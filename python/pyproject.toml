@@ -1,0 +1,27 @@
+[project]
+name = "relicpy"
+version = "26.9.18"
+description = "relic, in Python — the same LanceDB index, modelled with Pydantic"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "lancedb>=0.26",
+    "pydantic>=2.9",
+    "pyarrow>=17",
+]
+
+[project.scripts]
+relic-py = "relicpy.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["relicpy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
