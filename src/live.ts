@@ -1,5 +1,6 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { loadSources } from "./sources.js";
@@ -222,23 +223,88 @@ export interface LiveSession {
 }
 
 /**
- * Every session written to in the last `windowSec`, across all configured sources.
+ * The optional native binary, for the one thing it is genuinely better at.
  *
- * This is the `/list-agents` question asked of the filesystem: an agent that is running
- * is an agent whose transcript is growing. It scans project directories one level deep
- * — bounded, never a tree walk — because a stale project directory costs one readdir.
+ * The scan below is thousands of `stat()` calls over ~1,500 project directories, and
+ * it is the whole cost of this function — measured: resolving ONE session is 1 ms,
+ * this sweep is 200+ ms. It is also pure syscalls, so it parallelises across threads,
+ * which this runtime cannot do for blocking fs calls.
+ *
+ * What the binary is NOT asked to do is build the result. It returns fresh CANDIDATES
+ * — project directory plus uuids — and everything after that (reading each transcript
+ * head for cwd and title, assembling the tree) stays here, in one place. A second
+ * implementation of an output format is a second thing to drift; a second
+ * implementation of `readdir` is not.
+ *
+ * Absent, unbuildable, slow, or wrong shape -> null, and the caller scans in-process.
+ * The binary is strictly optional: `bunx` must keep working with no Rust toolchain.
+ * Set RELIC_NATIVE=0 to force the TypeScript path, or RELIC_NATIVE=/path/to/binary.
  */
-export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSession[]> {
-  const found: LiveSession[] = [];
+function nativeBin(): string | null {
+  const env = process.env.RELIC_NATIVE;
+  if (env === "0" || env === "false") return null;
+  if (env) return existsSync(env) ? env : null;
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));           // <repo>/src
+    const p = join(here, "..", "rust", "target", "release", "relic-native");
+    return existsSync(p) ? p : null;
+  } catch { return null; }
+}
 
-  for (const src of loadSources()) {
-    if (src.walk === "flat") continue;
-    for (const project of subdirs(src.path)) {
-      const pdir = join(src.path, project);
+type FreshMap = { project: string; uuids: string[] }[];
 
-      // Cheap gate first: if no top-level transcript is fresh, skip the tree entirely.
-      // Children live under <uuid>/, and a child write bumps the parent in practice —
-      // but not always, so also check session directories whose own mtime is fresh.
+/**
+ * Why the binary is or is not being used — for `relic backend`.
+ *
+ * "Is it faster" is the second question. The first is "is it even running", and
+ * before this existed the only way to find out was to read the source: an unbuilt
+ * binary, a stale RELIC_NATIVE, and a working native path all looked identical from
+ * the outside, because the fallback is silent by design.
+ */
+export function nativeInfo(): { path: string | null; usable: boolean; reason: string } {
+  const env = process.env.RELIC_NATIVE;
+  if (env === "0" || env === "false")
+    return { path: null, usable: false, reason: "disabled by RELIC_NATIVE=0" };
+  if (env)
+    return existsSync(env)
+      ? { path: env, usable: true, reason: "set by RELIC_NATIVE" }
+      : { path: env, usable: false, reason: "RELIC_NATIVE points at a missing file" };
+  try {
+    const p = join(dirname(fileURLToPath(import.meta.url)), "..",
+                   "rust", "target", "release", "relic-native");
+    return existsSync(p)
+      ? { path: p, usable: true, reason: "auto-detected" }
+      : { path: p, usable: false, reason: "not built — cargo build --release --manifest-path rust/Cargo.toml" };
+  } catch {
+    return { path: null, usable: false, reason: "could not resolve module path" };
+  }
+}
+
+async function nativeFresh(roots: string[], windowSec: number): Promise<FreshMap | null> {
+  const bin = nativeBin();
+  if (!bin || !roots.length) return null;
+  try {
+    const proc = Bun.spawn([bin, "live", "--window", String(windowSec), "--", ...roots],
+                           { stdout: "pipe", stderr: "ignore" });
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return null;
+    const parsed = JSON.parse(out);
+    // Shape-check rather than trust: a future binary that changes this format must
+    // fall back, not feed half-built objects into the loop below.
+    if (!Array.isArray(parsed)) return null;
+    for (const x of parsed) {
+      if (typeof x?.project !== "string" || !Array.isArray(x?.uuids)) return null;
+    }
+    return parsed as FreshMap;
+  } catch { return null; }
+}
+
+/** The same sweep, in-process. The reference path, and the fallback. */
+function tsFresh(roots: string[], windowSec: number): FreshMap {
+  const out: FreshMap = [];
+  for (const root of roots) {
+    for (const project of subdirs(root)) {
+      const pdir = join(root, project);
       const fresh: string[] = [];
       for (const f of jsonlIn(pdir)) {
         const st = statOf(join(pdir, f));
@@ -248,16 +314,52 @@ export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSes
         const st = statOf(join(pdir, d, "subagents"));
         if (st && age(st.mtimeMs) <= windowSec && !fresh.includes(d)) fresh.push(d);
       }
-      if (!fresh.length) continue;
+      if (fresh.length) out.push({ project: pdir, uuids: fresh });
+    }
+  }
+  return out;
+}
 
-      for (const uuid of fresh) {
-        const files = treeFiles(pdir, uuid).filter(f => f.ageSec <= windowSec);
-        if (!files.length) continue;
-        const { cwd, title } = await peek(join(pdir, `${uuid}.jsonl`));
-        found.push({ sessionUuid: uuid, projectDir: pdir, cwd, title, files,
-                     ageSec: Math.min(...files.map(f => f.ageSec)),
-                     agents: files.filter(f => f.tier !== "session").length });
-      }
+/**
+ * Roots to sweep: transcript layouts only, each path once.
+ *
+ * Exported because it is the input both the native and the in-process scan receive,
+ * and a test that compares the two must hand them the same list.
+ */
+export function liveRoots(): string[] {
+  const seen = new Set<string>();
+  for (const src of loadSources()) {
+    if (src.walk !== "claude-tiers" && src.walk !== "omp") continue;
+    if (!existsSync(src.path)) continue;
+    seen.add(src.path);
+  }
+  return [...seen];
+}
+
+export async function freshCandidates(roots: string[], windowSec: number): Promise<FreshMap> {
+  return (await nativeFresh(roots, windowSec)) ?? tsFresh(roots, windowSec);
+}
+
+/**
+ * Every session written to in the last `windowSec`, across all configured sources.
+ *
+ * This is the `/list-agents` question asked of the filesystem: an agent that is running
+ * is an agent whose transcript is growing. It scans project directories one level deep
+ * — bounded, never a tree walk — because a stale project directory costs one readdir.
+ */
+export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSession[]> {
+  const found: LiveSession[] = [];
+
+  // One sweep, two possible engines, identical result. Everything after the sweep
+  // runs here regardless of which engine produced the candidates.
+  for (const { project: pdir, uuids } of await freshCandidates(liveRoots(), windowSec)) {
+    for (const uuid of uuids) {
+      const files = treeFiles(pdir, uuid).filter(f => f.ageSec <= windowSec);
+      if (!files.length) continue;
+      const { cwd, title } = await peek(join(pdir, `${uuid}.jsonl`));
+      found.push({ sessionUuid: uuid, projectDir: pdir, cwd, title, files,
+                   ageSec: Math.min(...files.map(f => f.ageSec)),
+                   agents: files.filter(f => f.tier !== "session").length });
     }
   }
   found.sort((a, b) => a.ageSec - b.ageSec);

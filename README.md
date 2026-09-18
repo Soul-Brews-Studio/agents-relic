@@ -218,9 +218,50 @@ binary is strictly optional.
 
 ```bash
 bunx github:Soul-Brews-Studio/agents-relic status     # TS, nothing to install
-cargo build --release --manifest-path rust/Cargo.toml  # optional, ~14s
+cargo build --release --manifest-path rust/Cargo.toml  # optional, ~2s (zero deps)
 ./bin/relic-dispatch.sh now                            # native when present, TS otherwise
+./bin/relic-dispatch.sh banks                          # bank names
+./bin/relic-dispatch.sh shards --bank codex --count    # 47
 ```
+
+Native implements the **index-free** paths: `now`, `live`, `banks`, `shards`. All of
+them are pure `readdir` + `stat`, so they need no engine and stay in the
+zero-dependency default build.
+
+`live` is the one the TypeScript side actually calls. `liveSessions()` sweeps every
+project directory under every transcript root — ~1,500 directories, thousands of
+`stat()` calls — and that sweep is the entire cost of "what is running right now":
+resolving ONE session is 1 ms, the sweep is 60+ ms. It is also pure syscalls, so it
+parallelises across threads, which the JS runtime cannot do for blocking fs calls.
+
+The binary returns fresh *candidates* only — project directory plus uuids. Reading
+each transcript's head for cwd and title, and assembling the tree, stays in
+TypeScript. A second implementation of `readdir` is cheap; a second implementation of
+an output format is a second thing to drift.
+
+```
+                       RELIC_NATIVE=0        native
+  freshCandidates()          62 ms            33 ms
+  MCP relic_now exchange    190 ms           158 ms
+```
+
+Absent, unbuildable, non-zero exit, or wrong JSON shape → falls back to the
+in-process scan. `test/native-parity.test.ts` asserts both engines return the same
+candidate set, because a faster engine that returns a *different* answer is worse
+than no engine at all — which answer you get would depend on whether a binary
+happens to be built.
+
+Measured on this machine, 508 shards across 6 banks:
+
+| | answers | time |
+|---|---|---|
+| `relic-native shards --count` | which shards exist | **22 ms** |
+| `bun src/cli.ts --help` | nothing — startup floor | 79 ms |
+| `uv run relic-py --help` | nothing — startup floor | 570 ms |
+
+The native binary finishes the whole enumeration in less time than either runtime
+takes to print its own help. Counting ROWS inside those shards is a different
+question and still belongs to the engine — see below.
 
 ### Why only *some* commands are native
 

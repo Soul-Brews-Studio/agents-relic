@@ -374,6 +374,79 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log("vectors: none yet — they land in the same `events` table, no migration.");
 }
 
+// ---- banks / shards (layout, no engine) ------------------------------------
+//
+// Both also exist in the native binary, which is why they are safe for the
+// dispatcher to route: two implementations of the SAME output, pinned by
+// test/native-parity.test.ts. A command that exists in only one of them would print
+// something different depending on whether a binary was built.
+function cmdBanks(f: Record<string, string | boolean>) {
+  const shards = listShards((f["data-root"] as string) ?? null, Boolean(f["in-repo"]));
+  const names = [...new Set(shards.map(s => s.bank))].sort();
+  if (outFmt(f) === "json") { console.log(JSON.stringify(names, null, 2)); return; }
+  if (!names.length) { console.error("no shards indexed"); process.exit(1); }
+  for (const n of names) console.log(n);
+}
+
+function cmdShards(f: Record<string, string | boolean>) {
+  let shards = listShards((f["data-root"] as string) ?? null, Boolean(f["in-repo"]));
+  // --bank is EXACT, --repo is a substring of the REPO PORTION. Matching --repo
+  // against the key would make `--repo projects` select a whole bank, since every
+  // key begins with its bank name.
+  if (f.bank) shards = shards.filter(s => s.bank === String(f.bank));
+  if (f.repo) shards = shards.filter(s => s.repo.includes(String(f.repo)));
+  if (f.count) { console.log(String(shards.length)); return; }
+  if (outFmt(f) === "json") {
+    console.log(JSON.stringify(shards.map(s => ({ key: s.key, bank: s.bank, repo: s.repo, dir: s.dir })), null, 2));
+    return;
+  }
+  for (const s of shards) console.log(`${s.key}\t${s.dir}`);
+}
+
+// ---- backend (which engine answers what) -----------------------------------
+async function cmdBackend(f: Record<string, string | boolean>) {
+  const { nativeInfo, liveRoots, freshCandidates } = await import("./live.js");
+  const info = nativeInfo();
+  const mode = outFmt(f);
+
+  if (mode === "json") { console.log(JSON.stringify(info, null, 2)); return; }
+
+  console.log(`native binary   ${info.path ?? "(none found)"}`);
+  console.log(`                ${info.usable ? "usable" : info.reason}`);
+  console.log(`RELIC_NATIVE    ${process.env.RELIC_NATIVE ?? "(unset — auto-detect)"}`);
+  console.log(`engine          lancedb 0.39.0 — the SAME Rust core in every front end\n`);
+  console.log(`accelerated by the binary (pure readdir/stat, no engine):`);
+  console.log(`  now · sessions liveness      the sweep over every project directory`);
+  console.log(`  banks · shards               enumerate the index layout\n`);
+  console.log(`NOT accelerated, on purpose:`);
+  console.log(`  search · status · sessions · session · chain · pending · memory`);
+  console.log(`  they are bound by lancedb, and every front end wraps the same core,`);
+  console.log(`  so a second implementation would swap identical engines.\n`);
+
+  if (!f.probe) { console.log(`--probe   time both engines on this machine`); return; }
+
+  const roots = liveRoots();
+  const time = async (v: string | undefined) => {
+    const prev = process.env.RELIC_NATIVE;
+    if (v === undefined) delete process.env.RELIC_NATIVE; else process.env.RELIC_NATIVE = v;
+    const runs: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const t = Bun.nanoseconds();
+      await freshCandidates(roots, 3600);
+      runs.push((Bun.nanoseconds() - t) / 1e6);
+    }
+    if (prev === undefined) delete process.env.RELIC_NATIVE; else process.env.RELIC_NATIVE = prev;
+    runs.sort((a, b) => a - b);
+    return runs[2];   // median of 5 — a single run measures the page cache
+  };
+  const ts = await time("0");
+  const nat = info.usable ? await time(undefined) : null;
+  console.log(`probe — live scan over ${roots.length} roots, median of 5:`);
+  console.log(`  typescript    ${ts.toFixed(0).padStart(5)} ms`);
+  if (nat === null) console.log(`  native        n/a (${info.reason})`);
+  else console.log(`  native        ${nat.toFixed(0).padStart(5)} ms   ${(ts / nat).toFixed(1)}x`);
+}
+
 // ---- now (liveness, from mtime — never the index) ---------------------------
 async function cmdNow(f: Record<string, string | boolean>) {
   const windowSec = Number(f.window ?? 300);
@@ -444,6 +517,21 @@ async function cmdNow(f: Record<string, string | boolean>) {
 // ---- main ------------------------------------------------------------------
 const { f, pos } = flags(process.argv.slice(2));
 const cmd = pos[0];
+
+/*
+ * BACKEND SELECTION, before any command runs.
+ *
+ * The native binary accelerates the index-free scans only, and it does so from
+ * INSIDE the TypeScript path (src/live.ts) rather than by replacing a command — so
+ * the flag has to be set before a command reads it, and it is expressed as the same
+ * env var the library already honours rather than as a second mechanism.
+ *
+ * The engine-bound commands are deliberately unaffected: search, status and the rest
+ * all wrap the same lancedb 0.39.0 Rust core whichever front end calls them, so
+ * "selecting a backend" there would swap identical engines behind different wrappers.
+ */
+if (f["no-native"]) process.env.RELIC_NATIVE = "0";
+else if (typeof f.native === "string") process.env.RELIC_NATIVE = f.native;
 
 // ---- memory / pending -------------------------------------------------------
 // Both functions already existed in query.ts with no way to call them. A query nobody
@@ -533,7 +621,12 @@ if (!cmd || f.help) {
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
+  backend [--probe]            which engine answers what, and how fast here
+  banks                        bank names on this machine
+  shards  [--bank B] [--repo S] [--count]   the index layout
 
+  --no-native        force the TypeScript scan (see: relic backend)
+  --native PATH      use a specific relic-native binary
   --in-repo          write <ghq>/<org>/<repo>/.relic/ instead of ~/.relic
   --data-root PATH   explicit index location
   --json --jsonl --plain   machine output (or --format json|jsonl|plain)
@@ -695,6 +788,9 @@ else if (cmd === "read") {
   }
 }
 else if (cmd === "now" || cmd === "live") await cmdNow(f);
+else if (cmd === "backend") await cmdBackend(f);
+else if (cmd === "banks") cmdBanks(f);
+else if (cmd === "shards") cmdShards(f);
 else if (cmd === "mcp") {
   // exec rather than import: the server owns stdin/stdout for its whole lifetime.
   const { spawn } = await import("node:child_process");
