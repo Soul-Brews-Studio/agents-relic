@@ -7,7 +7,7 @@ import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
-import { buildTree, renderTree } from "./tree.js";
+import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -265,7 +265,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
     const entries = rows.map(r => ({
       path: r.file_path === parent.file_path ? basename(r.file_path)
           : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path,
-      tier: r.tier, events: r.event_count, time: localTime(r.started_at),
+      label: `${localTime(r.started_at)} ${r.tier} ${fmt(r.event_count)} ev`,
+      weight: r.event_count,
     }));
     console.log(`\n${base}`);
     renderTree(buildTree(entries), "", Number(f.limit ?? 8));
@@ -597,6 +598,29 @@ async function cmdPending(f: Record<string, string | boolean>) {
     console.log(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +
                 `  missing ${String(g.missing).padStart(6)}  changed ${String(g.changed).padStart(6)}`);
 
+  if (r.files.length && f.tree) {
+    /*
+     * The same shape question as `session --tree`, asked of what is NOT indexed.
+     *
+     * A flat pending list is a column of near-identical absolute paths, and the thing
+     * a reader actually wants is which RUN they belong to — ten files under one
+     * wf_<run>/ is one workflow that has not been imported yet, not ten unrelated
+     * gaps. Weight is bytes here, because an unindexed file has no event count: it
+     * does not exist in the index at all.
+     */
+    const root = commonPrefix(r.files.map(x => x.path));
+    const entries = r.files.map(x => ({
+      path: x.path.startsWith(root) ? x.path.slice(root.length) : x.path,
+      label: `${x.state} ${x.tier} ${fmt(x.size)}b`,
+      weight: x.size,
+    }));
+    console.log(`\n${root}`);
+    renderTree(buildTree(entries), "", Number(f.limit ?? 8), console.log, "b");
+    console.log(`\n${fmt(r.files.length)} pending shown · missing ${fmt(r.missing)} · changed ${fmt(r.changed)}`);
+    if (r.filesOmitted) console.log(`... and ${fmt(r.filesOmitted)} more pending (--list N)`);
+    return;
+  }
+
   if (r.files.length && f.paths) {
     /*
      * The full record, one file per two lines.
@@ -655,6 +679,7 @@ if (!cmd || f.help) {
                                on disk but not indexed: missing vs changed. --list N
                                names them — session id, repo, bank, newest first.
                                --paths adds the full session id and absolute path.
+                               --tree groups them by directory — which RUN is missing.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof

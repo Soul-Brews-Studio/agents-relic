@@ -1,78 +1,95 @@
 /**
- * Path trees — the SHAPE of a session, not just its contents.
+ * Path trees — the SHAPE of a set of files, not just the list.
  *
  * Lives apart from cli.ts because cli.ts runs a command at import time: anything that
  * imported it to reuse one function would execute the CLI as a side effect. Same
  * reason query.ts exists.
+ *
+ * A leaf carries an opaque `label` rather than a fixed set of columns, because the two
+ * callers describe different things — an indexed transcript has an event count, a
+ * PENDING file does not exist in the index at all and has a state and a size instead.
+ * Baking one caller's columns into the renderer would have meant a second renderer.
  */
 
 const fmt = (n: number) => n.toLocaleString("en-US");
 
-/**
- * A session tree, rendered as a tree.
- *
- * The flat listing answers "which transcripts" but hides the SHAPE, and the shape is
- * the interesting part: a workflow run is a directory holding one transcript per
- * agent, so nine agents working in parallel look identical to nine sequential ones
- * until you can see they share a `wf_<run>/` parent.
- *
- * Directories are summarised rather than just drawn — a run line carries its agent
- * count and event total, because "wf_3ae64b4d-526 (9 agents, 41,551 ev)" is the
- * sentence someone actually wants, and it is invisible in a flat list sorted by time.
- */
+export interface TreeEntry {
+  path: string;     // relative to whatever root the caller prints above the tree
+  label: string;    // rendered after the filename
+  weight?: number;  // summed up the directories; events, bytes, whatever the caller means
+}
+
 export interface TreeNode {
   children: Map<string, TreeNode>;
-  leaf?: { tier: string; events: number; time: string };
-  events: number;
+  leaf?: { label: string };
+  weight: number;
   files: number;
 }
 
-function newNode(): TreeNode { return { children: new Map(), events: 0, files: 0 }; }
+function newNode(): TreeNode { return { children: new Map(), weight: 0, files: 0 }; }
 
-export function buildTree(entries: { path: string; tier: string; events: number; time: string }[]): TreeNode {
+export function buildTree(entries: TreeEntry[]): TreeNode {
   const root = newNode();
   for (const e of entries) {
     const parts = e.path.split("/").filter(Boolean);
+    const w = e.weight ?? 0;
     let node = root;
-    root.events += e.events; root.files++;
+    root.weight += w; root.files++;
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i];
       let child = node.children.get(name);
       if (!child) { child = newNode(); node.children.set(name, child); }
-      child.events += e.events;
+      child.weight += w;
       child.files++;
-      if (i === parts.length - 1) child.leaf = { tier: e.tier, events: e.events, time: e.time };
+      if (i === parts.length - 1) child.leaf = { label: e.label };
       node = child;
     }
   }
   return root;
 }
 
-export function renderTree(node: TreeNode, prefix = "", limitPerDir = 8,
-                           emit: (line: string) => void = console.log): void {
+/**
+ * Directories first, then files, each group biggest first.
+ *
+ * A run directory is the thing the reader is looking for; burying it under twenty
+ * sibling transcripts defeats the point of drawing a tree at all.
+ */
+export function renderTree(
+  node: TreeNode,
+  prefix = "",
+  limitPerDir = 8,
+  emit: (line: string) => void = console.log,
+  unit = "ev",
+): void {
   const kids = [...node.children.entries()];
-  // Directories first, then files — a run directory is the thing you are looking for,
-  // and burying it under twenty sibling transcripts defeats the point of a tree.
   kids.sort((a, b) => {
     const ad = a[1].children.size > 0, bd = b[1].children.size > 0;
     if (ad !== bd) return ad ? -1 : 1;
-    return b[1].events - a[1].events;
+    return b[1].weight - a[1].weight;
   });
   const shown = kids.slice(0, limitPerDir);
   const hidden = kids.length - shown.length;
   shown.forEach(([name, child], i) => {
     const last = i === shown.length - 1 && hidden === 0;
     const branch = last ? "└── " : "├── ";
-    const isDir = child.children.size > 0;
-    if (isDir) {
-      const agents = child.files;
-      emit(`${prefix}${branch}${name}/   (${agents} file${agents === 1 ? "" : "s"}, ${fmt(child.events)} ev)`);
-      renderTree(child, prefix + (last ? "    " : "│   "), limitPerDir, emit);
+    if (child.children.size > 0) {
+      const n = child.files;
+      const w = child.weight ? `, ${fmt(child.weight)} ${unit}` : "";
+      emit(`${prefix}${branch}${name}/   (${n} file${n === 1 ? "" : "s"}${w})`);
+      renderTree(child, prefix + (last ? "    " : "│   "), limitPerDir, emit, unit);
     } else {
-      const l = child.leaf!;
-      emit(`${prefix}${branch}${name}   ${l.time} ${l.tier} ${fmt(l.events)} ev`);
+      emit(`${prefix}${branch}${name}   ${child.leaf!.label}`);
     }
   });
   if (hidden > 0) emit(`${prefix}└── ... and ${hidden} more`);
 }
 
+/** The longest directory prefix every path shares — what to print above the tree. */
+export function commonPrefix(paths: string[]): string {
+  if (!paths.length) return "";
+  const split = paths.map(p => p.split("/"));
+  const first = split[0];
+  let i = 0;
+  while (i < first.length - 1 && split.every(p => p[i] === first[i])) i++;
+  return first.slice(0, i).join("/") + "/";
+}
