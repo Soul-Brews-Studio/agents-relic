@@ -12,7 +12,8 @@ import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, hu
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
-         statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport } from "./query.js";
+         statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
+         groupByBank, maxISO } from "./query.js";
 import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -314,10 +315,16 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   }
   const smode = outFmt(f);
   if (smode === "json" || smode === "jsonl") {
-    const rows: { key: string; bank: string; repo: string; ev: number; se: number }[] = [];
+    const rows: { key: string; bank: string; repo: string; ev: number; se: number;
+                  lastIndexed: string; newestSession: string }[] = [];
     for (const sh of shards) {
-      try { const c = await (await LanceStore.open(sh.dir)).counts(); rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, ev: c.events, se: c.sessions }); }
-      catch { /* skip unreadable shard */ }
+      try {
+        const st = await LanceStore.open(sh.dir);
+        const c = await st.counts();
+        const fr = await st.freshness();
+        rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, ev: c.events, se: c.sessions,
+                    lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
+      } catch { /* skip unreadable shard */ }
     }
     rows.sort((a, b) => b.ev - a.ev);
     if (smode === "jsonl") { for (const r of rows) console.log(JSON.stringify(r)); }
@@ -328,29 +335,38 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log(`layout  ${dataRoot ?? (Boolean(f["in-repo"]) ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot())}`);
   console.log(`store   LanceDB + ICU full-text index (BM25)\n`);
 
-  const rows: { bank: string; repo: string; ev: number; se: number }[] = [];
+  const rows: { bank: string; repo: string; events: number; sessions: number;
+                lastIndexed: string; newestSession: string }[] = [];
   for (const s of shards) {
-    try { const c = await (await LanceStore.open(s.dir)).counts(); rows.push({ bank: s.bank, repo: s.repo, ev: c.events, se: c.sessions }); }
-    catch { /* skip unreadable shard */ }
+    try {
+      const st = await LanceStore.open(s.dir);
+      const c = await st.counts();
+      const fr = await st.freshness();
+      rows.push({ bank: s.bank, repo: s.repo, events: c.events, sessions: c.sessions,
+                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
+    } catch { /* skip unreadable shard */ }
   }
-  rows.sort((a, b) => b.ev - a.ev);
   // BANK FIRST, then repo. A flat list sorted by size interleaves three snapshots of the
   // same machine, and the reader cannot tell whether one repo appears three times because
   // it is busy or because it exists in three banks.
   const limit = Number(f.limit ?? 15);
-  const byBank = new Map<string, typeof rows>();
-  for (const r of rows) { const a = byBank.get(r.bank) ?? []; a.push(r); byBank.set(r.bank, a); }
-  const banks = [...byBank.entries()]
-    .map(([bank, rs]) => ({ bank, rs, ev: rs.reduce((a, r) => a + r.ev, 0), se: rs.reduce((a, r) => a + r.se, 0) }))
-    .sort((a, b) => b.ev - a.ev);
-  for (const b of banks) {
-    console.log(`  ${b.bank}   ${fmt(b.se)} sessions · ${fmt(b.ev)} events · ${b.rs.length} shards`);
-    for (const r of b.rs.slice(0, limit))
-      console.log(`    ${r.repo.replace("github.com/", "").padEnd(46)} ${String(r.se).padStart(6)} sess ${fmt(r.ev).padStart(10)} ev`);
-    if (b.rs.length > limit) console.log(`    ... and ${b.rs.length - limit} more (--limit N)`);
+  // groupByBank is shared with the MCP server. The two rendered this separately once,
+  // and only one of them grouped — which is how the MCP came to print a shard key under
+  // the heading "what `repo` accepts".
+  const when = (iso: string) => iso ? localDateTime(iso) : "never";
+  for (const b of groupByBank(rows)) {
+    console.log(`  ${b.bank}   ${fmt(b.sessions)} sessions · ${fmt(b.events)} events · ${b.shards} shards`);
+    console.log(`  ${" ".repeat(b.bank.length)}   indexed ${when(b.lastIndexed)} · newest session ${when(b.newestSession)}`);
+    for (const r of b.rows.slice(0, limit))
+      console.log(`    ${r.repo.replace("github.com/", "").padEnd(46)} ${String(r.sessions).padStart(6)} sess ${fmt(r.events).padStart(10)} ev`);
+    if (b.rows.length > limit) console.log(`    ... and ${b.rows.length - limit} more (--limit N)`);
     console.log("");
   }
-  console.log(`\ntotal   ${fmt(rows.reduce((a, r) => a + r.ev, 0))} events · ${fmt(rows.reduce((a, r) => a + r.se, 0))} sessions · ${rows.length} shards`);
+  console.log(`\ntotal   ${fmt(rows.reduce((a, r) => a + r.events, 0))} events · ${fmt(rows.reduce((a, r) => a + r.sessions, 0))} sessions · ${rows.length} shards`);
+  // Two clocks, deliberately both: the index can be fresh over stale material, or stale
+  // over fresh material, and only one of those is a problem to act on.
+  console.log(`last indexed  ${when(maxISO(rows.map(r => r.lastIndexed)))}` +
+              `   ·   newest session  ${when(maxISO(rows.map(r => r.newestSession)))}`);
   console.log("vectors: none yet — they land in the same `events` table, no migration.");
 }
 
@@ -454,35 +470,61 @@ async function cmdPending(f: Record<string, string | boolean>) {
     repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined,
     corpus: f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null,
     since: f.since ? String(f.since) : undefined,
+    // `--list` with no value means "a screenful", not "zero" — a bare flag parses as
+    // boolean true, and Number(true) is 1, which would silently show one row.
+    list: f.list === undefined ? 0 : (f.list === true ? 20 : Number(f.list)),
   });
-  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  const pmode = outFmt(f);
+  if (pmode === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  if (pmode === "jsonl") { for (const x of r.files) console.log(JSON.stringify(x)); return; }
+  if (pmode === "plain") {
+    for (const x of r.files)
+      console.log([x.sessionId, x.repo, x.bank, x.source + "/" + x.tier, x.state, x.path].join("\t"));
+    return;
+  }
   console.log(`found ${fmt(r.found)}  indexed ${fmt(r.indexed)}  missing ${fmt(r.missing)}  changed ${fmt(r.changed)}   ${r.scanMs} ms`);
   if (r.newestPendingMs !== null)
     console.log(`newest pending file: ${localDateTime(new Date(r.newestPendingMs).toISOString())}`);
   for (const g of r.groups)
     console.log(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +
                 `  missing ${String(g.missing).padStart(6)}  changed ${String(g.changed).padStart(6)}`);
+
+  if (r.files.length) {
+    console.log(`\nnot indexed yet — newest first (repo read from each transcript's own cwd):\n`);
+    console.log(`  ${"when".padEnd(16)} ${"session".padEnd(10)} ${"state".padEnd(7)} ` +
+                `${"bank".padEnd(22)} ${"source/tier".padEnd(26)} repo`);
+    for (const x of r.files)
+      console.log(`  ${localDateTime(new Date(x.mtime * 1000).toISOString()).padEnd(16)} ` +
+                  `${(x.sessionId ? x.sessionId.slice(0, 8) : "-").padEnd(10)} ` +
+                  `${x.state.padEnd(7)} ${x.bank.padEnd(22)} ` +
+                  `${(x.source + "/" + x.tier).padEnd(26)} ${x.repo}`);
+    if (r.filesOmitted) console.log(`  ... and ${fmt(r.filesOmitted)} more pending (--list N)`);
+  } else if (f.list !== undefined && r.missing + r.changed === 0) {
+    console.log(`\nnothing pending — every discovered file is in the index.`);
+  }
 }
 
 if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
-  search  <query> [--repo S] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
+  search  <query> [--repo S] [--bank B] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
-  session <id|prefix>          resolve a session id to its transcript file(s)
+  session <id|prefix> [--repo S] [--bank B]   resolve an id to its transcript file(s)
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   read    <file> [--prose]     whole transcript as readable conversation, any format
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
-  sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
+  sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
                                sessions that produced it — which had one, which had none
-  pending [--corpus ...] [--since 1h]  on disk but not indexed: missing vs changed
+  pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N]
+                               on disk but not indexed: missing vs changed. --list N
+                               names them — session id, repo, bank, newest first.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
@@ -493,8 +535,11 @@ if (!cmd || f.help) {
   --json --jsonl --plain   machine output (or --format json|jsonl|plain)
                      plain = file<TAB>seq<TAB>repo<TAB>text, one per line
 
-Sharded per repo, ghq-style, under $HOME by default:
-  ${defaultRoot()}/github.com/<org>/<repo>/
+Sharded BANK first, then per repo ghq-style, under $HOME by default:
+  ${defaultRoot()}/banks/<bank>/github.com/<org>/<repo>/
+
+A bank is one whole source root (a Claude projects dir, codex, omp, memory).
+--bank filters to one exactly; relic status prints the banks on this machine.
 
 LanceDB only, with an ICU full-text index: real Thai word segmentation, and
 2-character queries work (trigram cannot do either). Vectors land in the same

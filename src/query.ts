@@ -3,7 +3,7 @@ import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince } from "./discover.js";
-import { listShards } from "./repo.js";
+import { listShards, repoKeyOf } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
 import { importFiles } from "./import.js";
 import { buildChain, type Chain, type ChainRow } from "./chain.js";
@@ -426,22 +426,85 @@ export async function readAround(
   return out;
 }
 
-export interface ShardStat { key: string; events: number; sessions: number }
+/**
+ * One row per SHARD, which since banks is one row per (bank, repo) — not per repo.
+ *
+ * `key` is the full shard key, "<bank>/github.com/<org>/<repo>". It is a display
+ * string and NOTHING accepts it as a filter: `repo` matches the repo portion and
+ * `bank` matches the bank exactly. Callers that render a filter hint must use the
+ * split fields, never `key` — printing a key beside "this is what `repo` accepts"
+ * is the exact bug this split exists to prevent.
+ */
+export interface ShardStat {
+  key: string; bank: string; repo: string; events: number; sessions: number;
+  /** max(files.imported_at) — when the indexer last wrote this shard. "" if never. */
+  lastIndexed: string;
+  /** max(sessions.started_at) — when this shard's newest transcript began. "" if none. */
+  newestSession: string;
+}
 
 /**
  * Per-shard counts, biggest first.
  *
- * This doubles as repo DISCOVERY: the shard keys are exactly the values `repo` accepts
- * as a filter, so a caller that does not know what is indexed can find out here instead
- * of guessing a name.
+ * This doubles as DISCOVERY, and it discovers TWO filters, not one: `bank` takes a
+ * row's `bank` exactly, `repo` takes a substring of its `repo`. It used to be one —
+ * before banks the shard key WAS the repo key — and the rendering that assumed so
+ * printed "<bank>/github.com/<org>/<repo>" under the heading "what `repo` accepts",
+ * which matches nothing. Render from `bank` and `repo`; `key` is for display only.
  */
-export async function indexStatus(s: Scope = {}): Promise<{ root: string; rows: ShardStat[] }> {
+export interface BankGroup<T> {
+  bank: string; rows: T[]; events: number; sessions: number; shards: number;
+  /** Newest value across the group — "" when no row in it has one. */
+  lastIndexed: string; newestSession: string;
+}
+
+/** Newest non-empty ISO string in a list, or "" — max() over strings that may be absent. */
+export function maxISO(xs: (string | undefined)[]): string {
+  let best = "";
+  for (const x of xs) { const v = x ?? ""; if (v > best) best = v; }
+  return best;
+}
+
+/**
+ * Group shard rows by bank, biggest bank first, biggest repo first within each.
+ *
+ * A FLAT list sorted by size interleaves what are really several snapshots of the same
+ * machine, and the reader cannot tell whether a repo appears three times because it is
+ * busy or because it exists in three banks. Both the CLI and the MCP render from this,
+ * because the CLI grouped and the MCP did not, and that divergence is what let the MCP
+ * ship a repo-filter hint that matched nothing.
+ */
+export function groupByBank<T extends { bank: string; events: number; sessions: number;
+                                        lastIndexed?: string; newestSession?: string }>(
+  rows: T[],
+): BankGroup<T>[] {
+  const by = new Map<string, T[]>();
+  for (const r of rows) { const a = by.get(r.bank) ?? []; a.push(r); by.set(r.bank, a); }
+  return [...by.entries()]
+    .map(([bank, rs]) => ({
+      bank,
+      rows: [...rs].sort((a, b) => b.events - a.events),
+      events: rs.reduce((n, r) => n + r.events, 0),
+      sessions: rs.reduce((n, r) => n + r.sessions, 0),
+      shards: rs.length,
+      lastIndexed: maxISO(rs.map(r => r.lastIndexed)),
+      newestSession: maxISO(rs.map(r => r.newestSession)),
+    }))
+    .sort((a, b) => b.events - a.events);
+}
+
+export async function indexStatus(
+  s: Scope & { freshness?: boolean } = {},
+): Promise<{ root: string; rows: ShardStat[] }> {
   const { defaultRoot } = await import("./repo.js");
   const rows: ShardStat[] = [];
   for (const sh of pickShards(s)) {
     try {
-      const c = await (await LanceStore.open(sh.dir)).counts();
-      rows.push({ key: sh.key, events: c.events, sessions: c.sessions });
+      const st = await LanceStore.open(sh.dir);
+      const c = await st.counts();
+      const fr = s.freshness === false ? { lastIndexed: "", newestSession: "" } : await st.freshness();
+      rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, events: c.events, sessions: c.sessions,
+                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
     } catch { /* skip unreadable shard */ }
   }
   rows.sort((a, b) => b.events - a.events);
@@ -703,11 +766,51 @@ export interface PendingGroup {
   source: string; tier: string;
   found: number; indexed: number; changed: number; missing: number;
 }
+export interface PendingFile {
+  path: string; bank: string; source: string; tier: string;
+  state: "missing" | "changed";
+  mtime: number; size: number;
+  sessionId: string;   // "" for shapes that have none (vault notes, memory files)
+  repo: string;        // real cwd-derived repo key, or "_unresolved" — see listPending
+}
 export interface PendingReport {
   groups: PendingGroup[];
   found: number; indexed: number; changed: number; missing: number;
   newestPendingMs: number | null;
   scanMs: number;
+  /** Populated only when `list` was asked for. Newest first. */
+  files: PendingFile[];
+  /** Pending files that exist but were not listed, because `list` capped the output. */
+  filesOmitted: number;
+}
+
+/**
+ * The session id inside a transcript PATH, without opening the file.
+ *
+ * Every shape but one buries a uuid somewhere in the path, at a different depth:
+ *
+ *   <root>/<project>/<uuid>.jsonl                                  claude session
+ *   <root>/<project>/<uuid>/subagents/<agent>.jsonl                claude subagent
+ *   <root>/<project>/<uuid>/subagents/workflows/wf_R/agent-N.jsonl claude workflow_agent
+ *   <root>/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl                    codex
+ *
+ * So the rule is "first uuid anywhere in the path", not "parse the basename" — the
+ * basename is the uuid for exactly one of those four, and a subagent file would
+ * otherwise report its agent name where a session id belongs.
+ *
+ * omp has no uuid: `<ts>_<id>.jsonl`, and the id is the part after the underscore.
+ * Vault notes and memory files have no session at all, and get "".
+ */
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+export function sessionIdOfPath(path: string, source = ""): string {
+  const m = UUID_RE.exec(path);
+  if (m) return m[0].toLowerCase();
+  if (source.startsWith("omp")) {
+    const base = path.split("/").pop() ?? "";
+    const i = base.indexOf("_");
+    if (i >= 0) return base.slice(i + 1).replace(/\.jsonl$/, "");
+  }
+  return "";
 }
 
 /**
@@ -724,7 +827,7 @@ export interface PendingReport {
  * cases that matter.
  */
 export async function pendingReport(
-  s: Scope & { corpus?: string[] | null; since?: string } = {},
+  s: Scope & { corpus?: string[] | null; since?: string; list?: number } = {},
 ): Promise<PendingReport> {
   const t0 = Date.now();
   const seen = new Map<string, { mtime: number; size: number }>();
@@ -743,22 +846,49 @@ export async function pendingReport(
 
   const groups = new Map<string, PendingGroup>();
   let indexed = 0, changed = 0, missing = 0, newest: number | null = null;
+  const pending: { f: typeof found[number]; state: "missing" | "changed" }[] = [];
   for (const f of found) {
     const k = `${f.source}/${f.tier}`;
     const g = groups.get(k) ?? { source: f.source, tier: f.tier, found: 0, indexed: 0, changed: 0, missing: 0 };
     g.found++;
     const prior = seen.get(f.path);
-    if (!prior) { g.missing++; missing++; }
-    else if (prior.mtime !== f.mtime || prior.size !== f.size) { g.changed++; changed++; }
+    if (!prior) { g.missing++; missing++; pending.push({ f, state: "missing" }); }
+    else if (prior.mtime !== f.mtime || prior.size !== f.size) { g.changed++; changed++; pending.push({ f, state: "changed" }); }
     else { g.indexed++; indexed++; }
     if (!prior || prior.mtime !== f.mtime || prior.size !== f.size)
       newest = Math.max(newest ?? 0, f.mtime * 1000);
     groups.set(k, g);
   }
 
+  /*
+   * THE LIST IS CAPPED AND PARSED; THE COUNTS ARE NEITHER.
+   *
+   * A file's repo is not knowable from its path — the encoded project-dir name maps
+   * both "/" and "." to "-", so two checkouts can share one directory, and deriving a
+   * repo from it is a guess that is wrong for exactly the nested worktree cases that
+   * send someone looking at this report. So the repo here is read from the transcript's
+   * own cwd, which means opening the file.
+   *
+   * That is why `list` is opt-in and capped: the counts above are a cheap stat() sweep
+   * over the whole corpus, and this is N file reads. Sorting by mtime first means the
+   * N that get read are the N a human actually asked about — the most recent.
+   */
+  const cap = Math.max(0, Number(s.list ?? 0));
+  pending.sort((a, b) => b.f.mtime - a.f.mtime);
+  const files: PendingFile[] = [];
+  for (const { f, state } of pending.slice(0, cap)) {
+    let repo = "_unresolved";
+    try { repo = repoKeyOf((await f.parser(f.path)).cwd) ?? "_unresolved"; }
+    catch { /* an unparseable file is exactly why it is still pending — say _unresolved */ }
+    files.push({ path: f.path, bank: f.bank, source: f.source, tier: f.tier, state,
+                 mtime: f.mtime, size: f.size,
+                 sessionId: sessionIdOfPath(f.path, f.source), repo });
+  }
+
   return {
     groups: [...groups.values()].sort((a, b) => (b.missing + b.changed) - (a.missing + a.changed)),
     found: found.length, indexed, changed, missing,
     newestPendingMs: newest, scanMs: Date.now() - t0,
+    files, filesOmitted: Math.max(0, pending.length - files.length),
   };
 }
