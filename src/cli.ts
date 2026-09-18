@@ -8,6 +8,7 @@ import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf } from "./query.js";
@@ -409,6 +410,7 @@ if (!cmd || f.help) {
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
+  dig [N] [--deep]             session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -533,6 +535,17 @@ else if (cmd === "skipped") {
       console.log(`            ${x.file_path.split("/").pop()} --seq ${x.seq}`);
     }
   }
+}
+else if (cmd === "dig") {
+  // PROJECT_DIRS is the contract the /dig skill already exports — honour it so this is
+  // a drop-in for `python3 dig.py`, not a second thing to configure.
+  const env = (process.env.PROJECT_DIRS ?? "").split(":").filter(Boolean);
+  const rows = await runDig({
+    projectDirs: env.length ? env : defaultProjectDirs(),
+    count: Number(pos[1] ?? f.limit ?? 10),
+    deep: Boolean(f.deep || f.subagents),
+  });
+  console.log(JSON.stringify(rows, null, 2));
 }
 else if (cmd === "now" || cmd === "live") await cmdNow(f);
 else if (cmd === "mcp") {

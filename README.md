@@ -213,6 +213,50 @@ three days are **24 real conversations**. `--all-tiers` turns grouping off.
 Filters on `started_at` — the session's own first timestamp — **not** file mtime, which
 moves on every append and would make an old session look new.
 
+### `dig` — the fleet's session timeline, with the tier it was missing
+
+```bash
+relic dig 20 --deep                      # newest 20, all three tiers, as JSON
+PROJECT_DIRS="$dirs" relic dig 0 --deep  # drop-in for `python3 dig.py 0 --deep`
+```
+
+Emits the same JSON contract as `~/.claude/skills/dig/scripts/dig.py` — session entries
+in start order, gap sentinels interleaved, trailing coverage entry — so the `/dig`
+skill's renderer works unchanged. It is a TypeScript reimplementation and never shells
+out to Python.
+
+Head-to-head on one project directory, same input:
+
+| | `dig.py --deep 0` | `relic dig --deep 0` |
+|---|---|---|
+| entries returned | 13 | **118** |
+| `gitBranch: "unknown"` | 13 / 13 | **0 / 118** |
+| tiers seen | session, subagent | session, subagent, **workflow_agent (105)** |
+
+Three measured causes:
+
+- **The workflow tier.** `dig.py --deep` globs `<uuid>/subagents` for `.jsonl` and never
+  descends into the workflow run directories beneath it. A fan-out is invisible to it —
+  here that is 105 of 118 transcripts.
+- **`gitBranch`.** dig.py reads it only from a `type:"summary"` record. Sampled over the
+  120 newest transcripts across both roots: summary records **0/120**, `gitBranch` on
+  ordinary records **120/120**. Its branch column reads `unknown` for every current
+  session while the value sits on every line.
+- **`sessions-index.json`**, its other metadata source, exists in **59 of 1,527** project
+  directories (3.9%).
+
+Deep mode adds two fields the Python has no equivalent for: `tier` (which of the three,
+not a yes/no `isSubagent`) and `workflowRunId`, which groups a fan-out back together.
+
+What this deliberately keeps: the scan is over **files, not the index**. `dig` answers
+"what happened recently" across whatever is on disk, including transcripts nothing has
+imported yet, and routing it through the index would narrow that.
+
+Every path is checked before it is stat'd. Archived roots are full of symlinks into the
+live root which dangle once a session is pruned there; dig.py records an incident where
+one bad link aborted a scan of 38,764 files and emitted zero sessions — reading as "no
+history". The same thing broke a probe written while building this.
+
 ### `now` — what is running, and which session am I in
 
 ```bash

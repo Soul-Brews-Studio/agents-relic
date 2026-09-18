@@ -44,6 +44,7 @@ export interface SessionRow {
   line_count: number; event_count: number; bad_lines: number;
   started_at: string; ended_at: string; description: string; imported_at: string;
   title: string;   // the host's own session name; "" when it wrote none
+  git_branch: string;
 }
 
 /** (path, mtime, size) is the import-diff identity — no content hashing. */

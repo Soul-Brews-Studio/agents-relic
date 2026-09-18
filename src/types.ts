@@ -31,6 +31,15 @@ export interface ParsedFile {
    * null for Codex, which has no equivalent record. Callers fall back to description.
    */
   title: string | null;
+  /**
+   * The git branch the work happened on.
+   *
+   * Claude Code stamps `gitBranch` on EVERY record. The fleet's dig.py reads it only
+   * from a `type:"summary"` record, which measured 0/120 on current transcripts while
+   * gitBranch itself measured 120/120 — so that path reports "unknown" for every modern
+   * session. Read it off any record instead.
+   */
+  gitBranch: string | null;
 }
 
 export type Parser = (filePath: string) => Promise<ParsedFile>;
