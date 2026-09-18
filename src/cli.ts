@@ -23,6 +23,20 @@ function flags(argv: string[]) {
   return { f, pos };
 }
 const fmt = (n: number) => n.toLocaleString("en-US");
+
+/**
+ * Output mode. `plain` and `jsonl` are line-oriented so they compose with the rest of
+ * the shell — one record per line, no decoration, nothing on stdout but data. Progress
+ * and errors already go to stderr, so `relic search ... --plain | xargs ...` is safe.
+ */
+type Fmt = "pretty" | "plain" | "json" | "jsonl";
+function outFmt(f: Record<string, string | boolean>): Fmt {
+  if (f.json) return "json";
+  if (f.jsonl) return "jsonl";
+  if (f.plain) return "plain";
+  const v = String(f.format ?? "");
+  return v === "json" || v === "jsonl" || v === "plain" ? v : "pretty";
+}
 const nowISO = () => new Date().toISOString();
 
 /** One store per repo, opened on first write. */
@@ -194,6 +208,24 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     top_repo: hits[0]?.repo ?? "", fts: true,
   }, dataRoot);
 
+  const top = hits.slice(0, limit);
+  const mode = outFmt(f);
+
+  if (mode === "json") {
+    console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length, hits: top }, null, 2));
+    return;
+  }
+  if (mode === "jsonl") {
+    for (const h of top) console.log(JSON.stringify(h));
+    return;
+  }
+  if (mode === "plain") {
+    // file<TAB>seq<TAB>repo<TAB>one-line text — greppable, cuttable, xargs-able
+    for (const h of top)
+      console.log([h.file_path, h.seq, h.repo, h.text.replace(/\s+/g, " ").slice(0, 200)].join("\t"));
+    return;
+  }
+
   if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms.toFixed(0)} ms)`); return; }
   console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms.toFixed(0)} ms\n`);
   for (const h of hits.slice(0, limit)) {
@@ -247,6 +279,19 @@ async function cmdStatus(f: Record<string, string | boolean>) {
     if (!dataRoot) console.log(`  or point elsewhere: relic status --data-root /path/to/index`);
     return;
   }
+  const smode = outFmt(f);
+  if (smode === "json" || smode === "jsonl") {
+    const rows: { key: string; ev: number; se: number }[] = [];
+    for (const sh of shards) {
+      try { const c = await (await LanceStore.open(sh.dir)).counts(); rows.push({ key: sh.key, ev: c.events, se: c.sessions }); }
+      catch { /* skip unreadable shard */ }
+    }
+    rows.sort((a, b) => b.ev - a.ev);
+    if (smode === "jsonl") { for (const r of rows) console.log(JSON.stringify(r)); }
+    else console.log(JSON.stringify({ root: dataRoot ?? defaultRoot(), shards: rows.length,
+      events: rows.reduce((a, r) => a + r.ev, 0), sessions: rows.reduce((a, r) => a + r.se, 0), rows }, null, 2));
+    return;
+  }
   console.log(`layout  ${dataRoot ?? (Boolean(f["in-repo"]) ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot())}`);
   console.log(`store   LanceDB + ICU full-text index (BM25)\n`);
 
@@ -281,6 +326,8 @@ if (!cmd || f.help) {
 
   --in-repo          write <ghq>/<org>/<repo>/.relic/ instead of ~/.relic
   --data-root PATH   explicit index location
+  --json --jsonl --plain   machine output (or --format json|jsonl|plain)
+                     plain = file<TAB>seq<TAB>repo<TAB>text, one per line
 
 Sharded per repo, ghq-style, under $HOME by default:
   ${defaultRoot()}/github.com/<org>/<repo>/
@@ -309,7 +356,12 @@ else if (cmd === "trace") {
   const dataRoot = (f["data-root"] as string) ?? null;
   const shards = listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.key);
   const t = readTrace(dataRoot, shards);
-  if (!t) { console.log(`no queries logged yet — ${tracePath(dataRoot)}`); }
+  const tmode = outFmt(f);
+  if (t && (tmode === "json" || tmode === "jsonl")) {
+    if (tmode === "jsonl") { for (const x of t.terms) console.log(JSON.stringify(x)); }
+    else console.log(JSON.stringify(t, null, 2));
+  }
+  else if (!t) { console.log(`no queries logged yet — ${tracePath(dataRoot)}`); }
   else {
     console.log(`${t.total} queries · ${t.span} · median ${t.medianMs} ms\n`);
     console.log("answered by (top hit's repo)");
