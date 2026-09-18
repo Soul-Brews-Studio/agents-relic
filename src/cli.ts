@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
+import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -259,6 +260,21 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   // parent absolute once and everything else relative to it.
   const limit = Number(f.limit ?? 10);
   const base = parent.file_path.replace(/\.jsonl$/, "/");
+
+  if (f.tree) {
+    const entries = rows.map(r => ({
+      path: r.file_path === parent.file_path ? basename(r.file_path)
+          : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path,
+      label: `${localTime(r.started_at)} ${r.tier} ${fmt(r.event_count)} ev`,
+      weight: r.event_count,
+    }));
+    console.log(`\n${base}`);
+    renderTree(buildTree(entries), "", Number(f.limit ?? 8));
+    console.log(`\n${fmt(rows.length)} transcripts · ${fmt(rows.reduce((n, r) => n + r.event_count, 0))} events`);
+    if (rows.length > 1) console.log(`relic chain ${parent.session_uuid.slice(0, 8)}  — the same tree on a time axis`);
+    return;
+  }
+
   console.log(`\ntranscripts (under ${base}):`);
   for (const r of rows.slice(0, limit)) {
     const p = r.file_path === parent.file_path ? parent.file_path
@@ -268,6 +284,7 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   if (rows.length > limit) console.log(`  ... and ${rows.length - limit} more (--limit N, or --plain for full paths)`);
   if (rows.length > 1) console.log(`\nrelic chain ${parent.session_uuid.slice(0, 8)}  — the same tree on a time axis`);
 }
+
 
 // ---- sessions ----
 async function cmdSessions(f: Record<string, string | boolean>) {
@@ -581,6 +598,49 @@ async function cmdPending(f: Record<string, string | boolean>) {
     console.log(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +
                 `  missing ${String(g.missing).padStart(6)}  changed ${String(g.changed).padStart(6)}`);
 
+  if (r.files.length && f.tree) {
+    /*
+     * The same shape question as `session --tree`, asked of what is NOT indexed.
+     *
+     * A flat pending list is a column of near-identical absolute paths, and the thing
+     * a reader actually wants is which RUN they belong to — ten files under one
+     * wf_<run>/ is one workflow that has not been imported yet, not ten unrelated
+     * gaps. Weight is bytes here, because an unindexed file has no event count: it
+     * does not exist in the index at all.
+     */
+    const root = commonPrefix(r.files.map(x => x.path));
+    const entries = r.files.map(x => ({
+      path: x.path.startsWith(root) ? x.path.slice(root.length) : x.path,
+      label: `${x.state} ${x.tier} ${fmt(x.size)}b`,
+      weight: x.size,
+    }));
+    console.log(`\n${root}`);
+    renderTree(buildTree(entries), "", Number(f.limit ?? 8), console.log, "b");
+    console.log(`\n${fmt(r.files.length)} pending shown · missing ${fmt(r.missing)} · changed ${fmt(r.changed)}`);
+    if (r.filesOmitted) console.log(`... and ${fmt(r.filesOmitted)} more pending (--list N)`);
+    return;
+  }
+
+  if (r.files.length && f.paths) {
+    /*
+     * The full record, one file per two lines.
+     *
+     * The table below is scannable but lossy: it truncates the session id to 8
+     * characters and drops the path entirely, so answering "which file exactly, and
+     * where" meant piping --json through a script. A view someone has to rebuild by
+     * hand belongs in the tool.
+     */
+    console.log(`\nnot indexed yet — newest first (repo read from each transcript's own cwd):\n`);
+    for (const x of r.files) {
+      const when = localDateTime(new Date(x.mtime * 1000).toISOString());
+      console.log(`${when}  ${x.state.padEnd(7)} ${x.tier.padEnd(15)} ${x.sessionId || "(no session id)"}`);
+      console.log(`          ${x.repo}  ·  bank ${x.bank}  ·  ${x.source}`);
+      console.log(`          ${x.path}`);
+    }
+    if (r.filesOmitted) console.log(`\n... and ${fmt(r.filesOmitted)} more pending (--list N)`);
+    return;
+  }
+
   if (r.files.length) {
     console.log(`\nnot indexed yet — newest first (repo read from each transcript's own cwd):\n`);
     console.log(`  ${"when".padEnd(16)} ${"session".padEnd(10)} ${"state".padEnd(7)} ` +
@@ -605,7 +665,8 @@ if (!cmd || f.help) {
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
-  session <id|prefix> [--repo S] [--bank B]   resolve an id to its transcript file(s)
+  session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
+                               --tree shows the SHAPE: which agents shared a workflow run
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   read    <file> [--prose]     whole transcript as readable conversation, any format
   mcp                          run the MCP server on stdio (same lookups, for a model)
@@ -614,9 +675,11 @@ if (!cmd || f.help) {
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
                                sessions that produced it — which had one, which had none
-  pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N]
+  pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N] [--paths]
                                on disk but not indexed: missing vs changed. --list N
                                names them — session id, repo, bank, newest first.
+                               --paths adds the full session id and absolute path.
+                               --tree groups them by directory — which RUN is missing.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof

@@ -83,6 +83,13 @@ function walkClaude(root: string, sinceMs: number | null, out: Found[], srcKey: 
       for (const run of dirs(workflows)) {
         if (!run.startsWith("wf_")) continue;
         for (const f of files(join(workflows, run))) {
+          // journal.jsonl is the RUNNER's event log — launched/started/result records
+          // describing the workflow, not a transcript of anything an agent said. It
+          // sits in the same directory as the agent transcripts, so taking every
+          // .jsonl indexed runner metadata as if it were conversation: searchable
+          // text with a role and a session id attached, and no cwd, so it landed in
+          // `_unresolved`. Same reason walkMemory skips MEMORY.md.
+          if (f === "journal.jsonl") continue;
           const p = join(workflows, run, f);
           const st = statOf(p);
           if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;

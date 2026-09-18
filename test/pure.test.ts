@@ -5,6 +5,7 @@ import { locationOf, shardDirFor, DEFAULT_BANK } from "../src/repo.js";
 import { classify } from "../src/noise.js";
 import { nameOf, looksLikeId, toISO, dedupeHits, groupByBank, maxISO,
          sessionIdOfPath } from "../src/query.js";
+import { buildTree, renderTree, commonPrefix } from "../src/tree.js";
 
 /**
  * Pure-function tests — no LanceDB, no filesystem, no fixtures.
@@ -310,5 +311,63 @@ describe("maxISO — an absent timestamp must not win", () => {
   test("all-empty is empty, NOT undefined — callers render it as 'never'", () => {
     expect(maxISO(["", undefined])).toBe("");
     expect(maxISO([])).toBe("");
+  });
+});
+
+describe("session tree — the shape a flat listing hides", () => {
+  const entries = [
+    { path: "s.jsonl",                                  label: "17:06 session 3,353 ev",        weight: 3353 },
+    { path: "subagents/agent-a.jsonl",                  label: "13:33 subagent 141 ev",         weight: 141 },
+    { path: "subagents/workflows/wf_one/agent-x.jsonl", label: "17:30 workflow_agent 86 ev",    weight: 86 },
+    { path: "subagents/workflows/wf_one/agent-y.jsonl", label: "17:47 workflow_agent 78 ev",    weight: 78 },
+    { path: "subagents/workflows/wf_two/agent-z.jsonl", label: "17:43 workflow_agent 9 ev",     weight: 9 },
+  ];
+
+  test("a directory sums the weight of everything beneath it", () => {
+    // Nine agents in parallel and nine in sequence look identical in a flat list;
+    // the run directory's totals are what distinguish them.
+    const root = buildTree(entries);
+    const wfOne = root.children.get("subagents")!.children.get("workflows")!.children.get("wf_one")!;
+    expect(wfOne.files).toBe(2);
+    expect(wfOne.weight).toBe(164);
+    const workflows = root.children.get("subagents")!.children.get("workflows")!;
+    expect(workflows.files).toBe(3);
+    expect(workflows.weight).toBe(173);
+  });
+
+  test("the root counts every file, including the parent transcript", () => {
+    const root = buildTree(entries);
+    expect(root.files).toBe(5);
+    expect(root.weight).toBe(3353 + 141 + 86 + 78 + 9);
+  });
+
+  test("a leaf carries the caller's own label, not a fixed set of columns", () => {
+    // pending files have a state and a size; indexed transcripts have an event count.
+    // One renderer, because the leaf label is opaque to it.
+    const root = buildTree(entries);
+    expect(root.children.get("s.jsonl")!.leaf!.label).toBe("17:06 session 3,353 ev");
+  });
+
+  test("directories sort before files, so a run is never buried under siblings", () => {
+    const lines: string[] = [];
+    renderTree(buildTree(entries), "", 8, l => lines.push(l));
+    const dirIdx = lines.findIndex(l => l.includes("subagents/"));
+    const fileIdx = lines.findIndex(l => l.includes("s.jsonl"));
+    expect(dirIdx).toBeLessThan(fileIdx);
+  });
+
+  test("limitPerDir truncates and says how many it hid", () => {
+    const many = Array.from({ length: 12 }, (_, i) =>
+      ({ path: `subagents/workflows/wf_one/agent-${i}.jsonl`, label: `x ${i}`, weight: i }));
+    const lines: string[] = [];
+    renderTree(buildTree(many), "", 3, l => lines.push(l));
+    expect(lines.some(l => l.includes("and 9 more"))).toBe(true);
+  });
+
+  test("commonPrefix finds the deepest shared directory", () => {
+    expect(commonPrefix(["/a/b/c/x.jsonl", "/a/b/c/y.jsonl"])).toBe("/a/b/c/");
+    expect(commonPrefix(["/a/b/c/x.jsonl", "/a/b/d/y.jsonl"])).toBe("/a/b/");
+    expect(commonPrefix(["/only/one.jsonl"])).toBe("/only/");
+    expect(commonPrefix([])).toBe("");
   });
 });
