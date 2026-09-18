@@ -22,21 +22,22 @@ your repos.
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  relic — agent session transcripts, indexed              measured 2026-09-18 ║
-║  6 banks · 508 shards · 3,258,529 events · 40,865 sessions · 2.7 GB index    ║
+║  8 banks · 817 shards · 3,394,951 events · 167,853 sessions · 3.2 GB         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
  1 ─ SOURCES                        config: ~/.relic/sources.json, no code change
 
      ONE SOURCE = ONE BANK.       a bank is the top level of the shard path
 
-     source              raw     bank                     index
-     ~/.claude/projects  3.7 G   projects                  357 M   [on]
-     …/projects-archive  6.5 G   projects-archive          737 M   [on]
-     …/projects-1sep     13  G   projects-1sep-tue2026     1.5 G   [on]  largest
-     ~/.codex/sessions   11  G   codex                     141 M   [on]  other shape
-     ~/.omp/…/sessions    32 M   omp                       9.6 M   [on]
-     ~/.claude/…/memory   —       memory                    2.9 M   [on]  typed facts
-     ~/.relic-vault-unset  ?     vault                     —       [off] path unset
+     source              raw     bank                     index   events
+     ~/.claude/projects  3.7 G   projects                  366 M   402,944
+     …/projects-archive  6.5 G   projects-archive          737 M   984,469
+     …/projects-1sep     13  G   projects-1sep-tue2026     1.5 G  1,641,098
+     ~/.codex/sessions   11  G   codex                     141 M   225,747
+     ~/.omp/…/sessions    32 M   omp                       9.6 M     6,180
+     ~/.claude/…/memory   —       memory                    2.9 M       198
+     <ghq>/*/*/ψ/**.md    —       vaults                    464 M   124,044
+     one oracle's ψ      —       vault                      21 M    10,271
      ~/.hermes             ?     hermes                    —       [off] SQLite
      ~/.omx-runs          39 M   omx-logs                  —       [off] ops logs
                   │
@@ -92,7 +93,7 @@ your repos.
                                     ภาษาไทยเป็นคำบรรยาย -> ภาษา|ไทย|เป็น|คำ|บรรยาย
                  │
                  ▼
- 6 ─ SEARCH                         --bank 90 ms/162  ·  fan-out 356 ms/508 shards
+ 6 ─ SEARCH                         --bank 143 ms/47  ·  fan-out 547 ms/817 shards
 
      search ─┬─ --bank --repo --worktree      where
              ├─ --prose --role                who was speaking
@@ -115,9 +116,14 @@ hit** when that log was read (2026-09-18, 51 queries, median 151 ms). Six stages
 preserve 3.26 M events, and the query log says nearly all the value sits in five shards
 and one-fifteenth of the content. That is an argument for indexing *less*, not faster.
 
-A third number joined them with banks: **34 GB of transcripts compress to a 2.7 GB
-index**, and three of the six banks are overlapping snapshots of the same machine. Some
-of what is stored is stored twice, deliberately — see Banks below.
+A third number joined them with banks: **34 GB of transcripts compress to a 3.2 GB
+index**, and three of the eight banks are overlapping snapshots of the same machine.
+Some of what is stored is stored twice, deliberately — see Banks below.
+
+A fourth arrived with the ports. This index is now read by **three** implementations
+— TypeScript, Python and Rust — and the second and third found six bugs the first
+could not, because one implementation cannot disagree with itself. See
+[Three readers](#three-readers-one-index).
 
 ---
 
@@ -138,7 +144,7 @@ three different machines. Without a bank they collapse into one shard per repo, 
 question "which snapshot did this come from" becomes unanswerable after the fact.
 
 **The same session can therefore exist in two banks, as two physical rows.** That is the
-design, not corruption: 3,258,529 events across six banks is *more* than the 3,238,933 of
+design, not corruption: 3,394,951 events across eight banks is *more* than the 3,238,933 of
 the old flat index, because the duplicates are now stored twice on purpose.
 
 What each surface does about that duplication is not the same, and the difference matters:
@@ -176,7 +182,8 @@ and which bank it writes.
 | `codex` | `codex` | JSONL rollouts, date-nested | on |
 | `omp` | `omp` | JSONL, one dir per encoded cwd | on |
 | `claude-memory` | `memory` | `<project>/memory/*.md`, typed facts | on |
-| `oracle-vault` | `vault` | `ψ/**.md` documents | off — path is per-machine |
+| `oracle-vault` | `vault` | ONE oracle's `ψ/**.md` | off — path is per-machine |
+| `oracle-vaults` | `vaults` | EVERY `<org>/<repo>/ψ/**.md` under the ghq tree | off |
 | `hermes` | `hermes` | **SQLite**, one DB per profile | off |
 | `omx-logs` | `omx-logs` | run logs — ops output, not conversation | off |
 
@@ -210,6 +217,63 @@ transcript, with no path guessing.
 Noise filtering is declarative here rather than heuristic: `active = 1` and
 `compacted = 0` are exact column predicates, unlike `--skip-noise`, which has to infer
 from text shape.
+
+## Three readers, one index
+
+The same `~/.relic` is read by three implementations. This is not redundancy — it is
+the only test that catches a whole class of bug, because **one implementation cannot
+disagree with itself**.
+
+| | lines | commands | direct deps | what it is |
+|---|---|---|---|---|
+| **TypeScript** | 6,305 | 20 | 3 | the **reference**. All writes, the MCP server, the thing `bunx` runs. |
+| **Python** (`python/`) | 4,415 | 20 | 3 | `LanceModel` *is* the schema — the Arrow types come from the type hints. |
+| **Rust** (`rust/`) | 446 | 4 | **0** | index-free paths only, ~2 s build, zero dependencies. |
+
+```bash
+bun src/cli.ts status          # reference
+cd python && uv run relic-py status
+./bin/relic-dispatch.sh shards --count
+```
+
+All three wrap **lancedb 0.39.0 — the same Rust core.** So "pick a faster backend" for
+an engine-bound query would swap identical engines behind different wrappers. Only the
+index-free scans are worth going native for, which is what `relic backend` reports.
+
+### Six bugs the ports found
+
+Every one of these passed the reference's own test suite.
+
+| found by | bug |
+|---|---|
+| Python | `os.scandir().is_dir()` **follows** symlinks; Node's `Dirent.isDirectory()` does not. The vault walker crossed through `ψ/incubate/` into other repos' vaults — **68,719** notes discovered against the correct **10,129**. |
+| Python | JS `.length` counts UTF-16 **code units**, Python `len()` counts **code points**. One emoji made the same event measure 315 vs 316 — and `truncate()` cuts at `MAX_TEXT`, so the same `uid` was stored cut at a different offset. |
+| Python | `repo_key_of` lost the sibling-worktree rule → **28** shards written where the reference writes **27**. |
+| Python | `context_of` was a stub → 18 of 198 session rows carried an empty `worktree`. |
+| Rust | `liveSessions()` scanned `~/.claude/projects` **twice**, because `claude-live` and `claude-memory` both name it. Every running agent was double-reported, through the CLI *and* the MCP tool. |
+| **the reference** | `seek.ts` never skipped `journal.jsonl`, so `relic session <id>` on an unindexed session imported one bogus `workflow_agent` row per workflow run. Python returned 162 files where TypeScript returned 169, and this session has exactly **7** `wf_` runs. |
+
+The Rust one is the clearest case for a second implementation: **both halves of that
+double-count were individually correct**, so no assertion inside the TypeScript could
+have seen it.
+
+### How parity is proved
+
+Not "looks right". Index the same corpus with two implementations into separate
+`--data-root`s, then diff **every row of all three tables by key**:
+
+```
+events    ts=6180 py=6180  only-ts=0 only-py=0  differing=0
+sessions  ts=19   py=19    only-ts=0 only-py=0  differing=0
+files     ts=19   py=19    only-ts=0 only-py=0  differing=0
+```
+
+Parsers are compared event-by-event on real transcripts — claude **117,962** events,
+codex **62,837**, omp **5,001**, all zero-diff — and `discover()` on **49,651** files
+returns the same paths. `relic chain` output is byte-identical, and both MCP servers
+expose the same 8 tools.
+
+---
 
 ## Two front ends: TypeScript (reference) + optional native binary
 
@@ -251,7 +315,7 @@ candidate set, because a faster engine that returns a *different* answer is wors
 than no engine at all — which answer you get would depend on whether a binary
 happens to be built.
 
-Measured on this machine, 508 shards across 6 banks:
+Measured on this machine, 817 shards across 8 banks:
 
 | | answers | time |
 |---|---|---|
@@ -395,7 +459,7 @@ relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 
 ### Fan-out cost, and what it is not
 
-An unfiltered search asks all 508 shards. They are queried concurrently, capped at
+An unfiltered search asks all 817 shards. They are queried concurrently, capped at
 `min(16, cpus-2)` — unbounded would trade a latency problem for a file-descriptor one.
 
 Measured on `"peak concurrency"`, average of 3 runs each (single runs vary by ~2 s, so
@@ -796,7 +860,7 @@ copy a model gets is the one no human ever runs by hand.
 
 Two behaviours worth knowing:
 
-- **Narrowing is not cosmetic.** Measured on this index at 508 shards: unfiltered is
+- **Narrowing is not cosmetic.** Measured on this index at 817 shards: unfiltered is
   **356 ms**, `bank=projects-archive` is **90 ms over 162 shards**, and a single `repo`
   is one shard. Every tool description that takes `repo` or `bank` says so, so the model
   narrows by default. (An earlier measurement at 345 shards, before shards were queried
@@ -922,11 +986,51 @@ Duplicate keys and duplicate banks are dropped with a warning on stderr rather t
 silently merged; `relic sources` reports how many banks a run would write.
 
 Built-in and on: `claude-live`, `claude-archive`, `claude-1sep`, `codex`, `omp`,
-`claude-memory`. Built-in and **off**: `oracle-vault` (path is per-machine), `hermes`,
-and `omx-logs` (those `.jsonl` files are ops logs, not conversation, and indexing them
-floods search with noise).
+`claude-memory`. Built-in and **off**: `oracle-vault` and `oracle-vaults` (vault
+locations are per-machine), `hermes`, and `omx-logs` (those `.jsonl` files are ops
+logs, not conversation, and indexing them floods search with noise).
+
+### Every oracle's vault, not one
+
+`oracle-vault` names ONE path. `oracle-vaults` walks `<ghq>/github.com/<org>/<repo>/ψ`
+and finds all of them — measured here: **413** ψ paths, **386** distinct after
+resolving symlinks, **116,849** notes in 43 s.
+
+```bash
+relic index --corpus oracle-vaults
+```
+
+Three things it has to get right, each of which fails silently:
+
+- **A symlinked ψ is invisible** to `readdir` — `isDirectory()` is false for a symlink,
+  and the `/psi` skill deliberately points a plain repo's ψ at a caretaker oracle's
+  vault. 77 of 413 do this. The entry point is resolved with one `realpath`.
+- **Recursion must NOT follow symlinks.** `ψ/incubate/<org>/<repo>/origin` links back
+  out into the ghq tree, so a walker that follows everything goes vault → repo →
+  another vault. The same `isDirectory()===false` that causes the first problem
+  prevents this one, so the fix is the entry point only.
+- **A vault can contain another vault**, so dedup is by CONTAINMENT, not equality —
+  111 of 116,952 files were emitted twice before that.
 
 ---
+
+## `tier` and `kind` are two axes
+
+`tier` is a POSITION in a transcript hierarchy — `session`, `subagent`,
+`workflow_agent`. `kind` is WHAT a row is — `transcript`, `note`, `memory`,
+`message`.
+
+They used to be one column, so the default filter `(tier = 'session' OR tier = 'note')`
+read as "the main tiers" and actually meant "one tier plus one kind". That cost
+something real once: a tier default of `"session"` made 10,000 freshly indexed vault
+notes invisible while the result count looked perfectly healthy.
+
+`kind` is added by the lazy `widen()` migration, so **shards written before it have no
+such column at all** — not an empty one. A filter that merely guards with `kind = ''`
+still *names* the column, which is invalid SQL there: every shard throws, the
+per-shard catch swallows it, and search returns zero matches while reporting a healthy
+shard count. The read path checks the schema and picks its filter before building any
+SQL.
 
 ## Data model
 
@@ -1099,8 +1203,8 @@ deliberately — the English stemmer mangles identifiers (`structured_output_mod
 
 ## Performance
 
-Measured 2026-09-18 at **508 shards / 3,258,529 events / 40,865 sessions**, index 2.7 GB
-over ~34 GB of raw transcripts:
+Measured 2026-09-18 at **817 shards / 3,394,951 events / 167,853 sessions**, index
+3.2 GB over ~34 GB of raw transcripts plus 116,849 vault notes:
 
 | command | latency | shards read |
 |---|---|---|
@@ -1108,7 +1212,7 @@ over ~34 GB of raw transcripts:
 | `search --bank projects-archive` | **90 ms** | 162 |
 | `search` (unfiltered) | **356 ms** | 508 |
 | `status` (with both clocks) | **1.42 s** | 508 |
-| `pending` (whole corpus) | **1.37 s** | 40,865 files scanned |
+| `pending` (whole corpus) | **2.0 s** | 49,651 files scanned |
 | `pending --list 5` | 1.8 s | + 5 files opened |
 | `memory` (198 memories joined to sessions) | 1.73 s | 508 |
 
