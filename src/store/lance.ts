@@ -39,6 +39,12 @@ export interface EventRow {
   org: string;
   project: string;        // nested oracle/lab/incubated repo, "" when not nested
   dir: string;            // directory below the worktree, e.g. "ψ/memory/learnings"
+  // Claude Code memory only — "" for every other source. Kept as columns rather than
+  // a separate table so search/show/sessions/MCP stay ONE query path; a mostly-empty
+  // string column is cheap in a columnar store, a second table is a second code path
+  // in all seven tools.
+  mem_type: string;       // project | feedback | reference | user
+  origin_session: string; // the session that produced this memory — the join key
 }
 
 export interface SessionRow {
@@ -188,7 +194,7 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const limit = opts.limit ?? 20;
@@ -205,6 +211,7 @@ export class LanceStore {
     if (opts.project) filters.push(`project = ${sqlStr(opts.project)}`);
     // dir is a PREFIX match: --dir ψ/memory must return ψ/memory/learnings too.
     if (opts.dir)     filters.push(`dir LIKE '${opts.dir.replace(/'/g, "''")}%'`);
+    if (opts.memType) filters.push(`mem_type = ${sqlStr(opts.memType)}`);
     if (opts.path)     filters.push(`cwd LIKE '%${opts.path.replace(/'/g, "''")}%'`);
     // ts is ISO-8601 with a Z suffix, so lexicographic comparison IS chronological —
     // no parsing, and it pushes down into the scan. Verified on a 20k-row sample that

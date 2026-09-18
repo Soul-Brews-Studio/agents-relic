@@ -6,6 +6,7 @@ import { parseCodex } from "./shapes/codex.js";
 import { parseOmp } from "./shapes/omp.js";
 import { parseVault } from "./shapes/vault.js";
 import { parseHermes } from "./shapes/hermes.js";
+import { parseMemory } from "./shapes/memory.js";
 import type { Parser } from "./types.js";
 
 const HOME = homedir();
@@ -13,7 +14,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat" | "omp" | "vault" | "hermes";   // how to find files under `path`
+  walk: "claude-tiers" | "flat" | "omp" | "vault" | "hermes" | "memory";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -83,6 +84,15 @@ export const BUILTIN: SourceDef[] = [
     // Hermes — SQLite, not JSONL. Verified (issue #6): there genuinely is no
     // per-session JSONL beside the DB, unlike the omp case. One DB per profile,
     // many sessions each; the walker emits one entry per session.
+    key: "claude-memory", path: join(HOME, ".claude", "projects"),
+    walk: "memory", parser: parseMemory, enabled: true,
+    note: "Claude Code memory — typed facts (project/feedback/reference/user)",
+  },
+  {
+    // Claude Code's OWN memory — durable typed facts the agent chose to keep, each
+    // with a pointer back to the session that produced it. A different kind of thing
+    // from a transcript, and the only source that can answer "which session taught me
+    // this". Measured: 67 dirs, 227 files, 172 typed, 161 with originSessionId.
     key: "hermes", path: join(HOME, ".hermes"),
     walk: "hermes", parser: parseHermes, enabled: false,
     note: "Hermes — SQLite state.db per profile, one entry per session",

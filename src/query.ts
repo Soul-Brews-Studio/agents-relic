@@ -27,7 +27,7 @@ export interface Scope {
 export interface SearchOpts extends Scope {
   limit?: number;
   tier?: string; source?: string; worktree?: string; path?: string; role?: string;
-  org?: string; project?: string; dir?: string;
+  org?: string; project?: string; dir?: string; memType?: string;
   /**
    * Include subagent and workflow_agent transcripts. Default FALSE — see searchEvents.
    */
@@ -128,7 +128,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const mainOnly = !o.tier && !o.allTiers;
   const tier = o.tier;
   const opts = { limit, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
-                 org: o.org, project: o.project, dir: o.dir,
+                 org: o.org, project: o.project, dir: o.dir, memType: o.memType,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
 
   let next = 0;

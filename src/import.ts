@@ -144,6 +144,8 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         source: file.source, tier: file.tier,
         worktree: ctx.worktree, cwd: p.cwd ?? "",
         org: loc.org, project: loc.project, dir: loc.dir,
+        mem_type: String((p as any).memType ?? ""),
+        origin_session: String((p as any).originSessionId ?? ""),
       }));
 
       const batch = pend(shardKey);
