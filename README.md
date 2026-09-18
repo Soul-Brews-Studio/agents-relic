@@ -218,9 +218,27 @@ binary is strictly optional.
 
 ```bash
 bunx github:Soul-Brews-Studio/agents-relic status     # TS, nothing to install
-cargo build --release --manifest-path rust/Cargo.toml  # optional, ~14s
+cargo build --release --manifest-path rust/Cargo.toml  # optional, ~2s (zero deps)
 ./bin/relic-dispatch.sh now                            # native when present, TS otherwise
+./bin/relic-dispatch.sh banks                          # bank names
+./bin/relic-dispatch.sh shards --bank codex --count    # 47
 ```
+
+Native implements the **index-free** paths: `now`, `banks`, `shards`. Enumerating
+shards is pure `readdir` — which bank directories exist, and which repos under each —
+so it needs no engine and stays in the zero-dependency default build.
+
+Measured on this machine, 508 shards across 6 banks:
+
+| | answers | time |
+|---|---|---|
+| `relic-native shards --count` | which shards exist | **22 ms** |
+| `bun src/cli.ts --help` | nothing — startup floor | 79 ms |
+| `uv run relic-py --help` | nothing — startup floor | 570 ms |
+
+The native binary finishes the whole enumeration in less time than either runtime
+takes to print its own help. Counting ROWS inside those shards is a different
+question and still belongs to the engine — see below.
 
 ### Why only *some* commands are native
 

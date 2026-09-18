@@ -12,7 +12,7 @@ NATIVE="$HERE/rust/target/release/relic-native"
 # Keep in sync with main.rs's match arms. A command listed here but not actually
 # implemented natively exits 2 and does NOT fall through — so only add a name
 # here after its arm exists.
-NATIVE_CMDS="now"
+NATIVE_CMDS="now banks shards"
 
 cmd="${1:-help}"
 if [ -x "$NATIVE" ] && printf '%s\n' $NATIVE_CMDS | grep -qx "$cmd"; then

@@ -111,6 +111,119 @@ fn human_age(s: u64) -> String {
     else { format!("{:.1}h", s as f64 / 3600.0) }
 }
 
+// ---------------------------------------------------------------- banks & shards
+//
+// A BANK is one whole source root — a Claude projects dir, codex, omp, memory —
+// and it is the top level of the shard path:
+//
+//     ~/.relic/banks/<bank>/github.com/<org>/<repo>/
+//
+// Enumerating that is pure readdir, so it stays in the DEFAULT zero-dependency
+// build alongside `now`. Counting rows inside a shard needs the lance engine and
+// therefore the `index` feature; listing which shards exist does not, and the
+// listing is most of what a caller wants before it asks anything expensive.
+
+struct Shard {
+    key: String,  // "<bank>/github.com/<org>/<repo>" — display only, no filter takes it
+    dir: PathBuf,
+    bank: String,
+    repo: String, // "github.com/<org>/<repo>", or "_unresolved"
+}
+
+fn relic_root() -> PathBuf {
+    if let Ok(r) = std::env::var("RELIC_DATA_ROOT") {
+        if !r.is_empty() {
+            return PathBuf::from(r);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".relic")
+}
+
+/// Directory names one level under `p`, sorted, skipping dot-dirs AND `*.lance`.
+///
+/// The `.lance` skip is not cosmetic: LanceDB's own table directories live INSIDE
+/// a shard, and a walker that does not skip them enumerates `events.lance` as if
+/// it were an org or a repo.
+fn subdirs(p: &Path) -> Vec<String> {
+    let mut out: Vec<String> = match std::fs::read_dir(p) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !n.starts_with('.') && !n.ends_with(".lance"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+/// Every shard under the index root. Three levels below `banks/`, plus the
+/// `_unresolved` bucket which sits directly under a bank with no host/org/repo.
+fn list_shards(root: &Path) -> Vec<Shard> {
+    let mut out = Vec::new();
+    let banks_root = root.join("banks");
+    for bank in subdirs(&banks_root) {
+        let bank_dir = banks_root.join(&bank);
+
+        let unresolved = bank_dir.join("_unresolved");
+        if unresolved.is_dir() {
+            out.push(Shard {
+                key: format!("{bank}/_unresolved"),
+                dir: unresolved,
+                bank: bank.clone(),
+                repo: "_unresolved".to_string(),
+            });
+        }
+
+        for host in subdirs(&bank_dir) {
+            if host == "_unresolved" {
+                continue;
+            }
+            let host_dir = bank_dir.join(&host);
+            for org in subdirs(&host_dir) {
+                let org_dir = host_dir.join(&org);
+                for repo in subdirs(&org_dir) {
+                    let repo_path = format!("{host}/{org}/{repo}");
+                    out.push(Shard {
+                        key: format!("{bank}/{repo_path}"),
+                        dir: org_dir.join(&repo),
+                        bank: bank.clone(),
+                        repo: repo_path,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `--bank` is EXACT; `--repo` is a substring of the REPO PORTION only.
+///
+/// Matching `--repo` against `key` would make `--repo projects` quietly select a
+/// whole bank, because the key begins with the bank name.
+fn filter_shards(shards: Vec<Shard>, bank: Option<&str>, repo: Option<&str>) -> Vec<Shard> {
+    shards
+        .into_iter()
+        .filter(|s| bank.map(|b| s.bank == b).unwrap_or(true))
+        .filter(|s| repo.map(|r| s.repo.contains(r)).unwrap_or(true))
+        .collect()
+}
+
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            return it.next().map(|s| s.as_str());
+        }
+        if let Some(v) = a.strip_prefix(&format!("{name}=")) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
@@ -132,8 +245,39 @@ fn main() {
                 }
             }
         }
+        "banks" => {
+            let root = relic_root();
+            let shards = list_shards(&root);
+            if shards.is_empty() {
+                eprintln!("no shards under {}", root.join("banks").display());
+                std::process::exit(1);
+            }
+            let mut names: Vec<&str> = shards.iter().map(|s| s.bank.as_str()).collect();
+            names.sort();
+            names.dedup();
+            for n in names {
+                println!("{n}");
+            }
+        }
+        "shards" => {
+            let root = relic_root();
+            let shards = filter_shards(
+                list_shards(&root),
+                flag(&args, "--bank"),
+                flag(&args, "--repo"),
+            );
+            if args.iter().any(|a| a == "--count") {
+                println!("{}", shards.len());
+            } else {
+                for s in &shards {
+                    println!("{}\t{}", s.key, s.dir.display());
+                }
+            }
+        }
         _ => {
-            eprintln!("relic-native — read paths only. Implemented: now");
+            eprintln!("relic-native — read paths only. Implemented: now, banks, shards");
+            eprintln!("  banks                          bank names on this machine");
+            eprintln!("  shards [--bank B] [--repo S] [--count]");
             eprintln!("Everything else lives in the TypeScript CLI: relic <cmd>");
             std::process::exit(2);
         }
