@@ -357,6 +357,96 @@ with noise).
 
 ---
 
+## Data model
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  relic — data model and its joins                        measured 2026-09-18 ║
+║  3 tables · 0 foreign keys · file_path is the real key, session_uuid is not  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+ ONE LANCEDB DIRECTORY PER REPO    ~/.relic/github.com/<org>/<repo>/
+
+                       ┌──────────────────────────┐
+                       │  files      1,881 rows   │   THE MANIFEST
+                       │  ─────────────────────   │   written PER FILE, so Ctrl-C
+                       │  file_path   PK  UNIQUE  │   resumes instead of restarting
+                       │  repo_key                │
+                       │  mtime  size             │   (path,mtime,size) = the import
+                       │  imported_at             │   diff. No content hashing.
+                       └────────────┬─────────────┘
+                                    │  file_path   1:1
+                                    ▼
+                       ┌──────────────────────────┐
+                       │  sessions   1,881 rows   │   ONE ROW PER TRANSCRIPT FILE
+                       │  ─────────────────────   │
+                       │  file_path   PK  UNIQUE  │◄── the join everything uses
+                       │  session_uuid    153 !!  │    NOT unique — see below
+                       │  tier  source            │    session|subagent|workflow_agent
+                       │  cwd  worktree  repo_key │    identity, from the JSONL
+                       │  started_at  ended_at    │    the session's OWN clock,
+                       │  event_count  line_count │    never file mtime
+                       │  description             │    first user message
+                       └────────────┬─────────────┘
+                                    │  file_path   1:N   (avg 63 events/file)
+                                    ▼
+                       ┌──────────────────────────┐
+                       │  events   118,780 rows   │   ONE ROW PER INDEXED BLOCK
+                       │  ─────────────────────   │
+                       │  uid         PK  UNIQUE  │   sha1(source, BASENAME, seq)
+                       │  file_path       FK→     │   path EXCLUDED on purpose:
+                       │  session_uuid            │   same file under two roots
+                       │  seq                     │   dedups instead of doubling
+                       │  role                    │   labelled by BLOCK, not envelope
+                       │  ts  text                │
+                       │  repo_key worktree cwd   │   denormalised so a filter can
+                       │  source  tier            │   push down into the FTS scan
+                       └────────────┬─────────────┘
+                                    │
+                            text_idx(text)          ICU · stem:false · maxToken 128
+                                    │
+                                    ▼
+                               BM25 search
+
+ ── NO FOREIGN KEYS EXIST ────────────────────────────────────────────────────
+    LanceDB does not have them. Every edge above is a CONVENTION the writer keeps,
+    not a constraint the store enforces. Nothing stops an orphaned event, so
+    deleteEventsOf(file) runs before re-import — a SHRINKING file would otherwise
+    leave rows behind that no session row points at.
+
+ ── session_uuid IS NOT A KEY ────────────────────────────────────────────────
+    1,881 files  ->  153 distinct session_uuid       22 uuids span >1 file
+    Subagent and workflow-agent transcripts INHERIT the parent's uuid, so a uuid
+    identifies a session TREE, not a file. Filtering by it returns the parent plus
+    every child. Use file_path when you mean one transcript.
+    (The same collision makes an 8-char uuid prefix unsafe as an identifier.)
+
+ ── WHAT IS NOT STORED ───────────────────────────────────────────────────────
+    No full text of a file that exists on disk (--skip-noise drops readbacks).
+    No vectors yet — they land in `events`, same table, no migration.
+    The index is a POINTER: (file_path, seq) -> `show` re-reads the source .jsonl.
+
+ SIDECARS   ~/.relic/trace.jsonl    one line per query, + `opened` on show
+            ~/.relic/skipped.jsonl  one line per dropped event, with the rule
+            both JSONL on purpose: relic can index its own logs, no new reader
+
+ LEGEND  PK = key in practice   FK→ = join by convention, unenforced   !! = trap
+```
+
+**The reveal.** `session_uuid` looks like the primary key and is **12:1 non-unique** —
+1,881 files carry only 153 distinct uuids, because subagent and workflow-agent
+transcripts *inherit* the parent's. A uuid identifies a session **tree**, not a
+transcript, so filtering by it returns the parent plus every child. Use `file_path` when
+you mean one transcript. The same collision makes an 8-character uuid prefix unsafe as
+an identifier.
+
+And there are **no foreign keys at all** — LanceDB has none, so every edge is a
+convention the writer keeps. That is why `deleteEventsOf(file)` runs before re-import: a
+shrinking file would otherwise strand events no session row points at, and nothing in
+the store would object.
+
+---
+
 ## Design notes
 
 ### Three tiers, and the third is the one that gets missed
