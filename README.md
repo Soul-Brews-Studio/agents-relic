@@ -268,6 +268,92 @@ with noise).
 
 ## How it works
 
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  relic — agent session transcripts, indexed              measured 2026-09-18 ║
+║  345 shards · 3.2 M events · 37,285 sessions · 9.2 GB index over 34 GB raw   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+ 1 ─ SOURCES                        config: ~/.relic/sources.json, no code change
+
+     ~/.claude/projects           3.7 G    6,418 files   [on]
+     ~/.claude/projects-archive   6.5 G    7,052 files   [on]
+     ~/.claude/projects-1sep      13  G   25,397 files   [on]  largest, added last
+     ~/.codex/sessions            11  G    1,750 files   [on]  different shape
+     ~/.omx-runs                   39 M      449 files   [off] ops logs, not talk
+                  │
+                  │   THREE TIERS, and the third is the one that gets missed
+                  │     <project>/<uuid>.jsonl                          session
+                  │     <project>/<uuid>/subagents/<agent>.jsonl        subagent
+                  │     <project>/<uuid>/subagents/workflows/wf_*/…     workflow_agent
+                  ▼
+ 2 ─ PARSE                          one Parser contract, one file per shape
+
+     claude.ts ──┐                  Claude: the whole file is transcript
+     codex.ts  ──┤                  Codex:  only response_item is transcript;
+                 │                          event_msg / token_usage = UI noise
+                 ▼
+        blockRole(content)          LABEL BY WHAT THE BLOCK IS, NOT ITS ENVELOPE
+                 │                  a tool_result arrives inside a `user` message
+                 │
+      ┌──────────┼──────────┬───────────┬──────────┐
+      ▼          ▼          ▼           ▼          ▼
+  tool_result tool_use  assistant     user     thinking
+    40.1%      40.1%      12.1%       6.8%       0.3%
+                                        ^
+                                   THE HUMAN IS 6.8% OF A TRANSCRIPT
+                 │
+                 ▼
+ 3 ─ FILTER                         --skip-noise, opt-in, every drop logged
+
+     file-readback    810 rows  2.64 MB   3 ascending line numbers = a file dump
+     edit-payload     456       0.69 MB   the file now exists on disk
+     binary-blob       55       0.20 MB   base64
+     navigation-call  769       0.08 MB   [tool_use Read] — intent, no content
+                                          ── kept: bash, errors, all prose
+     DISCARDED ──────────────────────► ~/.relic/skipped.jsonl   (the proof)
+                 │
+                 ▼
+ 4 ─ ROUTE                          identity comes from the JSONL, never a column
+
+     cwd field ──► repoKeyOf ──► github.com/<org>/<repo>   host-independent
+                    │                                       (same repo on 3 machines
+                    └──► contextOf ──► worktree             = 1 shard, not 3)
+                 │
+                 ▼
+ 5 ─ STORE                          ~/.relic/github.com/<org>/<repo>/
+
+     events · sessions · files      LanceDB. files = the manifest, written PER FILE,
+                 │                  so Ctrl-C resumes instead of restarting
+                 ▼
+        ICU full-text index         icu 1-4 ms  ·  ngram(3) 2-36 ms and MISSES "ok"
+        stem:false                  ·  raw LIKE 27-41 ms
+                                    ภาษาไทยเป็นคำบรรยาย -> ภาษา|ไทย|เป็น|คำ|บรรยาย
+                 │
+                 ▼
+ 6 ─ SEARCH                         --repo ~200 ms  ·  fan-out ~1.8 s (345 shards)
+
+     search ─┬─ --repo --worktree --path      where
+             ├─ --prose --role                who was speaking
+             ├─ --since --until               when
+             └─ --plain --json --jsonl        for the shell
+                 │
+                 ├──► show <file> --seq N     reads the SOURCE .jsonl, not the index
+                 │                            (the index is a pointer, not an archive)
+                 └──► trace.jsonl             51 queries · 4 opened · median 151 ms
+                                              340 of 345 shards: never a best hit
+
+ LEGEND   [on]/[off] = source enabled   ! = caveat   -> = flows to
+ ─────────────────────────────────────────────────────────────────────────────
+ rg reads all 34 GB in ~0.7 s. This index buys FACETS, not reach or speed.
+```
+
+**What the picture shows that the prose does not.** Two numbers argue with each other:
+**the human is 6.8% of a transcript**, and **340 of 345 shards have never produced a
+best hit**. Five stages carefully preserve 3.2 M events, and the query log says nearly
+all the value sits in five shards and one-fifteenth of the content. That is an argument
+for indexing *less*, not faster.
+
 ### Three tiers, and the third is the one that gets missed
 
 ```
