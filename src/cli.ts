@@ -6,6 +6,7 @@ import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
+import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { repoKeyOf, contextOf, cwdOfFile, shardDirFor, ghqRoot, defaultRoot, guardShardDir, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -62,6 +63,7 @@ class Shards {
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
+  const skipNoise = Boolean(f["skip-noise"]);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
 
@@ -94,7 +96,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   // only knowable after parsing. Parsing is cheap relative to writing, so the order is:
   // parse -> route -> skip-or-write. The manifest still prevents the expensive half.
   const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
-  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0;
+  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skipped_noise = 0;
 
   for (const file of found) {
     try {
@@ -113,7 +115,19 @@ async function cmdIndex(f: Record<string, string | boolean>) {
       const seen = man.get(file.path);
       if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
 
-      const events: EventRow[] = p.events.map(e => ({
+      const dropped: any[] = [];
+      const kept = skipNoise
+        ? p.events.filter(e => {
+            const v = classify(e.text, e.role);
+            if (v.skip) dropped.push({ uid: e.uid, file_path: file.path, seq: e.seq, role: e.role,
+              rule: v.rule, bytes: e.text.length, head: e.text.replace(/\s+/g, " ").slice(0, 120) });
+            return !v.skip;
+          })
+        : p.events;
+      skipped_noise += dropped.length;
+      if (dropped.length) logSkipped(dropped, dataRoot);
+
+      const events: EventRow[] = kept.map(e => ({
         uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
         seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
         source: file.source, tier: file.tier,
@@ -128,7 +142,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
         cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
         workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
         file_mtime: file.mtime, file_size: file.size,
-        line_count: p.lines, event_count: p.events.length, bad_lines: p.badLines,
+        line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
         started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
         description: p.description ?? "", imported_at: nowISO(),
       });
@@ -168,6 +182,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(done - skipped - filtered)} files -> ${fmt(added)} events`);
+  if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--skip-noise) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
   console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
@@ -377,7 +392,7 @@ const cmd = pos[0];
 if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
-  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--dry-run]
+  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
   search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
@@ -386,6 +401,7 @@ if (!cmd || f.help) {
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
+  skipped                      what --skip-noise dropped, and the proof
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
   ui      [--port 4477]        local viewer: click a repo, search, read context
 
@@ -477,5 +493,23 @@ else if (cmd === "trace") {
   }
 }
 else if (cmd === "sessions") await cmdSessions(f);
+else if (cmd === "skipped") {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const st = readSkipped(dataRoot);
+  if (!st) { console.log(`nothing skipped yet — ${skippedPath(dataRoot)}`); }
+  else if (outFmt(f) === "json") console.log(JSON.stringify(st, null, 2));
+  else {
+    console.log(`${fmt(st.total)} events dropped · ${(st.bytes / 1e6).toFixed(1)} MB of text\n`);
+    for (const r of st.byRule)
+      console.log(`  ${r.rule.padEnd(26)} ${String(fmt(r.n)).padStart(7)}  ${(r.bytes / 1e6).toFixed(2).padStart(7)} MB`);
+    console.log("\nproof — what each rule actually dropped:");
+    let last = "";
+    for (const x of st.samples) {
+      if (x.rule !== last) { console.log(`\n  [${x.rule}]`); last = x.rule; }
+      console.log(`    ${String(x.bytes).padStart(6)}b  ${x.head.slice(0, 92)}`);
+      console.log(`            ${x.file_path.split("/").pop()} --seq ${x.seq}`);
+    }
+  }
+}
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
