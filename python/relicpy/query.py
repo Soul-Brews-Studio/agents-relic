@@ -175,11 +175,21 @@ def search_events(query: str, s: Scope, limit: int = 20,
     """
     shards = pick_shards(s)
     t0 = time.time()
-    where = None if all_tiers else "tier = 'session'"
 
     def one(sh: Shard) -> list[dict]:
         try:
-            rows = LanceStore.open(sh.dir).search(query, limit=limit, where=where)
+            st = LanceStore.open(sh.dir)
+            # PER SHARD, not once: the filter depends on whether THIS shard has the
+            # `kind` column, and 509 of the 817 on disk do not. A single filter computed
+            # up front is invalid SQL on one of the two populations, and the per-shard
+            # catch below turns that into "no matches" rather than an error.
+            #
+            # It also used to read `tier = 'session'` flat, which silently excluded every
+            # vault note and every hermes message from the default search here while the
+            # TypeScript implementation included them — the two answered the same query
+            # differently, and neither reported a problem.
+            where = None if all_tiers else st.main_tiers_filter()
+            rows = st.search(query, limit=limit, where=where)
         except Exception:
             return []
         for r in rows:
