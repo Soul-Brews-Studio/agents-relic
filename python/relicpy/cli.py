@@ -42,6 +42,17 @@ def _scope(a: argparse.Namespace) -> Scope:
                  repo=getattr(a, "repo", None), bank=getattr(a, "bank", None))
 
 
+def _fmt(a: argparse.Namespace) -> str:
+    """Output mode. plain and jsonl are line-oriented so they compose with the shell."""
+    if _json(a):
+        return "json"
+    if getattr(a, "jsonl", False):
+        return "jsonl"
+    if getattr(a, "plain", False):
+        return "plain"
+    return "pretty"
+
+
 def _json(a: argparse.Namespace) -> bool:
     """--json is SUPPRESS-defaulted, so the attribute may simply not exist."""
     return bool(getattr(a, "json", False))
@@ -390,6 +401,145 @@ def cmd_shards(a) -> int:
     return 0
 
 
+
+def cmd_chain(a) -> int:
+    from .chain import build_chain, render_chain
+    from .query import resolve_session
+    res = resolve_session(a.id, _scope(a), no_index=a.no_index)
+    if not res["rows"]:
+        print(f"no session matches {a.id}", file=sys.stderr)
+        return 1
+    c = build_chain(a.id, res["rows"])
+    if _json(a):
+        print(json.dumps({"id": c.id, "total": c.total, "wall_ms": c.wall_ms,
+                          "work_ms": c.work_ms,
+                          "groups": [{"run": g.run, "rows": len(g.rows), "peak": g.peak,
+                                      "start_ms": g.start_ms, "end_ms": g.end_ms}
+                                     for g in c.groups]}, indent=2))
+        return 0
+    if res["imported"]:
+        print(f"({res['imported']} transcripts imported on demand)\n")
+    print(render_chain(c, a.width, a.limit))
+    return 0
+
+
+def cmd_read(a) -> int:
+    from .sources import parser_for
+    from .time import local_date_time
+    parsed = parser_for(a.file)(a.file)
+    rows = [e for e in parsed.events
+            if (not a.role or e.role == a.role)
+            and (not a.prose or e.role in ("user", "assistant", "thinking", "note"))]
+    mode = _fmt(a)
+    if mode == "json":
+        print(json.dumps({"file": a.file, "title": parsed.title,
+                          "events": [e.model_dump() for e in rows]}, indent=2, default=str))
+    elif mode == "jsonl":
+        for e in rows:
+            print(json.dumps(e.model_dump(), default=str))
+    elif mode == "plain":
+        for e in rows:
+            print(f"{e.seq}\t{e.role}\t{' '.join(e.text.split())}")
+    else:
+        if parsed.title:
+            print(f"{parsed.title}\n")
+        for e in rows:
+            print(f"#{e.seq:>4} {e.role}" + (f"  {local_date_time(e.ts)}" if e.ts else ""))
+            print("\n".join("  " + l for l in e.text.split("\n")))
+            print()
+    return 0
+
+
+def cmd_trace(a) -> int:
+    from .repo import list_shards
+    from .trace import read_trace
+    known = [s.repo for s in list_shards(getattr(a, "data_root", None))]
+    t = read_trace(getattr(a, "data_root", None), known)
+    if not t:
+        print("no query log yet — run a search first")
+        return 0
+    if _json(a):
+        print(json.dumps(t, indent=2))
+        return 0
+    print(f"{t['total']} queries · {t['span']} · median {t['median_ms']} ms\n")
+    print("answered by (top hit's repo)")
+    for r in t["by_repo"][:a.limit]:
+        print(f"  {r['n']:>5}  {r['repo']}")
+    print(f"\nzero-hit queries: {t['zero_hit']}/{t['total']}")
+    if t["fts_misses"]:
+        # A LIKE fallback is 7-28x slower and unranked, so it is worth surfacing.
+        print(f"fts fallbacks:    {t['fts_misses']}  (LIKE scan — slower, no _score)")
+    print("slowest")
+    for r in t["slowest"]:
+        print(f"  {r['ms']:>6} ms  {r['q'][:60]}")
+    if t["dead_shards"]:
+        print(f"\n{len(t['dead_shards'])} of {len(known)} shards have never produced a best hit")
+    return 0
+
+
+def cmd_skipped(a) -> int:
+    from .noise import read_skipped
+    r = read_skipped(getattr(a, "data_root", None), a.limit)
+    if _json(a):
+        print(json.dumps(r, indent=2))
+        return 0
+    if not r["total"]:
+        print("nothing dropped yet — --skip-noise is opt-in, and every drop is logged here")
+        return 0
+    print(f"{r['total']:,} events dropped · {r['bytes']/1e6:.2f} MB\n")
+    for b in r["by_rule"]:
+        print(f"  {b['rule']:<22} {b['n']:>7}  {b['bytes']/1e6:>7.2f} MB")
+    print("\nmost recent:")
+    for x in r["rows"]:
+        print(f"  {x.get('rule','?'):<22} {str(x.get('head',''))[:80]}")
+    return 0
+
+
+def cmd_backend(a) -> int:
+    """Python has no native binary — say so plainly rather than implying one exists."""
+    import platform
+    info = {
+        "implementation": "python", "runtime": platform.python_version(),
+        "engine": "lancedb (the same Rust core every front end wraps)",
+        "native_binary": None,
+        "note": "the optional relic-native binary accelerates the TypeScript live scan; "
+                "relicpy has no equivalent and does not shell out to it",
+    }
+    if _json(a):
+        print(json.dumps(info, indent=2))
+        return 0
+    for k, v in info.items():
+        print(f"  {k:<16} {v}")
+    return 0
+
+
+def cmd_mcp(a) -> int:
+    from .mcp import serve
+    return serve()
+
+
+def cmd_dig(a) -> int:
+    """Session timeline as JSON — dig.py's contract, all three tiers.
+
+    Built from the INDEX rather than by re-walking, which is the whole point: the
+    third tier (workflow_agent) is one directory deeper than an obvious glob reaches.
+    """
+    from .query import list_sessions, name_of
+    r = list_sessions(_scope(a), since=a.since, limit=a.count)
+    out = [{
+        "sessionId": str(x.get("session_uuid"))[:12],
+        "repoName": str(x.get("repo") or "").split("/")[-1],
+        "startGMT7": _local(x.get("started_at") or ""),
+        "endGMT7": _local(x.get("ended_at") or ""),
+        "events": int(x.get("event_count") or 0),
+        "tier": x.get("tier"),
+        "gitBranch": x.get("git_branch") or "",
+        "summary": name_of(x),
+    } for x in r["rows"]]
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Global flags go on a PARENT parser that every subcommand inherits, not only on
     # the top-level one.
@@ -498,9 +648,56 @@ def main(argv: list[str] | None = None) -> int:
     nw.add_argument("--limit", type=int, default=15)
     nw.set_defaults(func=cmd_now)
 
+    lv = sub.add_parser("live", parents=[common], help="alias for `now`")
+    lv.add_argument("--all", action="store_true")
+    lv.add_argument("--cwd"); lv.add_argument("--window", type=int, default=300)
+    lv.add_argument("--limit", type=int, default=15)
+    lv.set_defaults(func=cmd_now)
+
     sr = sub.add_parser("sources", parents=[common],
                         help="what this machine has, and what is on/off")
     sr.set_defaults(func=cmd_sources)
+
+
+    ch = sub.add_parser("chain", parents=[common],
+                        help="the session tree on a TIME axis — what ran in parallel")
+    ch.add_argument("id")
+    ch.add_argument("--bank"); ch.add_argument("--repo")
+    ch.add_argument("--width", type=int, default=40)
+    ch.add_argument("--limit", type=int, default=8)
+    ch.add_argument("--no-index", action="store_true")
+    ch.set_defaults(func=cmd_chain)
+
+    rd = sub.add_parser("read", parents=[common],
+                        help="a whole transcript as readable conversation, any shape")
+    rd.add_argument("file")
+    rd.add_argument("--role"); rd.add_argument("--prose", action="store_true")
+    rd.add_argument("--jsonl", action="store_true"); rd.add_argument("--plain", action="store_true")
+    rd.set_defaults(func=cmd_read)
+
+    tr = sub.add_parser("trace", parents=[common],
+                        help="your own query log: who answers, what is dead")
+    tr.add_argument("--limit", type=int, default=10)
+    tr.set_defaults(func=cmd_trace)
+
+    sk = sub.add_parser("skipped", parents=[common],
+                        help="what --skip-noise dropped, and the proof")
+    sk.add_argument("--limit", type=int, default=20)
+    sk.set_defaults(func=cmd_skipped)
+
+    bk = sub.add_parser("backend", parents=[common],
+                        help="which engine answers what, in this implementation")
+    bk.set_defaults(func=cmd_backend)
+
+    dg = sub.add_parser("dig", parents=[common],
+                        help="session timeline as JSON — dig.py's contract, all 3 tiers")
+    dg.add_argument("count", nargs="?", type=int, default=10)
+    dg.add_argument("--bank"); dg.add_argument("--repo"); dg.add_argument("--since")
+    dg.set_defaults(func=cmd_dig)
+
+    mc = sub.add_parser("mcp", parents=[common],
+                        help="run the MCP server on stdio (same lookups, for a model)")
+    mc.set_defaults(func=cmd_mcp)
 
     ix = sub.add_parser("index", parents=[common], help="build or update the index")
     ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")

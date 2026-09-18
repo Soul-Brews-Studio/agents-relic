@@ -151,3 +151,23 @@ def load_sources() -> list[SourceDef]:
 
 def source_keys() -> list[str]:
     return [s.key for s in load_sources()]
+
+
+def parser_for(path: str) -> Parser:
+    """The shape that can read THIS file, chosen by path then by extension.
+
+    `read` takes an arbitrary path, so it cannot rely on the source registry having
+    walked it. Matching a configured source's root first means a file inside a known
+    root is read by that root's shape even when its name is ambiguous.
+    """
+    for src in load_sources():
+        if src.path and path.startswith(src.path.rstrip("/") + "/"):
+            # memory and its host share a root, so the more specific layout wins
+            if src.walk == "memory" and "/memory/" not in path:
+                continue
+            return src.parser
+    if path.endswith(".md"):
+        return shape_vault.parse
+    if "/rollout-" in path or path.startswith(os.path.join(HOME, ".codex")):
+        return shape_codex.parse
+    return shape_claude.parse
