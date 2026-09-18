@@ -27,6 +27,10 @@ export interface Scope {
 export interface SearchOpts extends Scope {
   limit?: number;
   tier?: string; source?: string; worktree?: string; path?: string; role?: string;
+  /**
+   * Include subagent and workflow_agent transcripts. Default FALSE — see searchEvents.
+   */
+  allTiers?: boolean;
   since?: string; until?: string;   // 7d / 12h / 30m / 2026-09-01 / full ISO
   prose?: boolean;
 }
@@ -94,7 +98,22 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const CAP = Number(process.env.RELIC_FANOUT) > 0
     ? Number(process.env.RELIC_FANOUT)
     : Math.max(4, Math.min(16, (os.cpus?.().length ?? 8) - 2));
-  const opts = { limit, tier: o.tier, source: o.source, worktree: o.worktree, path: o.path,
+  /*
+   * DEFAULT TO THE MAIN CONVERSATION.
+   *
+   * By file count the corpus is 73% workflow_agent (21,305 vs 7,327 session), and those
+   * are an agent talking to itself inside one fan-out — near-duplicate prompts, tool
+   * chatter, and the same instructions restated N times. The human's own thread is
+   * where a decision was actually made.
+   *
+   * Measured before this default existed: unfiltered top-20 was already 60-75% session,
+   * because BM25 favours the denser prose anyway. So this is not rescuing a drowned
+   * signal — it is removing the remaining 25-40% of agent noise from the common case,
+   * and cutting the work the fan-out does. `allTiers` gets it all back, and the CLI and
+   * MCP both SAY SO on every result rather than silently narrowing.
+   */
+  const tier = o.tier ?? (o.allTiers ? undefined : "session");
+  const opts = { limit, tier, source: o.source, worktree: o.worktree, path: o.path,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
 
   let next = 0;

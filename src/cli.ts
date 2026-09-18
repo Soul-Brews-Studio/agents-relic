@@ -123,6 +123,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
     since: f.since as string, until: f.until as string,
+    allTiers: Boolean(f["all-tiers"] || f.tier),
   });
 
   const filters: Record<string, string> = {};
@@ -151,7 +152,9 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   }
 
   if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`); return; }
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms\n`);
+  const narrowed = !f["all-tiers"] && !f.tier;
+  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms` +
+    (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : "") + "\n");
   for (const h of hits.slice(0, limit)) {
     const i = h.text.toLowerCase().indexOf(q.toLowerCase());
     const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
@@ -407,7 +410,7 @@ if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
-  search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...]
+  search  <query> [--repo S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]

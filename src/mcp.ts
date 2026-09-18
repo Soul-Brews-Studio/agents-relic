@@ -63,7 +63,14 @@ const TOOLS = [
         prose: { type: "boolean" as const, description:
           "Only conversation (user/assistant/thinking), excluding tool traffic. " +
           "Use when looking for a decision or explanation rather than a command." },
-        tier: str("session (the human's conversation) | subagent | workflow_agent."),
+        tier: str("session (the human's conversation) | subagent | workflow_agent. " +
+                  "Setting this explicitly overrides the main-sessions-only default."),
+        all_tiers: { type: "boolean" as const, description:
+          "Include subagent and workflow_agent transcripts. DEFAULT FALSE: 73% of the " +
+          "corpus by file count is workflow agents talking to themselves inside one " +
+          "fan-out, and the human's own thread is where decisions were actually made. " +
+          "Set true when you want the agent work itself — deep mining, tracing how a " +
+          "fan-out reasoned, or finding an insight the main thread only summarised." },
         source: str("Which corpus a transcript came from — see relic_status."),
         worktree: str("Worktree name, when the repo uses them."),
         path: str("Substring of the transcript's file path."),
@@ -264,6 +271,7 @@ async function run(name: string, a: any): Promise<string> {
     const { hits, shards, ms, total } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
+      allTiers: Boolean(a.all_tiers || a.tier),
     });
     // Same trace log the CLI writes, so MCP traffic shows up in `relic trace` too —
     // otherwise the "which shards actually answer anything" question silently loses
@@ -273,7 +281,9 @@ async function run(name: string, a: any): Promise<string> {
             shards, hits: hits.length, ms, top_repo: hits[0]?.repo ?? "", fts: true }, DATA_ROOT);
 
     if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)`;
-    const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms`, ""];
+    const narrowed = !a.all_tiers && !a.tier;
+    const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
+      (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""), ""];
     for (const h of hits.slice(0, limit)) {
       const i = h.text.toLowerCase().indexOf(q.toLowerCase());
       const snip = i < 0 ? h.text.slice(0, 200) : h.text.slice(Math.max(0, i - 70), i + q.length + 130);
