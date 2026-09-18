@@ -5,6 +5,7 @@ import { parseClaude } from "./shapes/claude.js";
 import { parseCodex } from "./shapes/codex.js";
 import { parseOmp } from "./shapes/omp.js";
 import { parseVault } from "./shapes/vault.js";
+import { parseHermes } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
 
 const HOME = homedir();
@@ -12,7 +13,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat" | "omp" | "vault";   // how to find files under `path`
+  walk: "claude-tiers" | "flat" | "omp" | "vault" | "hermes";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -79,6 +80,14 @@ export const BUILTIN: SourceDef[] = [
     note: "Oracle ψ vault markdown — set its path in ~/.relic/sources.json",
   },
   {
+    // Hermes — SQLite, not JSONL. Verified (issue #6): there genuinely is no
+    // per-session JSONL beside the DB, unlike the omp case. One DB per profile,
+    // many sessions each; the walker emits one entry per session.
+    key: "hermes", path: join(HOME, ".hermes"),
+    walk: "hermes", parser: parseHermes, enabled: false,
+    note: "Hermes — SQLite state.db per profile, one entry per session",
+  },
+  {
     key: "omx-logs", path: join(HOME, ".omx-runs"),
     walk: "flat", parser: parseClaude, enabled: false,
     note: "omx run logs — OPS LOGS, not conversation. Opt in only if you want them.",
@@ -95,7 +104,8 @@ export const KNOWN_NON_JSONL = [
   // source (key "omp" above), so this entry is a note about a redundant store, not a
   // gap in coverage.
   { key: "omp-db", path: join(HOME, ".omp", "agent", "history.db"), note: "omp — SQLite mirror of ~/.omp/agent/sessions/*.jsonl, which IS indexed" },
-  { key: "hermes", path: join(HOME, ".hermes"), note: "Hermes — SQLite (kanban.db, profiles/*/state.db)" },
+  // hermes/state.db is now a real source (walk:"hermes"); only kanban.db is unread.
+  { key: "hermes-kanban", path: join(HOME, ".hermes", "kanban.db"), note: "Hermes kanban board — not conversation, unread" },
 ];
 
 /**
