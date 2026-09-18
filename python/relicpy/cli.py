@@ -40,13 +40,18 @@ def _scope(a: argparse.Namespace) -> Scope:
                  repo=getattr(a, "repo", None), bank=getattr(a, "bank", None))
 
 
+def _json(a: argparse.Namespace) -> bool:
+    """--json is SUPPRESS-defaulted, so the attribute may simply not exist."""
+    return bool(getattr(a, "json", False))
+
+
 def cmd_status(a: argparse.Namespace) -> int:
     root, rows = index_status(_scope(a), freshness=not a.no_freshness)
     if not rows:
         print(f"no shards found in  {root}\n")
         print("  index one first:   relic index --since 7d   (TypeScript CLI)")
         return 1
-    if a.json:
+    if _json(a):
         print(json.dumps({
             "root": root, "shards": len(rows),
             "events": sum(r.events for r in rows),
@@ -84,7 +89,7 @@ def cmd_search(a: argparse.Namespace) -> int:
         print("search needs a query", file=sys.stderr)
         return 1
     res = search_events(q, _scope(a), limit=a.limit, all_tiers=a.all_tiers)
-    if a.json:
+    if _json(a):
         print(json.dumps({**{k: res[k] for k in ("shards", "total", "ms")},
                           "hits": [h.model_dump() for h in res["hits"]]}, indent=2))
         return 0
@@ -104,12 +109,12 @@ def cmd_search(a: argparse.Namespace) -> int:
 
 
 def cmd_banks(a: argparse.Namespace) -> int:
-    names = list_bank_names(a.data_root)
-    if a.json:
+    names = list_bank_names(getattr(a, "data_root", None))
+    if _json(a):
         print(json.dumps(names, indent=2))
         return 0
     if not names:
-        print(f"no banks under {a.data_root or default_root()}")
+        print(f"no banks under {getattr(a, "data_root", None) or default_root()}")
         return 1
     for b in names:
         print(b)
@@ -117,30 +122,58 @@ def cmd_banks(a: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Global flags go on a PARENT parser that every subcommand inherits, not only on
+    # the top-level one.
+    #
+    # argparse binds a top-level flag before the subcommand name and nowhere else, so
+    # `relic-py status --json` exits 2 with "unrecognized arguments" while
+    # `relic-py --json status` works. The TypeScript CLI accepts its flags in any
+    # position, and this is meant to be the same app — a caller who writes
+    # `relic status --json` and then `relic-py status --json` should not have to learn
+    # that one of them puts flags somewhere else.
+    #
+    # It shipped because the check that would have caught it piped stderr to
+    # /dev/null, so an exit-2 usage error read as an empty success.
+    # default=SUPPRESS on every shared flag, and it is load-bearing.
+    #
+    # With an ordinary default, the SUBPARSER writes that default over whatever the
+    # top-level parser already parsed — so adding parents=[common] fixed
+    # `status --json` and simultaneously broke `--json status`, which had worked.
+    # SUPPRESS means an absent flag sets no attribute at all, so the earlier value
+    # survives and both placements work.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data-root", default=argparse.SUPPRESS,
+                        help="explicit index location")
+    common.add_argument("--in-repo", action="store_true", default=argparse.SUPPRESS,
+                        help="read <ghq>/<org>/<repo>/.relic")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine output")
+
     p = argparse.ArgumentParser(
         prog="relic-py",
+        parents=[common],
         description="relic, in Python — reads the same ~/.relic the TypeScript CLI writes",
     )
-    p.add_argument("--data-root", default=None, help="explicit index location")
-    p.add_argument("--in-repo", action="store_true", help="read <ghq>/<org>/<repo>/.relic")
-    p.add_argument("--json", action="store_true", help="machine output")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("status", help="bank -> repo, counts, and both clocks")
+    s = sub.add_parser("status", parents=[common],
+                       help="bank -> repo, counts, and both clocks")
     s.add_argument("--bank"); s.add_argument("--repo")
     s.add_argument("--limit", type=int, default=15, help="repo rows per bank")
     s.add_argument("--no-freshness", action="store_true",
                    help="skip the two clocks (one less column scan per shard)")
     s.set_defaults(func=cmd_status)
 
-    q = sub.add_parser("search", help="full text, BM25-ranked, deduped across banks")
+    q = sub.add_parser("search", parents=[common],
+                       help="full text, BM25-ranked, deduped across banks")
     q.add_argument("query", nargs="+")
     q.add_argument("--bank"); q.add_argument("--repo")
     q.add_argument("--limit", type=int, default=20)
     q.add_argument("--all-tiers", action="store_true")
     q.set_defaults(func=cmd_search)
 
-    b = sub.add_parser("banks", help="the bank names on this machine")
+    b = sub.add_parser("banks", parents=[common],
+                       help="the bank names on this machine")
     b.set_defaults(func=cmd_banks)
 
     a = p.parse_args(argv)
