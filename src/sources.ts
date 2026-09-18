@@ -1,6 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+
+// ghq root differs per machine — /opt/Code here, ~/ghq elsewhere. repo.ts already
+// shells out to `ghq root` and caches it; guessing the default would have pointed
+// this source at a directory that does not exist on this machine.
+import { ghqRoot } from "./repo.js";
 import { parseClaude } from "./shapes/claude.js";
 import { parseCodex } from "./shapes/codex.js";
 import { parseOmp } from "./shapes/omp.js";
@@ -14,7 +19,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat" | "omp" | "vault" | "hermes" | "memory";   // how to find files under `path`
+  walk: "claude-tiers" | "flat" | "omp" | "vault" | "vaults" | "hermes" | "memory";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -110,7 +115,31 @@ export const BUILTIN: SourceDef[] = [
     // per note rather than chunking. See src/shapes/vault.ts.
     key: "oracle-vault", path: join(HOME, ".relic-vault-unset"),
     walk: "vault", parser: parseVault, enabled: false, bank: "vault",
-    note: "Oracle ψ vault markdown — set its path in ~/.relic/sources.json",
+    note: "ONE oracle's ψ vault — set its path in ~/.relic/sources.json",
+  },
+  {
+    // EVERY oracle's vault, found by walking the ghq tree rather than being told one
+    // path. Measured on this machine: 413 repos carry a ψ, 386 distinct after
+    // resolving symlinks — against the one that `oracle-vault` can name.
+    //
+    // Off by default and deliberately so: it reads a tree this tool does not own, and
+    // on a machine with a different layout the glob finds nothing rather than
+    // something wrong. Point it at the host of a ghq root — the level holding <org>/
+    // directories, not the ghq root itself.
+    //
+    // ITS OWN BANK, not "vault". Sharing one with oracle-vault was the first attempt
+    // and the duplicate-source guard rejected it on sight — correctly. Two builtins
+    // claiming one bank is the exact shape the guard exists to catch, and weakening
+    // the guard to fit a new source would have removed a check that already caught a
+    // real incident.
+    //
+    // Separate banks also make the overlap legible rather than silent: enable both
+    // and the vault named by oracle-vault appears in "vault" AND in "vaults", which
+    // `relic status` shows as two banks. Search collapses the duplicate events by
+    // content, so the answer stays right either way.
+    key: "oracle-vaults", path: join(ghqRoot(), "github.com"),
+    walk: "vaults", parser: parseVault, enabled: false, bank: "vaults",
+    note: "EVERY <org>/<repo>/ψ under the ghq tree — symlinks resolved, realpath-deduped",
   },
   {
     // Claude Code's OWN memory — durable typed facts the agent chose to keep, each
