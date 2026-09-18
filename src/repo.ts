@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 
 /**
  * Map a session's cwd to the repo that owns it — "github.com/<org>/<repo>".
@@ -104,15 +105,24 @@ export function ghqRoot(): string {
 
 export const SHARD_DIR = ".relic";
 
+/** The default home: ~/.relic/github.com/<org>/<repo>/ — mirrors ghq, touches no repo. */
+export function defaultRoot(): string { return join(homedir(), ".relic"); }
+
 /**
- * Where a repo's shard lives. Default is INSIDE the repo, so an oracle's session
- * history travels with its checkout. `dataRoot` redirects to a mirror tree for anyone
- * who does not want files landing in working copies.
+ * Where a repo's shard lives.
+ *
+ * DEFAULT is ~/.relic/<repo-key>/ — the ghq shape, but under $HOME. Nothing is written
+ * into a working copy, so there is one place to back up, one place to delete, and no
+ * surprise directories in 198 repos you do not own.
+ *
+ * `inRepo` opts into <ghq-root>/<repo-key>/.relic/ instead, for when an oracle's
+ * history should travel with its checkout. `dataRoot` overrides both.
  */
-export function shardDirFor(repoKey: string | null, dataRoot: string | null): string {
-  if (dataRoot) return join(dataRoot, repoKey ?? "_unresolved");
-  if (!repoKey) return join(ghqRoot(), "_relic-unresolved");
-  return join(ghqRoot(), repoKey, SHARD_DIR);
+export function shardDirFor(repoKey: string | null, dataRoot: string | null, inRepo = false): string {
+  const key = repoKey ?? "_unresolved";
+  if (dataRoot) return join(dataRoot, key);
+  if (inRepo) return repoKey ? join(ghqRoot(), repoKey, SHARD_DIR) : join(ghqRoot(), "_relic-unresolved");
+  return join(defaultRoot(), key);
 }
 
 /** Self-ignoring, so no repo's own .gitignore is ever edited. */
@@ -123,9 +133,11 @@ export function guardShardDir(dir: string) {
 }
 
 /** Discover shards by walking the tree — no central manifest to fall out of sync. */
-export function listShards(dataRoot: string | null): { key: string; dir: string }[] {
+export function listShards(dataRoot: string | null, inRepo = false): { key: string; dir: string }[] {
   const out: { key: string; dir: string }[] = [];
   const ls = (p: string) => { try { return readdirSync(p, { withFileTypes: true }); } catch { return []; } };
+
+  if (!dataRoot && !inRepo) dataRoot = defaultRoot();
 
   if (dataRoot) {
     const gh = join(dataRoot, "github.com");
@@ -154,4 +166,34 @@ export function listShards(dataRoot: string | null): { key: string; dir: string 
   const un = join(root, "_relic-unresolved");
   if (existsSync(un)) out.push({ key: "_unresolved", dir: un });
   return out;
+}
+
+/**
+ * Read a session's working directory from the JSONL itself.
+ *
+ * THE FILE IS THE SOURCE OF TRUTH for identity. Neither the encoded project dir name
+ * (maps both "/" and "." to "-", lossy, not reversible) nor a derived DB column
+ * (lanceglass's `project` is "homelab.wt-1-openclaw-guide" — org already gone) can
+ * produce a repo key. Both were tried; both were wrong.
+ *
+ * One read per distinct file, memoised, bounded prefix.
+ */
+const cwdCache = new Map<string, string | null>();
+
+export async function cwdOfFile(filePath: string): Promise<string | null> {
+  if (cwdCache.has(filePath)) return cwdCache.get(filePath)!;
+  let found: string | null = null;
+  try {
+    const head = await Bun.file(filePath).slice(0, 262_144).text();
+    for (const line of head.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line);
+        const cwd = rec?.cwd ?? rec?.payload?.cwd;
+        if (typeof cwd === "string" && cwd) { found = cwd; break; }
+      } catch { /* truncated final line is expected when slicing */ }
+    }
+  } catch { /* unreadable */ }
+  cwdCache.set(filePath, found);
+  return found;
 }

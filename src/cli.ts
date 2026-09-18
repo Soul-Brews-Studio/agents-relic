@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { LanceStore, type EventRow } from "./store/lance.js";
 import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
-import { repoKeyOf, contextOf, shardDirFor, ghqRoot, guardShardDir, listShards } from "./repo.js";
+import { trace, readTrace, tracePath } from "./trace.js";
+import { repoKeyOf, contextOf, cwdOfFile, shardDirFor, ghqRoot, defaultRoot, guardShardDir, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
   const f: Record<string, string | boolean> = {};
@@ -27,12 +28,12 @@ const nowISO = () => new Date().toISOString();
 /** One store per repo, opened on first write. */
 class Shards {
   private pool = new Map<string, LanceStore>();
-  constructor(private dataRoot: string | null) {}
+  constructor(private dataRoot: string | null, private inRepo = false) {}
   async get(repoKey: string | null): Promise<LanceStore> {
     const key = repoKey ?? "_unresolved";
     let s = this.pool.get(key);
     if (!s) {
-      const dir = shardDirFor(repoKey, this.dataRoot);
+      const dir = shardDirFor(repoKey, this.dataRoot, this.inRepo);
       guardShardDir(dir);
       s = await LanceStore.open(dir);
       this.pool.set(key, s);
@@ -46,6 +47,7 @@ class Shards {
 // ---- index -----------------------------------------------------------------
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
 
@@ -72,7 +74,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   }
   if (f["dry-run"]) { process.stderr.write("--dry-run: nothing written\n"); return; }
 
-  const shards = new Shards(dataRoot);
+  const shards = new Shards(dataRoot, inRepo);
 
   // Each shard owns its own manifest, so the skip check needs the file's repo — which is
   // only knowable after parsing. Parsing is cheap relative to writing, so the order is:
@@ -154,16 +156,22 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   console.log(`  imported:    ${fmt(done - skipped - filtered)} files -> ${fmt(added)} events`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
-  console.log(`  wrote:       ${dataRoot ? dataRoot : "in-repo .relic/"} in ${secs}s`);
+  console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
 }
 
 // ---- search ----------------------------------------------------------------
 async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const limit = Number(f.limit ?? 20);
-  let shards = listShards(dataRoot);
+  let shards = listShards(dataRoot, Boolean(f["in-repo"]));
   if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
-  if (!shards.length) { console.log("no shards yet — run `index` first"); return; }
+  if (!shards.length) {
+    const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
+    console.log(`no shards found in  ${where}\n`);
+    console.log(`  index one first:   relic index --since 7d${dataRoot ? ` --data-root ${dataRoot}` : ""}`);
+    if (!dataRoot) console.log(`  or point elsewhere: relic search ... --data-root /path/to/index`);
+    return;
+  }
 
   const hits: (EventRow & { repo: string })[] = [];
   let searched = 0;
@@ -177,6 +185,14 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
   }
   const ms = performance.now() - t0;
+
+  const filters: Record<string, string> = {};
+  for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
+  trace({
+    ts: new Date().toISOString(), q, chars: [...q].length, filters,
+    shards: searched, hits: hits.length, ms: Math.round(ms),
+    top_repo: hits[0]?.repo ?? "", fts: true,
+  }, dataRoot);
 
   if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms.toFixed(0)} ms)`); return; }
   console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms.toFixed(0)} ms\n`);
@@ -192,6 +208,15 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
 // ---- show ------------------------------------------------------------------
 async function cmdShow(path: string, f: Record<string, string | boolean>) {
+  // A result RETURNED is not a result USED. `opened` is the stronger signal for which
+  // shards have a constituency, so record it the moment someone actually reads a hit.
+  trace({
+    ts: new Date().toISOString(), q: "", chars: 0, filters: {},
+    shards: 0, hits: 0, ms: 0, fts: true,
+    top_repo: repoKeyOf(await cwdOfFile(path)) ?? "",
+    opened: path,
+  }, (f["data-root"] as string) ?? null);
+
   const target = Number(f.seq ?? 1), before = Number(f.before ?? 2), after = Number(f.after ?? 2);
   const rl = createInterface({ input: createReadStream(path, "utf8") });
   let seq = 0;
@@ -214,10 +239,16 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
 // ---- status ----------------------------------------------------------------
 async function cmdStatus(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
-  const shards = listShards(dataRoot);
-  if (!shards.length) { console.log("nothing indexed yet"); return; }
-  console.log(`layout  ${dataRoot ? `mirror under ${dataRoot}` : `in-repo: ${ghqRoot()}/<org>/<repo>/.relic/`}`);
-  console.log(`store   LanceDB only — no FTS index, no tokenizer, no routing\n`);
+  const shards = listShards(dataRoot, Boolean(f["in-repo"]));
+  if (!shards.length) {
+    const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
+    console.log(`no shards found in  ${where}\n`);
+    console.log(`  index one first:   relic index --since 7d${dataRoot ? ` --data-root ${dataRoot}` : ""}`);
+    if (!dataRoot) console.log(`  or point elsewhere: relic status --data-root /path/to/index`);
+    return;
+  }
+  console.log(`layout  ${dataRoot ?? (Boolean(f["in-repo"]) ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot())}`);
+  console.log(`store   LanceDB + ICU full-text index (BM25)\n`);
 
   const rows: { key: string; ev: number; se: number }[] = [];
   for (const s of shards) {
@@ -245,11 +276,14 @@ if (!cmd || f.help) {
   show    <file> --seq N [--before 2] [--after 2]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
+  trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
+  ui      [--port 4477]        local viewer: click a repo, search, read context
 
-  --data-root PATH   mirror tree instead of writing inside repos
+  --in-repo          write <ghq>/<org>/<repo>/.relic/ instead of ~/.relic
+  --data-root PATH   explicit index location
 
-Sharded per repo, ghq-style:
-  ${ghqRoot()}/github.com/<org>/<repo>/.relic/
+Sharded per repo, ghq-style, under $HOME by default:
+  ${defaultRoot()}/github.com/<org>/<repo>/
 
 LanceDB only. Substring search, so Thai and sub-3-character needles work with no
 tokenizer. Vectors land in the same table later.`);
@@ -265,6 +299,64 @@ else if (cmd === "sources") {
     console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  ${s.path}\n         ${s.note}`);
   console.log("\nreal history that is NOT jsonl — needs a different reader:");
   for (const k of KNOWN_NON_JSONL) console.log(`  [--]  ${k.key.padEnd(16)} ${k.path}\n         ${k.note}`);
+}
+else if (cmd === "ui") {
+  const { serve } = await import("./ui.js");
+  await serve({ port: Number(f.port ?? 4477), dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]) });
+}
+else if (cmd === "trace") {
+  const cloud = Boolean(f.cloud);
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const shards = listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.key);
+  const t = readTrace(dataRoot, shards);
+  if (!t) { console.log(`no queries logged yet — ${tracePath(dataRoot)}`); }
+  else {
+    console.log(`${t.total} queries · ${t.span} · median ${t.medianMs} ms\n`);
+    console.log("answered by (top hit's repo)");
+    for (const r of t.byRepo.slice(0, Number(f.limit ?? 10)))
+      console.log(`  ${String(r.n).padStart(5)}  ${r.repo.replace("github.com/", "")}`);
+    if (t.byFilter.length) {
+      console.log("\nfilters used");
+      for (const x of t.byFilter) console.log(`  ${String(x.n).padStart(5)}  --${x.filter}`);
+    }
+    if (t.opened) {
+      console.log(`\nactually opened (${t.opened} reads) — the real constituency`);
+      for (const r of t.openedByRepo.slice(0, 8))
+        console.log(`  ${String(r.n).padStart(5)}  ${(r.repo || "(unresolved)").replace("github.com/", "")}`);
+    }
+    console.log(`\nzero-hit queries: ${t.zeroHit}/${t.total}`);
+    if (t.slowest.length) {
+      console.log("slowest");
+      for (const s2 of t.slowest) console.log(`  ${String(s2.ms).padStart(6)} ms  ${s2.q.slice(0, 48)}`);
+    }
+    if (cloud && t.terms.length) {
+      // Terminal has no font sizes, so weight is the size cue. Same log scale the
+      // fleet's tag cloud uses: size = log(n)/log(max), bucketed into four tiers.
+      // Single-use terms are dropped — a cloud of 1:1 entries is all noise.
+      const shown = t.terms.filter(x => x.n > 1);
+      const max = shown[0]?.n ?? 1;
+      const BIG = "\x1b[1;97m", MID = "\x1b[1m", LOW = "\x1b[0m", DIM = "\x1b[2m", OFF = "\x1b[0m";
+      const tier = (n: number) => {
+        const r = Math.log(n + 1) / Math.log(max + 1);
+        return r > 0.85 ? BIG : r > 0.6 ? MID : r > 0.35 ? LOW : DIM;
+      };
+      console.log(`\nquery cloud — ${t.terms.length} distinct terms, ${shown.length} asked more than once\n`);
+      let line = "", width = 0;
+      for (const { term, n } of shown.slice(0, 60)) {
+        const label = tier(n) + term + OFF + DIM + "·" + n + OFF;
+        const w = [...term].length + String(n).length + 2;
+        if (width + w > 76) { console.log("  " + line); line = ""; width = 0; }
+        line += label + "   "; width += w + 3;
+      }
+      if (line) console.log("  " + line);
+      if (shown.length === 0)
+        console.log("  (every term asked exactly once — nothing repeats yet)");
+    }
+
+    if (t.neverTop.length)
+      console.log(`\n${t.neverTop.length} shard(s) never produced a best hit — no constituency:\n  ` +
+        t.neverTop.slice(0, 12).map(s2 => s2.replace("github.com/", "")).join("\n  "));
+  }
 }
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
