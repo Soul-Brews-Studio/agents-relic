@@ -108,6 +108,55 @@ for indexing *less*, not faster.
 ---
 
 
+## Two front ends: TypeScript (reference) + optional native binary
+
+`bunx` keeps working with **no Rust toolchain and no build step** — the native
+binary is strictly optional.
+
+```bash
+bunx github:Soul-Brews-Studio/agents-relic status     # TS, nothing to install
+cargo build --release --manifest-path rust/Cargo.toml  # optional, ~14s
+./bin/relic-dispatch.sh now                            # native when present, TS otherwise
+```
+
+### Why only *some* commands are native
+
+The split follows whether a command needs LanceDB, not a blanket "Rust is
+faster" assumption:
+
+| path | native build | measured |
+|---|---|---|
+| **index-free** (`now`) — readdir + mtime only | zero dependencies, 14s build | **~0.00–0.01s vs 0.82–1.87s** for Bun |
+| index-backed (`session`, `search`) | needs lance+datafusion, ~500 crates, multi-minute build | roughly a wash |
+
+The reason index-backed commands barely move: **TS, Python and Rust all wrap the
+same Rust `lance` core.** The query costs the same in every one of them — a
+native build saves only the host-language startup slice, not the query. A Python
+spike against the identical shard showed the same ~1.2s query as TS.
+
+So `rust/` defaults to **no engine dependency at all** (`default = []`). Opt in
+with `--features index` only if you have a reason.
+
+### Traps found building this
+
+- `lancedb 0.39.0` **does not compile** without `features = ["remote"]` — its
+  `job.rs` references `Error::Http`, a variant `error.rs` only defines under
+  that feature. Undocumented; found by bisecting flags.
+- `lto = true` on the lance+datafusion tree turned linking into a
+  machine-saturating step (observed system load >200) for no measured gain on
+  read paths bounded by query time. It is off deliberately.
+- `bun build --compile` is **not** a shortcut here — the compiled binary
+  measured ~2s steady-state and 291 MB, *slower* than plain `bun src/cli.ts`,
+  because the LanceDB native addon has to be loaded out of the bundle each run.
+
+### The rule this split enforces
+
+The TypeScript CLI is the reference implementation and owns every write path
+(index, import, cache). The native binary implements read paths only. Anything
+not implemented natively **falls through to TS** rather than being
+reimplemented — two copies of the parser or the schema is the maintenance trap
+this design exists to avoid.
+
 ## Install
 
 ```bash

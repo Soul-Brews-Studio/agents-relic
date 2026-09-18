@@ -1,0 +1,40 @@
+[package]
+name = "relic-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native binary for agents-relic's index-free read paths. The TypeScript CLI is the reference implementation."
+
+[[bin]]
+name = "relic-native"
+path = "src/main.rs"
+
+[features]
+# DEFAULT IS NO ENGINE. The index-free commands (`now`) are pure readdir+mtime
+# and need nothing but std — so the default build has zero dependencies and
+# compiles in seconds.
+#
+# Pulling lancedb in costs ~500 crates (lance + datafusion + arrow) and a
+# multi-minute cold build, for commands where the query dominates anyway and
+# native buys only the startup slice. Opt in deliberately:
+#   cargo build --release --features index
+default = []
+index = ["dep:lancedb", "dep:arrow-array", "dep:futures", "dep:tokio"]
+
+[dependencies]
+# Version MUST track @lancedb/lancedb in package.json — both wrap the same Rust
+# core, and skew means the two front ends read one shard with two engines.
+#
+# features = ["remote"] is NOT optional: lancedb 0.39.0 fails to compile without
+# it (job.rs references Error::Http, which error.rs only defines under that
+# feature). Undocumented; found by bisecting feature flags.
+lancedb = { version = "0.39", features = ["remote"], optional = true }
+arrow-array = { version = "56", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+
+[profile.release]
+opt-level = 3
+# LTO deliberately OFF — on the lance+datafusion tree it turned linking into a
+# machine-saturating step (observed load >200) with no measured runtime gain on
+# read paths bounded by query time, not codegen.
+lto = false
