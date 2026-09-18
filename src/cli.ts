@@ -12,7 +12,7 @@ import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, hu
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
-         statsOf, neighbours, nameOf, staleness } from "./query.js";
+         statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport } from "./query.js";
 import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -84,8 +84,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   const { added, skipped, failed, filtered, imported } = tally;
   const skipped_noise = tally.skippedNoise;
   const shards = tally.shards;
-  const indexed = shards.keys().length;
-  const idxSecs = "0.0";
+  const idxSecs = (tally.ftsMs / 1000).toFixed(1);
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
 
   const byTier = new Map<string, number>();
@@ -100,7 +99,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--skip-noise) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
-  console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
+  console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
+              `, ${tally.ftsBuilt} fts index built in ${idxSecs}s` +
+              (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
   console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
 }
 
@@ -108,7 +109,8 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const limit = Number(f.limit ?? 20);
-  const scope = { dataRoot, inRepo: Boolean(f["in-repo"]), repo: f.repo ? String(f.repo) : undefined };
+  const scope = { dataRoot, inRepo: Boolean(f["in-repo"]), repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
 
   if (!pickShards(scope).length) {
     const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
@@ -131,7 +133,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
   trace({
     ts: new Date().toISOString(), q, chars: [...q].length, filters,
-    shards: searched, hits: hits.length, ms, top_repo: hits[0]?.repo ?? "", fts: true,
+    shards: searched, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
+            top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true,
   }, dataRoot);
 
   const top = hits.slice(0, limit);
@@ -183,7 +186,8 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
 // ---- session (resolve one id) ----
 async function cmdSession(id: string, f: Record<string, string | boolean>) {
   const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
-                  repo: f.repo ? String(f.repo) : undefined };
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
   const { rows, imported, matchedBy } = await resolveSession(id, {
     ...scope, noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
   });
@@ -267,7 +271,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
 // ---- sessions ----
 async function cmdSessions(f: Record<string, string | boolean>) {
   const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
-                  repo: f.repo ? String(f.repo) : undefined };
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
   if (!pickShards(scope).length) { console.log("no shards match"); return; }
 
   const { rows: top, total, transcripts, events, shards } = await listSessions({
@@ -298,7 +303,8 @@ async function cmdSessions(f: Record<string, string | boolean>) {
 // ---- status ----------------------------------------------------------------
 async function cmdStatus(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
-  const shards = listShards(dataRoot, Boolean(f["in-repo"]));
+  let shards = listShards(dataRoot, Boolean(f["in-repo"]));
+  if (f.bank) shards = shards.filter(sh => sh.bank === String(f.bank));
   if (!shards.length) {
     const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
     console.log(`no shards found in  ${where}\n`);
@@ -308,9 +314,9 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   }
   const smode = outFmt(f);
   if (smode === "json" || smode === "jsonl") {
-    const rows: { key: string; ev: number; se: number }[] = [];
+    const rows: { key: string; bank: string; repo: string; ev: number; se: number }[] = [];
     for (const sh of shards) {
-      try { const c = await (await LanceStore.open(sh.dir)).counts(); rows.push({ key: sh.key, ev: c.events, se: c.sessions }); }
+      try { const c = await (await LanceStore.open(sh.dir)).counts(); rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, ev: c.events, se: c.sessions }); }
       catch { /* skip unreadable shard */ }
     }
     rows.sort((a, b) => b.ev - a.ev);
@@ -322,16 +328,28 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log(`layout  ${dataRoot ?? (Boolean(f["in-repo"]) ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot())}`);
   console.log(`store   LanceDB + ICU full-text index (BM25)\n`);
 
-  const rows: { key: string; ev: number; se: number }[] = [];
+  const rows: { bank: string; repo: string; ev: number; se: number }[] = [];
   for (const s of shards) {
-    try { const c = await (await LanceStore.open(s.dir)).counts(); rows.push({ key: s.key, ev: c.events, se: c.sessions }); }
+    try { const c = await (await LanceStore.open(s.dir)).counts(); rows.push({ bank: s.bank, repo: s.repo, ev: c.events, se: c.sessions }); }
     catch { /* skip unreadable shard */ }
   }
   rows.sort((a, b) => b.ev - a.ev);
+  // BANK FIRST, then repo. A flat list sorted by size interleaves three snapshots of the
+  // same machine, and the reader cannot tell whether one repo appears three times because
+  // it is busy or because it exists in three banks.
   const limit = Number(f.limit ?? 15);
-  for (const r of rows.slice(0, limit))
-    console.log(`  ${r.key.replace("github.com/", "").padEnd(48)} ${String(r.se).padStart(6)} sess ${fmt(r.ev).padStart(10)} ev`);
-  if (rows.length > limit) console.log(`  ... and ${rows.length - limit} more (--limit N)`);
+  const byBank = new Map<string, typeof rows>();
+  for (const r of rows) { const a = byBank.get(r.bank) ?? []; a.push(r); byBank.set(r.bank, a); }
+  const banks = [...byBank.entries()]
+    .map(([bank, rs]) => ({ bank, rs, ev: rs.reduce((a, r) => a + r.ev, 0), se: rs.reduce((a, r) => a + r.se, 0) }))
+    .sort((a, b) => b.ev - a.ev);
+  for (const b of banks) {
+    console.log(`  ${b.bank}   ${fmt(b.se)} sessions · ${fmt(b.ev)} events · ${b.rs.length} shards`);
+    for (const r of b.rs.slice(0, limit))
+      console.log(`    ${r.repo.replace("github.com/", "").padEnd(46)} ${String(r.se).padStart(6)} sess ${fmt(r.ev).padStart(10)} ev`);
+    if (b.rs.length > limit) console.log(`    ... and ${b.rs.length - limit} more (--limit N)`);
+    console.log("");
+  }
   console.log(`\ntotal   ${fmt(rows.reduce((a, r) => a + r.ev, 0))} events · ${fmt(rows.reduce((a, r) => a + r.se, 0))} sessions · ${rows.length} shards`);
   console.log("vectors: none yet — they land in the same `events` table, no migration.");
 }
@@ -407,6 +425,45 @@ async function cmdNow(f: Record<string, string | boolean>) {
 const { f, pos } = flags(process.argv.slice(2));
 const cmd = pos[0];
 
+// ---- memory / pending -------------------------------------------------------
+// Both functions already existed in query.ts with no way to call them. A query nobody
+// can run is the same as a query that does not exist.
+async function cmdMemory(f: Record<string, string | boolean>) {
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
+  const r = await memoryReport({ ...scope, memType: f["mem-type"] ? String(f["mem-type"]) : undefined,
+                                 since: f.since ? String(f.since) : undefined,
+                                 until: f.until ? String(f.until) : undefined });
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  console.log(`memories  ${fmt(r.total)} across ${r.shards} shards   ${r.ms} ms`);
+  console.log(`  ${r.byType.map(b => `${b.type || "(untyped)"}=${b.n}`).join("  ")}`);
+  console.log(`  with origin ${r.withOrigin}   joined ${r.joined}   orphaned ${r.orphaned}` +
+              `   no origin ${r.total - r.withOrigin}`);
+  if (r.perRepo.length) {
+    console.log(`\n  repo                                      mem   transcripts  producing`);
+    for (const x of r.perRepo.slice(0, Number(f.limit ?? 20)))
+      console.log(`  ${x.repo.replace("github.com/", "").padEnd(40)} ${String(x.memories).padStart(4)}` +
+                  `  ${String(x.transcripts).padStart(11)}  ${String(x.producing).padStart(9)}`);
+  }
+}
+
+async function cmdPending(f: Record<string, string | boolean>) {
+  const r = await pendingReport({
+    dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined,
+    corpus: f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null,
+    since: f.since ? String(f.since) : undefined,
+  });
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  console.log(`found ${fmt(r.found)}  indexed ${fmt(r.indexed)}  missing ${fmt(r.missing)}  changed ${fmt(r.changed)}   ${r.scanMs} ms`);
+  if (r.newestPendingMs !== null)
+    console.log(`newest pending file: ${localDateTime(new Date(r.newestPendingMs).toISOString())}`);
+  for (const g of r.groups)
+    console.log(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +
+                `  missing ${String(g.missing).padStart(6)}  changed ${String(g.changed).padStart(6)}`);
+}
+
 if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
@@ -423,7 +480,10 @@ if (!cmd || f.help) {
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
-  status  [--limit 15]
+  memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
+                               sessions that produced it — which had one, which had none
+  pending [--corpus ...] [--since 1h]  on disk but not indexed: missing vs changed
+  status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
@@ -447,15 +507,21 @@ else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {
   console.log("configured sources (~/.relic/sources.json overrides)\n");
-  for (const s of detect())
-    console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  ${s.path}\n         ${s.note}`);
+  const det = detect();
+  for (const s of det)
+    console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  bank=${s.bank.padEnd(22)} ${s.path}\n         ${s.note}`);
+  const banks = [...new Set(det.filter(s => s.enabled).map(s => s.bank))];
+  console.log(`\n  ${banks.length} banks would be written: ${banks.join(" · ")}`);
   console.log("\nreal history that is NOT jsonl — needs a different reader:");
   for (const k of KNOWN_NON_JSONL) console.log(`  [--]  ${k.key.padEnd(16)} ${k.path}\n         ${k.note}`);
 }
 else if (cmd === "trace") {
   const cloud = Boolean(f.cloud);
   const dataRoot = (f["data-root"] as string) ?? null;
-  const shards = listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.key);
+  // BARE repo keys, not shard keys: `top_repo` in the log is written bank-less (cli.ts
+  // `show` uses repoKeyOf), so comparing against "<bank>/github.com/..." would report
+  // every shard as "never produced a best hit".
+  const shards = [...new Set(listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.repo))];
   const t = readTrace(dataRoot, shards);
   const tmode = outFmt(f);
   if (t && (tmode === "json" || tmode === "jsonl")) {
@@ -591,5 +657,7 @@ else if (cmd === "mcp") {
   spawn(process.execPath, [here, ...process.argv.slice(3)], { stdio: "inherit" })
     .on("exit", c => process.exit(c ?? 0));
 }
+else if (cmd === "memory") await cmdMemory(f);
+else if (cmd === "pending") await cmdPending(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

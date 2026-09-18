@@ -1,19 +1,20 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { loadSources } from "./sources.js";
+import { bankOf, loadSources } from "./sources.js";
 import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
 
 // "note" is not a transcript tier — a vault document has no turns. It shares the
 // enum so the whole query surface (search/show/sessions/MCP) stays one code path.
-export type Tier = "session" | "subagent" | "workflow_agent" | "note";
+export type Tier = "session" | "subagent" | "workflow_agent" | "note" | "memory";
 
 export interface Found {
   path: string;
   projectDir: string;      // raw encoded dir name (display only — the encoding is lossy)
   tier: Tier;
   source: string;
+  bank: string;            // top level of the shard path — see bankOf in sources.ts
   workflowRunId: string | null;
   agentId: string | null;
   mtime: number;
@@ -208,6 +209,27 @@ function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: 
   }
 }
 
+/**
+ * Claude Code memory: `<root>/<encoded-project>/memory/*.md`.
+ *
+ * MEMORY.md is skipped — it is a one-line index OF the other files, so indexing it
+ * repeats every memory's description as a second, lower-quality hit.
+ */
+function walkMemory(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  for (const project of dirs(root)) {
+    const dir = join(root, project, "memory");
+    if (!existsSync(dir)) continue;
+    for (const f of files(dir, ".md")) {
+      if (f === "MEMORY.md") continue;
+      const p = join(dir, f);
+      const st = statOf(p);
+      if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
+      out.push({ path: p, projectDir: project, tier: "memory", source: srcKey,
+        workflowRunId: null, agentId: null, ...st, parser });
+    }
+  }
+}
+
 export function discover(only: string[] | null, sinceMs: number | null): Found[] {
   const out: Found[] = [];
   const tick = () => {
@@ -218,12 +240,17 @@ export function discover(only: string[] | null, sinceMs: number | null): Found[]
     if (!wanted || !existsSync(src.path)) continue;
     progressLine(`  scanning ${src.key}…`);
     const before = out.length;
-    if (src.walk === "hermes") walkHermes(src.path, sinceMs, out, src.key, src.parser);
+    if (src.walk === "memory") walkMemory(src.path, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "hermes") walkHermes(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
     else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
     else walkClaude(src.path, sinceMs, out, src.key, src.parser);
-    void before;
+    // Stamp the bank on what this source just contributed, rather than threading it
+    // through all six walkers. A file's bank is a property of the SOURCE it was found
+    // under, so the walkers never need to know about it.
+    const bank = bankOf(src);
+    for (let i = before; i < out.length; i++) out[i].bank = bank;
   }
   if (out.length >= 2000) progressLine(`  scanned ${out.length.toLocaleString()} files`);
   return out;

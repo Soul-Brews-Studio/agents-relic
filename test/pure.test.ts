@@ -1,9 +1,9 @@
 import { expect, test, describe } from "bun:test";
 import { localDateTime, localTime, localDate } from "../src/time.js";
 import { encodeProjectDir, encodeOmpDir } from "../src/live.js";
-import { locationOf } from "../src/repo.js";
+import { locationOf, shardDirFor, DEFAULT_BANK } from "../src/repo.js";
 import { classify } from "../src/noise.js";
-import { nameOf, looksLikeId, toISO } from "../src/query.js";
+import { nameOf, looksLikeId, toISO, dedupeHits } from "../src/query.js";
 
 /**
  * Pure-function tests — no LanceDB, no filesystem, no fixtures.
@@ -166,5 +166,74 @@ describe("toISO — relative spans, bare dates, passthrough", () => {
   test("empty input is undefined, not epoch zero", () => {
     expect(toISO("")).toBeUndefined();
     expect(toISO(undefined)).toBeUndefined();
+  });
+});
+
+describe("dedupeHits — the key is content, NOT uid", () => {
+  // uidOf(shape, basename, seq) hashes a LINE SLOT. A resumed Claude session writes a new
+  // file under the SAME uuid holding NONE of the earlier lines, so one uid can name two
+  // different events. Measured: of 13 projects∩projects-1sep pairs, 8 diverge at line 1,
+  // and one pair had 1,018 slots carrying an indexed event in BOTH copies.
+  test("keeps two DIFFERENT events that share a uid", () => {
+    const out = dedupeHits([
+      { uid: "same", ts: "2026-09-01T00:00:00Z", role: "user", text: "old session line 1" },
+      { uid: "same", ts: "2026-09-12T00:00:00Z", role: "user", text: "resumed session line 1" },
+    ]);
+    expect(out.length).toBe(2);
+  });
+
+  test("collapses the same event arriving from two banks", () => {
+    const out = dedupeHits([
+      { uid: "a", ts: "2026-09-01T00:00:00Z", role: "user", text: "hello" },
+      { uid: "a", ts: "2026-09-01T00:00:00Z", role: "user", text: "hello" },
+    ]);
+    expect(out.length).toBe(1);
+  });
+
+  test("keeps the FIRST occurrence, so the best-ranked copy survives the sort", () => {
+    const out = dedupeHits([
+      { uid: "a", ts: "t", role: "user", text: "x", tag: "best" },
+      { uid: "b", ts: "t", role: "user", text: "x", tag: "worse" },
+    ] as any);
+    expect((out[0] as any).tag).toBe("best");
+  });
+
+  test("falls back to uid only when there is no timestamp", () => {
+    // vault/memory carry no ts and hash the FULL path into the uid, so uid there really
+    // does identify one chunk of one file.
+    const out = dedupeHits([
+      { uid: "note-1", ts: "", role: "note", text: "" },
+      { uid: "note-1", ts: "", role: "note", text: "" },
+      { uid: "note-2", ts: "", role: "note", text: "" },
+    ]);
+    expect(out.length).toBe(2);
+  });
+
+  test("two distinct untimestamped rows are NOT collapsed by empty content", () => {
+    const out = dedupeHits([
+      { uid: "x", ts: "", role: "note", text: "" },
+      { uid: "y", ts: "", role: "note", text: "" },
+    ]);
+    expect(out.length).toBe(2);
+  });
+});
+
+describe("shardDirFor — the bank is the top segment", () => {
+  test("bank comes before the repo key", () => {
+    expect(shardDirFor("github.com/acme/repo", "/data", false, "projects"))
+      .toBe("/data/banks/projects/github.com/acme/repo");
+  });
+
+  test("an unresolved repo still lands inside its bank", () => {
+    expect(shardDirFor(null, "/data", false, "codex")).toBe("/data/banks/codex/_unresolved");
+  });
+
+  test("a caller with no bank does not write to the data root itself", () => {
+    expect(shardDirFor("github.com/acme/repo", "/data")).toBe(`/data/banks/${DEFAULT_BANK}/github.com/acme/repo`);
+  });
+
+  test("in-repo puts the bank INSIDE .relic, so one checkout can hold several", () => {
+    const d = shardDirFor("github.com/acme/repo", null, true, "projects-archive");
+    expect(d.endsWith("github.com/acme/repo/.relic/banks/projects-archive")).toBe(true);
   });
 });
