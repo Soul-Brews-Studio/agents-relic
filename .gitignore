@@ -5,3 +5,6 @@ docs/
 
 # Rust build artifacts — the native binary is optional and built locally
 rust/target/
+
+# scratch probes — never committed
+.tmp/

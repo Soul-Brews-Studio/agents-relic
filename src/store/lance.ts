@@ -339,4 +339,40 @@ export class LanceStore {
     }
     return [...agg.values()];
   }
+
+  /**
+   * Every Claude Code memory row in this shard — a filter-only read, never FTS.
+   *
+   * `search("")` cannot answer this: an empty query against a full-text index matches
+   * nothing by construction, so it reports zero for a shard that is actually full.
+   *
+   * The schema probe is not defensive padding. `mem_type` arrived with `widen()`, so
+   * any shard written before it lacks the column, and a Lance `select` naming a missing
+   * column is a HARD ERROR, not an empty result — it would take down the whole fan-out.
+   */
+  async memories(): Promise<{ session_uuid: string; file_path: string; mem_type: string; origin_session: string; ts: string; text: string }[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const have = new Set((await t.schema()).fields.map(f => f.name));
+    if (!have.has("mem_type")) return [];
+    return await t.query().where("tier = 'memory'")
+      .select(["session_uuid", "file_path", "mem_type", "origin_session", "ts", "text"])
+      .toArray() as any;
+  }
+
+  /** The session ids this shard holds — the right-hand side of the memory join. */
+  async sessionIds(): Promise<Set<string>> {
+    const t = await this.existing("sessions");
+    if (!t) return new Set();
+    const rows = await t.query().select(["session_uuid"]).toArray() as any[];
+    return new Set(rows.map(r => String(r.session_uuid)));
+  }
+
+  /** Indexed transcript count, excluding the document tiers that are not sessions. */
+  async transcriptCount(): Promise<number> {
+    const t = await this.existing("sessions");
+    if (!t) return 0;
+    const rows = await t.query().select(["tier"]).toArray() as any[];
+    return rows.filter(r => r.tier !== "note" && r.tier !== "memory").length;
+  }
 }

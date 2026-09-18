@@ -2,7 +2,7 @@ import { createReadStream, statSync } from "node:fs";
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
-import { parseSince } from "./discover.js";
+import { discover, parseSince } from "./discover.js";
 import { listShards } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
 import { importFiles } from "./import.js";
@@ -530,4 +530,159 @@ export function staleness(row: SessionRow): { behindSec: number; fileMtimeMs: nu
     const behind = Math.round((st.mtimeMs - Number(row.file_mtime ?? 0) * 1000) / 1000);
     return behind > 60 ? { behindSec: behind, fileMtimeMs: st.mtimeMs } : null;
   } catch { return null; }
+}
+
+
+// ---- Claude Code memory: the join no other source can answer --------------------
+
+export interface MemoryRow {
+  repo: string; name: string; memType: string; origin: string;
+  ts: string; filePath: string; description: string;
+  /** Is the session that produced this memory still in the index? */
+  originIndexed: boolean;
+}
+
+export interface MemoryReport {
+  rows: MemoryRow[];
+  total: number;
+  byType: { type: string; n: number }[];
+  /** Memories carrying an originSessionId at all. */
+  withOrigin: number;
+  /** Carry an origin, and that session IS indexed — the joinable set. */
+  joined: number;
+  /** Carry an origin whose session is NOT in the index (pruned, or another machine). */
+  orphaned: number;
+  perRepo: { repo: string; memories: number; transcripts: number; producing: number }[];
+  shards: number;
+  ms: number;
+}
+
+/**
+ * Memories, and how they line up against the transcripts that produced them.
+ *
+ * `origin_session` is the only key in this index that crosses KINDS — it points from a
+ * durable fact back to the conversation that created it. That makes three questions
+ * answerable that no other source can answer alone: which sessions produced memories,
+ * which memories have outlived their evidence, and how memory density varies by repo.
+ *
+ * "producing" counts DISTINCT origin sessions present in the shard, not memories, so a
+ * session that yielded four facts counts once.
+ */
+export async function memoryReport(
+  s: Scope & { memType?: string; since?: string; until?: string; limit?: number } = {},
+): Promise<MemoryReport> {
+  const t0 = Date.now();
+  const rows: MemoryRow[] = [];
+  const byType = new Map<string, number>();
+  const perRepo: MemoryReport["perRepo"] = [];
+  const since = toISO(s.since);
+  const until = toISO(s.until, true);
+  let withOrigin = 0, joined = 0, orphaned = 0, shards = 0;
+
+  for (const sh of pickShards(s)) {
+    let store;
+    try { store = await LanceStore.open(sh.dir); } catch { continue; }
+    let mems;
+    try { mems = await store.memories(); } catch { continue; }
+    if (!mems.length) continue;
+    shards++;
+
+    const ids = await store.sessionIds();
+    const transcripts = await store.transcriptCount();
+    const producing = new Set<string>();
+    let kept = 0;
+
+    for (const m of mems) {
+      if (s.memType && m.mem_type !== s.memType) continue;
+      if (since && m.ts && m.ts < since) continue;
+      if (until && m.ts && m.ts > until) continue;
+      kept++;
+      const origin = String(m.origin_session ?? "");
+      const originIndexed = Boolean(origin) && ids.has(origin);
+      if (origin) { withOrigin++; originIndexed ? joined++ : orphaned++; }
+      if (originIndexed) producing.add(origin);
+      const type = String(m.mem_type || "(untyped)");
+      byType.set(type, (byType.get(type) ?? 0) + 1);
+      rows.push({
+        repo: sh.key, name: String(m.session_uuid ?? ""), memType: type, origin,
+        ts: String(m.ts ?? ""), filePath: String(m.file_path ?? ""),
+        // The description leads the indexed text, so the first line IS the description.
+        description: String(m.text ?? "").split("\n")[0].slice(0, 160),
+        originIndexed,
+      });
+    }
+    if (kept) perRepo.push({ repo: sh.key, memories: kept, transcripts, producing: producing.size });
+  }
+
+  rows.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+  perRepo.sort((a, b) => b.memories - a.memories);
+  return {
+    rows: s.limit ? rows.slice(0, s.limit) : rows,
+    total: rows.length,
+    byType: [...byType].map(([type, n]) => ({ type, n })).sort((a, b) => b.n - a.n),
+    withOrigin, joined, orphaned, perRepo, shards, ms: Date.now() - t0,
+  };
+}
+
+// ---- what is on disk but NOT in the index ---------------------------------------
+
+export interface PendingGroup {
+  source: string; tier: string;
+  found: number; indexed: number; changed: number; missing: number;
+}
+export interface PendingReport {
+  groups: PendingGroup[];
+  found: number; indexed: number; changed: number; missing: number;
+  newestPendingMs: number | null;
+  scanMs: number;
+}
+
+/**
+ * Discovered-on-disk minus already-imported: the backlog, before an index run.
+ *
+ * Answers "how many sessions are not indexed" without writing anything, and separates
+ * the two reasons a file is pending — never seen (`missing`) versus seen and since
+ * modified (`changed`), which is the normal state of every live session.
+ *
+ * The manifest is the SAME (path, mtime, size) identity the importer skips on, so this
+ * cannot disagree with what a real run would do. Manifests are merged across shards
+ * because discovery does not know a file's repo until it is parsed — and the encoded
+ * project-dir name is lossy, so guessing it here would be wrong for exactly the nested
+ * cases that matter.
+ */
+export async function pendingReport(
+  s: Scope & { corpus?: string[] | null; since?: string } = {},
+): Promise<PendingReport> {
+  const t0 = Date.now();
+  const seen = new Map<string, { mtime: number; size: number }>();
+  for (const sh of pickShards(s)) {
+    try {
+      const man = await (await LanceStore.open(sh.dir)).manifest();
+      for (const [k, v] of man) seen.set(k, v);
+    } catch { /* unreadable shard contributes nothing — it just looks unindexed */ }
+  }
+
+  const sinceMs = s.since ? parseSince(s.since) : null;
+  const found = discover(s.corpus ?? null, sinceMs);
+
+  const groups = new Map<string, PendingGroup>();
+  let indexed = 0, changed = 0, missing = 0, newest: number | null = null;
+  for (const f of found) {
+    const k = `${f.source}/${f.tier}`;
+    const g = groups.get(k) ?? { source: f.source, tier: f.tier, found: 0, indexed: 0, changed: 0, missing: 0 };
+    g.found++;
+    const prior = seen.get(f.path);
+    if (!prior) { g.missing++; missing++; }
+    else if (prior.mtime !== f.mtime || prior.size !== f.size) { g.changed++; changed++; }
+    else { g.indexed++; indexed++; }
+    if (!prior || prior.mtime !== f.mtime || prior.size !== f.size)
+      newest = Math.max(newest ?? 0, f.mtime * 1000);
+    groups.set(k, g);
+  }
+
+  return {
+    groups: [...groups.values()].sort((a, b) => (b.missing + b.changed) - (a.missing + a.changed)),
+    found: found.length, indexed, changed, missing,
+    newestPendingMs: newest, scanMs: Date.now() - t0,
+  };
 }
