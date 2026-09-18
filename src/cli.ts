@@ -316,13 +316,17 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   const smode = outFmt(f);
   if (smode === "json" || smode === "jsonl") {
     const rows: { key: string; bank: string; repo: string; ev: number; se: number;
+                  events: number; sessions: number;
                   lastIndexed: string; newestSession: string }[] = [];
     for (const sh of shards) {
       try {
         const st = await LanceStore.open(sh.dir);
         const c = await st.counts();
         const fr = await st.freshness();
-        rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, ev: c.events, se: c.sessions,
+        rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo,
+                    // ev/se predate the rest of this row and something may read them.
+                    // events/sessions are the names everything else uses.
+                    ev: c.events, se: c.sessions, events: c.events, sessions: c.sessions,
                     lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
       } catch { /* skip unreadable shard */ }
     }

@@ -22,16 +22,23 @@ your repos.
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  relic — agent session transcripts, indexed              measured 2026-09-18 ║
-║  345 shards · 3.2 M events · 37,285 sessions · 9.2 GB index over 34 GB raw   ║
+║  6 banks · 508 shards · 3,258,529 events · 40,865 sessions · 2.7 GB index    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
  1 ─ SOURCES                        config: ~/.relic/sources.json, no code change
 
-     ~/.claude/projects           3.7 G    6,418 files   [on]
-     ~/.claude/projects-archive   6.5 G    7,052 files   [on]
-     ~/.claude/projects-1sep      13  G   25,397 files   [on]  largest, added last
-     ~/.codex/sessions            11  G    1,750 files   [on]  different shape
-     ~/.omx-runs                   39 M      449 files   [off] ops logs, not talk
+     ONE SOURCE = ONE BANK.       a bank is the top level of the shard path
+
+     source              raw     bank                     index
+     ~/.claude/projects  3.7 G   projects                  357 M   [on]
+     …/projects-archive  6.5 G   projects-archive          737 M   [on]
+     …/projects-1sep     13  G   projects-1sep-tue2026     1.5 G   [on]  largest
+     ~/.codex/sessions   11  G   codex                     141 M   [on]  other shape
+     ~/.omp/…/sessions    32 M   omp                       9.6 M   [on]
+     ~/.claude/…/memory   —       memory                    2.9 M   [on]  typed facts
+     ~/.relic-vault-unset  ?     vault                     —       [off] path unset
+     ~/.hermes             ?     hermes                    —       [off] SQLite
+     ~/.omx-runs          39 M   omx-logs                  —       [off] ops logs
                   │
                   │   THREE TIERS, and the third is the one that gets missed
                   │     <project>/<uuid>.jsonl                          session
@@ -72,7 +79,10 @@ your repos.
                     └──► contextOf ──► worktree             = 1 shard, not 3)
                  │
                  ▼
- 5 ─ STORE                          ~/.relic/github.com/<org>/<repo>/
+ 5 ─ STORE                          ~/.relic/banks/<bank>/github.com/<org>/<repo>/
+                                    BANK FIRST. Three Claude roots are overlapping
+                                    snapshots of one machine, so the same session
+                                    exists in two banks — as two physical rows.
 
      events · sessions · files      LanceDB. files = the manifest, written PER FILE,
                  │                  so Ctrl-C resumes instead of restarting
@@ -82,17 +92,17 @@ your repos.
                                     ภาษาไทยเป็นคำบรรยาย -> ภาษา|ไทย|เป็น|คำ|บรรยาย
                  │
                  ▼
- 6 ─ SEARCH                         --repo ~200 ms  ·  fan-out ~1.8 s (345 shards)
+ 6 ─ SEARCH                         --bank 90 ms/162  ·  fan-out 356 ms/508 shards
 
-     search ─┬─ --repo --worktree --path      where
+     search ─┬─ --bank --repo --worktree      where
              ├─ --prose --role                who was speaking
              ├─ --since --until               when
              └─ --plain --json --jsonl        for the shell
                  │
                  ├──► show <file> --seq N     reads the SOURCE .jsonl, not the index
                  │                            (the index is a pointer, not an archive)
-                 └──► trace.jsonl             51 queries · 4 opened · median 151 ms
-                                              340 of 345 shards: never a best hit
+                 └──► trace.jsonl             every query, CLI and MCP alike
+                                              which shards ever answer anything
 
  LEGEND   [on]/[off] = source enabled   ! = caveat   -> = flows to
  ─────────────────────────────────────────────────────────────────────────────
@@ -100,25 +110,78 @@ your repos.
 ```
 
 **What the picture shows that the prose does not.** Two numbers argue with each other:
-**the human is 6.8% of a transcript**, and **340 of 345 shards have never produced a
-best hit**. Five stages carefully preserve 3.2 M events, and the query log says nearly
-all the value sits in five shards and one-fifteenth of the content. That is an argument
-for indexing *less*, not faster.
+**the human is 6.8% of a transcript**, and **340 of 345 shards had never produced a best
+hit** when that log was read (2026-09-18, 51 queries, median 151 ms). Six stages carefully
+preserve 3.26 M events, and the query log says nearly all the value sits in five shards
+and one-fifteenth of the content. That is an argument for indexing *less*, not faster.
+
+A third number joined them with banks: **34 GB of transcripts compress to a 2.7 GB
+index**, and three of the six banks are overlapping snapshots of the same machine. Some
+of what is stored is stored twice, deliberately — see Banks below.
 
 ---
 
 
+## Banks
+
+A **bank** is one whole source root, and it is the top level of the shard path:
+
+```
+~/.relic/banks/<bank>/github.com/<org>/<repo>/
+         │        └─ one git repo, ghq-style — a LanceDB directory
+         └─ one source root: a Claude projects dir, codex, omp, memory
+```
+
+**Why a bank exists.** This machine has three Claude projects roots — the live one, an
+archive, and a dated snapshot. They are **overlapping copies of the same machine**, not
+three different machines. Without a bank they collapse into one shard per repo, and the
+question "which snapshot did this come from" becomes unanswerable after the fact.
+
+**The same session can therefore exist in two banks, as two physical rows.** That is the
+design, not corruption: 3,258,529 events across six banks is *more* than the 3,238,933 of
+the old flat index, because the duplicates are now stored twice on purpose.
+
+What each surface does about that duplication is not the same, and the difference matters:
+
+| | duplicates |
+|---|---|
+| `relic search` / `relic_search` | **collapsed** — keyed on `(ts, role, text)` |
+| `relic sessions` / `relic_sessions` | **not collapsed** — a cross-bank copy shows as an extra transcript |
+
+> The dedup key is content, **not `uid`**. `uidOf` hashes a *line slot*, so a resumed
+> session writes a new file under the same uuid whose slot 7 holds a different event.
+> Measured: of 13 real cross-root pairs, 8 diverge at line 1, and one pair had 1,018
+> slots carrying a different indexed event in each copy. A uid-keyed dedup shipped
+> first and silently dropped real results; it was reverted.
+
+`--bank <name>` (CLI) and `bank` (MCP) match **exactly**, not as a substring, and are the
+cheapest filter available — measured on this index, `--bank projects-archive` is **90 ms
+over 162 shards** against **356 ms over 508** unfiltered.
+
+`relic status` prints the banks on this machine. Don't hardcode the list; it changes when
+a source is added.
+
+---
+
 ## Sources
 
-Four shapes, one index. Each declares how to find its files and how to parse them.
+Nine declared, six on by default. Each declares how to find its files, how to parse them,
+and which bank it writes.
 
-| source | shape | default |
-|---|---|---|
-| `claude-live` / `claude-archive` | JSONL, 3 tiers (session/subagent/workflow_agent) | on |
-| `codex` | JSONL rollouts, date-nested | on |
-| `omp` | JSONL, one dir per encoded cwd | on |
-| `oracle-vault` | `ψ/**.md` documents | off — path is per-machine |
-| `hermes` | **SQLite**, one DB per profile | off |
+| source | bank | shape | default |
+|---|---|---|---|
+| `claude-live` | `projects` | JSONL, 3 tiers (session/subagent/workflow_agent) | on |
+| `claude-archive` | `projects-archive` | same | on |
+| `claude-1sep` | `projects-1sep-tue2026` | same — the largest root | on |
+| `codex` | `codex` | JSONL rollouts, date-nested | on |
+| `omp` | `omp` | JSONL, one dir per encoded cwd | on |
+| `claude-memory` | `memory` | `<project>/memory/*.md`, typed facts | on |
+| `oracle-vault` | `vault` | `ψ/**.md` documents | off — path is per-machine |
+| `hermes` | `hermes` | **SQLite**, one DB per profile | off |
+| `omx-logs` | `omx-logs` | run logs — ops output, not conversation | off |
+
+`relic sources` prints this for *your* machine, with what is actually present and how many
+banks a run would write.
 
 ### Hermes is SQLite, and that is not the omp mistake
 
@@ -231,11 +294,17 @@ Trim ~350 MB of LanceDB's unused ML optional deps with an override in your
 relic sources                  # what agent transcripts exist on this machine
 relic index --since 30d        # build the index (resumable — Ctrl-C is safe)
 relic search "freelist"        # search everything
-relic status                   # what you ended up with
+relic status                   # what you ended up with, and when it last ran
+relic pending                  # what is on disk but NOT indexed  <- the real check
 ```
 
-Everything lands in `~/.relic/github.com/<org>/<repo>/`. Nothing is written into any
-repository. Use `--in-repo` if you want each repo to carry its own shard instead.
+**Run `relic pending` after any index.** `relic status` reports what was imported and
+never what was missed, so a partially-indexed corpus looks completely healthy. This is
+not hypothetical: an index run with `--since 7d` left 3,591 workflow_agent + 427 subagent
++ 361 session files unseen while `status` showed 3 M events. `pending` caught it.
+
+Everything lands in `~/.relic/banks/<bank>/github.com/<org>/<repo>/`. Nothing is written
+into any repository. Use `--in-repo` if you want each repo to carry its own shard.
 
 ---
 
@@ -285,7 +354,7 @@ relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 
 ### Fan-out cost, and what it is not
 
-An unfiltered search asks all 345 shards. They are queried concurrently, capped at
+An unfiltered search asks all 508 shards. They are queried concurrently, capped at
 `min(16, cpus-2)` — unbounded would trade a latency problem for a file-descriptor one.
 
 Measured on `"peak concurrency"`, average of 3 runs each (single runs vary by ~2 s, so
@@ -298,7 +367,7 @@ one-shot comparisons of this are worthless):
 | 32 | 6,762 ms |
 | 64 | 5,972 ms |
 
-Concurrency buys ~1.5x and nothing reliable above 16, because the cost is 345 real FTS
+Concurrency buys ~1.5x and nothing reliable above 16, because the cost is 508 real FTS
 queries. **`--repo` is still worth far more than any cap** — one shard answers in ~330 ms.
 `RELIC_FANOUT` overrides the cap for measurement.
 
@@ -320,7 +389,8 @@ two different events, and the role tells you which is which. Six such pairs rema
 
 ### Ranking across shards
 
-relic shards by repo, so a fan-out asks 345 indexes and each returns its own top-`limit`.
+relic shards by (bank, repo), so a fan-out asks 508 indexes and each returns its own
+top-`limit`.
 Those results are **sorted by BM25 score before slicing** — without that step the "top 20"
 is whatever the first shards happened to hold.
 
@@ -561,13 +631,65 @@ relic show <file> --seq 224 --before 3 --after 3
 Every search result prints its own `-> show …` line; copy it. Reads the source `.jsonl`
 directly, because the index stores a **pointer**, not an archive.
 
-### `status`, `sources`, `trace`
+### `status`, `pending`, `memory`, `sources`, `trace`
 
 ```bash
-relic status                 # shards, events, sessions, sizes
+relic status                 # bank → repo, counts, and BOTH clocks
+relic status --bank codex    # one bank
+relic pending                # on disk but not indexed: missing vs changed
+relic pending --list 20      # NAME them: session id, repo, bank, newest first
+relic memory                 # Claude's own memory, joined to the sessions that made it
 relic sources                # configured sources and what is actually present
 relic trace                  # your own query log
 relic trace --cloud          # keyword cloud, log-scaled by how often you ask
+```
+
+**`status` reports two clocks, and conflating them is the trap:**
+
+```
+  projects   16,000 sessions · 156,665 events · 52 shards
+             indexed 2026-09-18 21:04 · newest session 2026-09-18 20:40
+```
+
+`indexed` is `max(files.imported_at)` — when the **indexer** last wrote here. `newest
+session` is `max(sessions.started_at)` — when the newest **transcript** began. They
+diverge exactly where it matters: reindexing an old corpus moves the first and leaves the
+second months back, and an index that has not run since Tuesday still shows a recent
+second because a session started before it ran. **Only `indexed` answers "is this
+current".** A real row from this machine:
+
+```json
+{ "repo": "github.com/Soul-Brews-Studio/mawjs-oracle",
+  "lastIndexed": "2026-09-18T13:57:25.167Z",
+  "newestSession": "2026-06-02T13:51:28.393Z" }
+```
+
+Fresh index, three-month-old material — both true, neither a fault.
+
+**`pending --list N` names what is missing**, newest first:
+
+```
+  when             session    state   bank      source/tier          repo
+  2026-09-18 21:30 04d1d650   changed projects  claude-live/session  laris-co/neo-oracle
+  2026-09-18 21:15 7ba99d4d   changed projects  claude-live/session  dryoungdo/mycelium-oracle
+```
+
+`missing` = never seen. `changed` = seen, and modified since — the normal state of any
+live session, not a fault.
+
+The counts are a `stat()` sweep over the whole corpus; only the listed `N` are opened.
+A file's repo is **not** knowable from its path (the encoded project-dir name maps both
+`/` and `.` to `-`, so two checkouts can share one directory), so it is read from each
+transcript's own `cwd`. That is why the list is opt-in and capped.
+
+Omit `--since` when the question is "is anything missing" — a `--since` scan structurally
+cannot see a file older than the span.
+
+All three speak `--json`, `--jsonl` and `--plain`:
+
+```bash
+relic pending --list 50 --plain     # sessionId<TAB>repo<TAB>bank<TAB>source/tier<TAB>state<TAB>path
+relic status --json | jq '.rows[] | select(.bank=="codex")'
 ```
 
 ### `skipped` — what `--skip-noise` dropped, and the proof
@@ -599,17 +721,29 @@ claude mcp add relic -- bun /path/to/agents-relic/src/mcp.ts
 claude mcp add relic -- relic mcp
 ```
 
-Seven tools, each one deterministic lookup with named parameters:
+Eight tools, each one deterministic lookup with named parameters:
 
-| tool | answers |
-|---|---|
-| `relic_now` | what is running right now; **how a model learns its own session id** |
-| `relic_status` | what is indexed — **call first**, the repo keys it lists are what `repo` accepts |
-| `relic_search` | full-text over transcripts; returns `file` + `seq` pointers |
-| `relic_sessions` | what was I working on, over a time range |
-| `relic_session` | one id **or name** → the tree, its stats, and the sessions either side |
-| `relic_chain` | what ran in parallel inside that session |
-| `relic_show` | the conversation around one hit, read from the source `.jsonl` |
+| tool | answers | `bank` |
+|---|---|---|
+| `relic_now` | what is running right now; **how a model learns its own session id** | — |
+| `relic_status` | what is indexed — **call first**; the only place both filter vocabularies are discoverable | yes |
+| `relic_pending` | what is on disk but **not** indexed, and which sessions those are | yes |
+| `relic_search` | full-text over transcripts; returns `file` + `seq` pointers | yes |
+| `relic_sessions` | what was I working on, over a time range | yes |
+| `relic_session` | one id **or name** → the tree, its stats, and the sessions either side | yes |
+| `relic_chain` | what ran in parallel inside that session | yes |
+| `relic_show` | the conversation around one hit, read from the source `.jsonl` | — |
+
+**`relic_status` groups bank → repo and says which column each filter reads.** It used to
+claim its rows were the values `repo` accepts. After banks those rows read
+`projects/github.com/org/repo`, while `repo` matches the repo portion only — so a model
+following the tool's own instructions got zero hits, from the one tool whose job is
+saying what is valid. A bank **heading** is what `bank` takes (exact); an indented repo
+**row** is what `repo` takes (substring).
+
+**`relic_pending` exists because `relic_status` cannot answer "is the index complete".**
+It reports what was imported, never what was missed. With `list: N` the pending sessions
+are named, each with its session id and the repo read from that transcript's own cwd.
 
 **Why this exists: a model should not improvise a query.** Without tools, "find session
 1f3db67f" becomes a guessed `find` or a `grep -r` over 25k transcripts — slow, often
@@ -621,9 +755,11 @@ copy a model gets is the one no human ever runs by hand.
 
 Two behaviours worth knowing:
 
-- **`repo` is not cosmetic.** Measured on this index: `repo=neo-oracle` is **329 ms over
-  1 shard**; the same query unfiltered is **10.7 s over 345**. Every tool description that
-  takes `repo` says so, so the model narrows by default.
+- **Narrowing is not cosmetic.** Measured on this index at 508 shards: unfiltered is
+  **356 ms**, `bank=projects-archive` is **90 ms over 162 shards**, and a single `repo`
+  is one shard. Every tool description that takes `repo` or `bank` says so, so the model
+  narrows by default. (An earlier measurement at 345 shards, before shards were queried
+  concurrently, put the unfiltered fan-out at 10.7 s.)
 - **MCP queries land in the same trace log** as CLI ones. Otherwise `relic trace`'s
   "which shards ever answer anything" question silently loses every query a model made —
   which, once an agent is using this, is most of them.
@@ -726,18 +862,28 @@ The first analysis predicted 42.7%. The honest number is 14%, because "big" is n
       "path": "/Users/you/.claude/projects-1sep-tue2026",
       "walk": "claude-tiers",
       "shape": "claude",
+      "bank": "projects-1sep-tue2026",
       "note": "older snapshot root"
     }
   ]
 }
 ```
 
-`walk` is `claude-tiers` (the three-tier Claude layout) or `flat` (recursive file walk).
-`shape` is `claude` or `codex`.
+`walk` is `claude-tiers` (the three-tier Claude layout), `flat` (recursive file walk),
+`omp`, `vault`, `memory` or `hermes`. `shape` is `claude` or `codex`.
 
-Built-in: `claude-live`, `claude-archive`, `codex`, and `omx-logs` (**off** by default —
-those `.jsonl` files are ops logs, not conversation, and indexing them floods search
-with noise).
+**`bank` decides where the rows physically land.** Omit it and the source writes into
+`default`, sharing a shard with anything else that did the same — exactly the collapse
+banks exist to prevent when one root is a *snapshot* of another. Give any source that
+overlaps an existing one its own bank name.
+
+Duplicate keys and duplicate banks are dropped with a warning on stderr rather than
+silently merged; `relic sources` reports how many banks a run would write.
+
+Built-in and on: `claude-live`, `claude-archive`, `claude-1sep`, `codex`, `omp`,
+`claude-memory`. Built-in and **off**: `oracle-vault` (path is per-machine), `hermes`,
+and `omx-logs` (those `.jsonl` files are ops logs, not conversation, and indexing them
+floods search with noise).
 
 ---
 
@@ -749,7 +895,7 @@ with noise).
 ║  3 tables · 0 foreign keys · file_path is the real key, session_uuid is not  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
- ONE LANCEDB DIRECTORY PER REPO    ~/.relic/github.com/<org>/<repo>/
+ ONE LANCEDB DIR PER (BANK, REPO)  ~/.relic/banks/<bank>/github.com/<org>/<repo>/
 
                        ┌──────────────────────────┐
                        │  files      1,881 rows   │   THE MANIFEST
@@ -912,18 +1058,24 @@ deliberately — the English stemmer mangles identifiers (`structured_output_mod
 
 ## Performance
 
-Measured at 345 shards / 3.2 M events:
+Measured 2026-09-18 at **508 shards / 3,258,529 events / 40,865 sessions**, index 2.7 GB
+over ~34 GB of raw transcripts:
 
-| query | latency |
-|---|---|
-| `--repo <one>` | **~200 ms** |
-| fan-out (all shards) | **~1.8 s** |
+| command | latency | shards read |
+|---|---|---|
+| `search --repo <one>` | ~200 ms | 1 |
+| `search --bank projects-archive` | **90 ms** | 162 |
+| `search` (unfiltered) | **356 ms** | 508 |
+| `status` (with both clocks) | **1.42 s** | 508 |
+| `pending` (whole corpus) | **1.37 s** | 40,865 files scanned |
+| `pending --list 5` | 1.8 s | + 5 files opened |
+| `memory` (198 memories joined to sessions) | 1.73 s | 508 |
 
-Latency scales with **shard count**, not corpus size. Use `--repo` when you know where
-you are looking.
+Latency scales with **shard count**, not corpus size — which is what makes `--bank` the
+cheapest filter: it cuts the shard set without knowing anything about the query.
 
-An honest caveat: `rg` searches 14.7 GB of raw JSONL in ~0.7 s. relic earns its place
-through **facets and structure** — repo, worktree, role, date, session listing — not
+An honest caveat: `rg` searches the raw JSONL in ~0.7 s. relic earns its place through
+**facets and structure** — bank, repo, worktree, role, date, session listing — not
 through reach or raw speed.
 
 ---
