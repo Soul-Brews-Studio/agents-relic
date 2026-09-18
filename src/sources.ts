@@ -18,7 +18,21 @@ export interface SourceDef {
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
+  /**
+   * The BANK this source writes into — the top level of the shard path:
+   *   ~/.relic/<bank>/github.com/<org>/<repo>/
+   *
+   * Defaults to `key`. The three Claude roots override it so the directory on disk
+   * reads as the root it mirrors (`projects`, `projects-archive`, …) rather than an
+   * internal key. A bank is a STORAGE namespace, not an identity: the same session
+   * can legitimately appear in two banks, and `uid` is what collapses it at read
+   * time. See uidOf in types.ts before changing anything here.
+   */
+  bank?: string;
 }
+
+/** A source's bank, defaulting to its key. The only place this fallback lives. */
+export function bankOf(s: SourceDef): string { return s.bank || s.key; }
 
 /**
  * Agent transcript sources.
@@ -49,13 +63,31 @@ export interface SourceDef {
 export const BUILTIN: SourceDef[] = [
   {
     key: "claude-live", path: join(HOME, ".claude", "projects"),
-    walk: "claude-tiers", parser: parseClaude, enabled: true,
+    walk: "claude-tiers", parser: parseClaude, enabled: true, bank: "projects",
     note: "Claude Code — session / subagent / workflow_agent",
   },
   {
     key: "claude-archive", path: join(HOME, ".claude", "projects-archive"),
-    walk: "claude-tiers", parser: parseClaude, enabled: true,
+    walk: "claude-tiers", parser: parseClaude, enabled: true, bank: "projects-archive",
     note: "Claude Code archive",
+  },
+  {
+    /*
+     * The largest root on this machine: 25,397 files across 903 directories.
+     *
+     * It lived ONLY in ~/.relic/sources.json until 2026-09-18, when that file was
+     * deleted along with the index and took the definition with it. A rebuild would
+     * then have indexed two of three Claude roots and reported success. A root this
+     * size is not machine-local trivia; it belongs in version control.
+     *
+     * Overlaps the other two roots heavily — 342 sessions shared with claude-live,
+     * 134 with claude-archive, and every one of claude-archive's 455 project
+     * directories also appears here. That duplication is expected and is resolved by
+     * uid at read time, NOT by keeping the roots apart.
+     */
+    key: "claude-1sep", path: join(HOME, ".claude", "projects-1sep-tue2026"),
+    walk: "claude-tiers", parser: parseClaude, enabled: true, bank: "projects-1sep-tue2026",
+    note: "Claude Code snapshot 1sep-tue2026 — the largest root",
   },
   {
     key: "codex", path: join(HOME, ".codex", "sessions"),
@@ -77,22 +109,22 @@ export const BUILTIN: SourceDef[] = [
     // YAML frontmatter / 94% under 4 KB — i.e. small, structured, and worth one row
     // per note rather than chunking. See src/shapes/vault.ts.
     key: "oracle-vault", path: join(HOME, ".relic-vault-unset"),
-    walk: "vault", parser: parseVault, enabled: false,
+    walk: "vault", parser: parseVault, enabled: false, bank: "vault",
     note: "Oracle ψ vault markdown — set its path in ~/.relic/sources.json",
-  },
-  {
-    // Hermes — SQLite, not JSONL. Verified (issue #6): there genuinely is no
-    // per-session JSONL beside the DB, unlike the omp case. One DB per profile,
-    // many sessions each; the walker emits one entry per session.
-    key: "claude-memory", path: join(HOME, ".claude", "projects"),
-    walk: "memory", parser: parseMemory, enabled: true,
-    note: "Claude Code memory — typed facts (project/feedback/reference/user)",
   },
   {
     // Claude Code's OWN memory — durable typed facts the agent chose to keep, each
     // with a pointer back to the session that produced it. A different kind of thing
     // from a transcript, and the only source that can answer "which session taught me
     // this". Measured: 67 dirs, 227 files, 172 typed, 161 with originSessionId.
+    key: "claude-memory", path: join(HOME, ".claude", "projects"),
+    walk: "memory", parser: parseMemory, enabled: true, bank: "memory",
+    note: "Claude Code memory — typed facts (project/feedback/reference/user)",
+  },
+  {
+    // Hermes — SQLite, not JSONL. Verified (issue #6): there genuinely is no
+    // per-session JSONL beside the DB, unlike the omp case. One DB per profile,
+    // many sessions each; the walker emits one entry per session.
     key: "hermes", path: join(HOME, ".hermes"),
     walk: "hermes", parser: parseHermes, enabled: false,
     note: "Hermes — SQLite state.db per profile, one entry per session",
@@ -156,6 +188,7 @@ export function loadSources(): SourceDef[] {
               : parseClaude,
         enabled: a.enabled !== false,
         note: String(a.note ?? "user-configured"),
+        bank: a.bank ? String(a.bank) : undefined,
       });
     }
   } catch { /* a broken config must not stop an index run */ }
@@ -182,8 +215,9 @@ export function parserFor(filePath: string): Parser {
   return filePath.endsWith(".md") ? parseVault : parseClaude;
 }
 
-export function detect(): { key: string; path: string; present: boolean; enabled: boolean; note: string }[] {
+export function detect(): { key: string; bank: string; path: string; present: boolean; enabled: boolean; note: string }[] {
   return loadSources().map(s => ({
-    key: s.key, path: s.path, present: existsSync(s.path), enabled: s.enabled, note: s.note,
+    key: s.key, bank: bankOf(s), path: s.path, present: existsSync(s.path),
+    enabled: s.enabled, note: s.note,
   }));
 }

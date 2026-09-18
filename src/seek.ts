@@ -1,6 +1,6 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
-import { loadSources } from "./sources.js";
+import { bankOf, loadSources } from "./sources.js";
 import type { Found, Tier } from "./discover.js";
 
 /**
@@ -39,6 +39,10 @@ export function seekOnDisk(id: string): Found[] {
 
   for (const src of loadSources()) {
     if (!existsSync(src.path)) continue;
+    // Same bank the bulk walker would have stamped. Without it an on-demand
+    // `relic session <id>` import writes into the fallback bank instead of the
+    // source's own — a misfile that no error would report.
+    const bank = bankOf(src);
 
     if (src.walk === "flat") {
       // Codex nests by date; bounded depth rather than an open-ended walk.
@@ -48,7 +52,7 @@ export function seekOnDisk(id: string): Found[] {
           if (!want(f) && !f.includes(id)) continue;
           const st = statOf(join(root, f));
           if (st) out.push({ path: join(root, f), projectDir: src.key, tier: "session" as Tier,
-            source: src.key, workflowRunId: null, agentId: null, ...st, parser: src.parser });
+            source: src.key, bank, workflowRunId: null, agentId: null, ...st, parser: src.parser });
         }
         if (depth >= 4) return;
         for (const d of dirs(root)) walk(join(root, d), depth + 1);
@@ -65,7 +69,7 @@ export function seekOnDisk(id: string): Found[] {
         if (!want(f)) continue;
         const st = statOf(join(pp, f));
         if (st) out.push({ path: join(pp, f), projectDir: project, tier: "session",
-          source: src.key, workflowRunId: null, agentId: null, ...st, parser: src.parser });
+          source: src.key, bank, workflowRunId: null, agentId: null, ...st, parser: src.parser });
       }
 
       // children live under <uuid>/subagents/... — so the DIRECTORY carries the id
@@ -77,7 +81,7 @@ export function seekOnDisk(id: string): Found[] {
         for (const f of files(sub)) {
           const st = statOf(join(sub, f));
           if (st) out.push({ path: join(sub, f), projectDir: project, tier: "subagent",
-            source: src.key, workflowRunId: null, agentId: basename(f, ".jsonl"), ...st, parser: src.parser });
+            source: src.key, bank, workflowRunId: null, agentId: basename(f, ".jsonl"), ...st, parser: src.parser });
         }
         const wf = join(sub, WF);
         for (const run of dirs(wf)) {
@@ -85,7 +89,7 @@ export function seekOnDisk(id: string): Found[] {
           for (const f of files(join(wf, run))) {
             const st = statOf(join(wf, run, f));
             if (st) out.push({ path: join(wf, run, f), projectDir: project, tier: "workflow_agent",
-              source: src.key, workflowRunId: run, agentId: basename(f, ".jsonl"), ...st, parser: src.parser });
+              source: src.key, bank, workflowRunId: run, agentId: basename(f, ".jsonl"), ...st, parser: src.parser });
           }
         }
       }

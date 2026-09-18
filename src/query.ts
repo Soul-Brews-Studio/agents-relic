@@ -21,7 +21,8 @@ import { buildChain, type Chain, type ChainRow } from "./chain.js";
 export interface Scope {
   dataRoot?: string | null;
   inRepo?: boolean;
-  repo?: string;        // substring of the shard key, e.g. "neo-oracle"
+  repo?: string;        // substring of the REPO portion only, e.g. "neo-oracle"
+  bank?: string;        // exact bank name, e.g. "projects-archive" — see repo.ts
 }
 
 export interface SearchOpts extends Scope {
@@ -52,10 +53,17 @@ export function toISO(v: unknown, endOfDay = false): string | undefined {
   return raw;
 }
 
-/** The shards a query will touch, after the `--repo` substring filter. */
+/**
+ * The shards a query will touch, after the `--bank` and `--repo` filters.
+ *
+ * `repo` matches the REPO portion, never the whole key. Once the key gained a bank
+ * prefix, a substring test against the key would make `--repo projects` match every
+ * shard in three banks — a filter that silently widens is worse than one that errors.
+ */
 export function pickShards(s: Scope) {
-  const all = listShards(s.dataRoot ?? null, Boolean(s.inRepo));
-  return s.repo ? all.filter(x => x.key.includes(s.repo!)) : all;
+  let all = listShards(s.dataRoot ?? null, Boolean(s.inRepo));
+  if (s.bank) all = all.filter(x => x.bank === s.bank);
+  return s.repo ? all.filter(x => x.repo.includes(s.repo!)) : all;
 }
 
 export interface SearchResult {
@@ -174,12 +182,23 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    * same event, not a coincidence. Sorting by score happens FIRST, so the copy that is
    * kept is the best-ranked one rather than whichever shard answered first.
    */
-  const seen = new Set<string>();
+  const seenUid = new Set<string>();
+  const seenEvent = new Set<string>();
   const deduped: typeof hits = [];
   for (const h of hits) {
-    const k = `${h.ts}\u001f${h.role}\u001f${h.text}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
+    // uid FIRST, and it is the cross-BANK case: uid excludes the path and the bank, so
+    // one session indexed under two source roots produces the same uid twice. Exact and
+    // cheaper than comparing full text.
+    if (seenUid.has(h.uid)) continue;
+    seenUid.add(h.uid);
+    // ts empty means the shape carries no timestamp (documents). Keying on
+    // ("", role, text) there would collapse genuinely distinct rows, so uid is the only
+    // safe key in that case and the content test is skipped.
+    if (h.ts) {
+      const k = `${h.ts}\u001f${h.role}\u001f${h.text}`;
+      if (seenEvent.has(k)) continue;
+      seenEvent.add(k);
+    }
     deduped.push(h);
   }
   hits.length = 0;
@@ -473,7 +492,10 @@ export async function neighbours(
 ): Promise<Neighbours> {
   const iso = String(row.started_at ?? "");
   if (!iso) return { before: [], after: [] };
-  const shard = pickShards({ ...s, repo: row.repo }).find(x => x.key === row.repo);
+  // `row.repo` is a full shard KEY ("<bank>/github.com/<org>/<repo>"), not a repo name,
+  // so it must not be fed to the `repo` filter — that filter now matches the repo
+  // portion and would return nothing, leaving this function silently empty.
+  const shard = pickShards({ dataRoot: s.dataRoot, inRepo: s.inRepo }).find(x => x.key === row.repo);
   if (!shard) return { before: [], after: [] };
   try {
     const store = await LanceStore.open(shard.dir);

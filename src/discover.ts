@@ -1,7 +1,7 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { loadSources } from "./sources.js";
+import { bankOf, loadSources } from "./sources.js";
 import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
 
@@ -14,6 +14,7 @@ export interface Found {
   projectDir: string;      // raw encoded dir name (display only — the encoding is lossy)
   tier: Tier;
   source: string;
+  bank: string;            // top level of the shard path — see bankOf in sources.ts
   workflowRunId: string | null;
   agentId: string | null;
   mtime: number;
@@ -245,7 +246,11 @@ export function discover(only: string[] | null, sinceMs: number | null): Found[]
     else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
     else walkClaude(src.path, sinceMs, out, src.key, src.parser);
-    void before;
+    // Stamp the bank on what this source just contributed, rather than threading it
+    // through all six walkers. A file's bank is a property of the SOURCE it was found
+    // under, so the walkers never need to know about it.
+    const bank = bankOf(src);
+    for (let i = before; i < out.length; i++) out[i].bank = bank;
   }
   if (out.length >= 2000) progressLine(`  scanned ${out.length.toLocaleString()} files`);
   return out;

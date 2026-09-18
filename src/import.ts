@@ -1,7 +1,7 @@
 import { LanceStore, type EventRow, type SessionRow, type FileRow } from "./store/lance.js";
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
-import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir } from "./repo.js";
+import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
 
 /**
  * Writing into the index.
@@ -14,15 +14,21 @@ import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir } from "./
 const nowISO = () => new Date().toISOString();
 const fmt = (n: number) => n.toLocaleString("en-US");
 
-/** One store per repo, opened on first write. */
+/**
+ * One store per (BANK, repo), opened on first write.
+ *
+ * Keying on the repo alone would hand the same LanceStore to two banks, and every row
+ * would land in whichever bank happened to open first — silently, since both writes
+ * succeed. The three Claude roots overlap by 742 sessions, so that is not hypothetical.
+ */
 export class Shards {
   private pool = new Map<string, LanceStore>();
   constructor(private dataRoot: string | null, private inRepo = false) {}
-  async get(repoKey: string | null): Promise<LanceStore> {
-    const key = repoKey ?? "_unresolved";
+  async get(repoKey: string | null, bank = DEFAULT_BANK): Promise<LanceStore> {
+    const key = `${bank}\u0000${repoKey ?? "_unresolved"}`;   // NUL: never legal in either part
     let s = this.pool.get(key);
     if (!s) {
-      const dir = shardDirFor(repoKey, this.dataRoot, this.inRepo);
+      const dir = shardDirFor(repoKey, this.dataRoot, this.inRepo, bank);
       guardShardDir(dir);
       s = await LanceStore.open(dir);
       this.pool.set(key, s);
@@ -31,6 +37,8 @@ export class Shards {
   }
   get size() { return this.pool.size; }
   keys() { return [...this.pool.keys()]; }
+  /** The open stores themselves — for callers that must not re-derive a key to reopen. */
+  stores() { return [...this.pool.values()]; }
 }
 
 export interface ImportOpts {
@@ -72,18 +80,21 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
    * invariant "a file is only marked done once its rows are committed" still holds.
    */
   const FLUSH_EVERY = 250;
-  interface Pending { events: EventRow[]; sessions: SessionRow[]; files: FileRow[]; deletes: string[] }
+  // The batch carries its own store. The shard key is now (bank, repo), and re-deriving
+  // a store from that string in flush() would mean parsing the key back apart — the exact
+  // shape of bug this change exists to remove.
+  interface Pending { store: LanceStore; events: EventRow[]; sessions: SessionRow[]; files: FileRow[]; deletes: string[] }
   const pending = new Map<string, Pending>();
-  const pend = (k: string): Pending => {
+  const pend = (k: string, store: LanceStore): Pending => {
     let b = pending.get(k);
-    if (!b) { b = { events: [], sessions: [], files: [], deletes: [] }; pending.set(k, b); }
+    if (!b) { b = { store, events: [], sessions: [], files: [], deletes: [] }; pending.set(k, b); }
     return b;
   };
 
   async function flush(): Promise<void> {
-    for (const [shardKey, b] of pending) {
+    for (const b of pending.values()) {
       if (!b.events.length && !b.sessions.length && !b.files.length && !b.deletes.length) continue;
-      const store = await shards.get(shardKey === "_unresolved" ? null : shardKey);
+      const store = b.store;
       // Deletes FIRST and as a unit: a re-imported file must drop its old rows before
       // the new ones land, or the two generations coexist.
       for (const fp of b.deletes) await store.deleteEventsOf(fp);
@@ -116,10 +127,15 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       const repoKey = repoKeyOf(p.cwd);
       if (o.repoFilter && !(repoKey ?? "").includes(o.repoFilter)) { filtered++; continue; }
 
-      const shardKey = repoKey ?? "_unresolved";
+      // `repoCol` is what goes in the rows; `shardKey` is (bank, repo) and only ever
+      // names a batch. The bank is NOT written into repo_key — it is already the
+      // directory the row lives in, and duplicating it would make every existing
+      // `--repo` filter match bank names too.
+      const repoCol = repoKey ?? "_unresolved";
+      const shardKey = `${file.bank}\u0000${repoCol}`;
       const ctx = contextOf(p.cwd);
       const loc = locationOf(p.cwd);
-      const store = await shards.get(repoKey);
+      const store = await shards.get(repoKey, file.bank);
 
       if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
       const man = manifests.get(shardKey)!;
@@ -139,7 +155,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       if (dropped.length) logSkipped(dropped, o.dataRoot);
 
       const events: EventRow[] = kept.map(e => ({
-        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: repoCol,
         seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
         source: file.source, tier: file.tier,
         worktree: ctx.worktree, cwd: p.cwd ?? "",
@@ -148,11 +164,11 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         origin_session: String((p as any).originSessionId ?? ""),
       }));
 
-      const batch = pend(shardKey);
+      const batch = pend(shardKey, store);
       if (seen) batch.deletes.push(file.path);
       batch.events.push(...events);
       batch.sessions.push({
-        session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        session_uuid: p.sessionUuid, file_path: file.path, repo_key: repoCol,
         project_dir: file.projectDir, tier: file.tier, source: file.source,
         cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
         workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
@@ -161,7 +177,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
         description: p.description ?? "", title: p.title ?? "", git_branch: p.gitBranch ?? "", imported_at: nowISO(),
       });
-      batch.files.push({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
+      batch.files.push({ file_path: file.path, repo_key: repoCol, mtime: file.mtime, size: file.size, imported_at: nowISO() });
       man.set(file.path, { mtime: file.mtime, size: file.size });
       added += events.length;
       imported++;
@@ -184,8 +200,8 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
 
   await flush();   // anything left below the batch threshold
 
-  for (const key of shards.keys()) {
-    try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); } catch {}
+  for (const store of shards.stores()) {
+    try { await store.ensureFtsIndex(); } catch {}
   }
   return { added, skipped, failed, filtered, skippedNoise, done, imported, shards };
 }
