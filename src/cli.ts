@@ -427,7 +427,6 @@ if (!cmd || f.help) {
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
-  ui      [--port 4477]        local viewer: click a repo, search, read context
 
   --in-repo          write <ghq>/<org>/<repo>/.relic/ instead of ~/.relic
   --data-root PATH   explicit index location
@@ -452,10 +451,6 @@ else if (cmd === "sources") {
     console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  ${s.path}\n         ${s.note}`);
   console.log("\nreal history that is NOT jsonl — needs a different reader:");
   for (const k of KNOWN_NON_JSONL) console.log(`  [--]  ${k.key.padEnd(16)} ${k.path}\n         ${k.note}`);
-}
-else if (cmd === "ui") {
-  const { serve } = await import("./ui.js");
-  await serve({ port: Number(f.port ?? 4477), dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]) });
 }
 else if (cmd === "trace") {
   const cloud = Boolean(f.cloud);
