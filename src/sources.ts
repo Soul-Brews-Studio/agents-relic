@@ -143,6 +143,25 @@ export function loadSources(): SourceDef[] {
 }
 
 /** What is actually on this machine, for the `sources` command. */
+/**
+ * Which parser handles this file, chosen by the source whose root contains it.
+ *
+ * Path-based, not content-sniffing: every source already declares its root, and three
+ * of the four shapes are newline-delimited JSON that a sniffer would confuse. The
+ * fallback is the Claude parser, since that is the only shape whose files can appear
+ * outside any configured root (a transcript copied somewhere for inspection).
+ */
+export function parserFor(filePath: string): Parser {
+  let best: SourceDef | null = null;
+  for (const s of loadSources()) {
+    if (!filePath.startsWith(s.path)) continue;
+    // Longest matching root wins — sources can nest (a vault inside a repo).
+    if (!best || s.path.length > best.path.length) best = s;
+  }
+  if (best) return best.parser;
+  return filePath.endsWith(".md") ? parseVault : parseClaude;
+}
+
 export function detect(): { key: string; path: string; present: boolean; enabled: boolean; note: string }[] {
   return loadSources().map(s => ({
     key: s.key, path: s.path, present: existsSync(s.path), enabled: s.enabled, note: s.note,

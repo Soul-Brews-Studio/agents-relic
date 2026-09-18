@@ -1,4 +1,4 @@
-import { LanceStore, type EventRow } from "./store/lance.js";
+import { LanceStore, type EventRow, type SessionRow, type FileRow } from "./store/lance.js";
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
 import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir } from "./repo.js";
@@ -52,6 +52,53 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
   let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0;
 
+  /*
+   * BATCHED WRITES.
+   *
+   * Each `mergeInsert` is a versioned commit in LanceDB. Writing events+session+file
+   * per FILE means 3 commits per file, which is negligible for JSONL transcripts (few
+   * files, thousands of events each) and pathological for document sources (many
+   * files, ~1 event each).
+   *
+   * Measured before this change, same code both times:
+   *   omp          19 files ->  6,173 events   ~1,200 events/sec
+   *   oracle-vault 10,058 files -> ~10,058 events    5 files/sec  (ETA 32 min, 19 MB)
+   *
+   * Accumulating and flushing every FLUSH_EVERY files turns ~30,000 commits into ~40.
+   *
+   * Resume semantics: `putFile` is what marks a file done, and it is flushed in the
+   * SAME batch as its events — so an interrupt loses at most one batch, and those
+   * files are simply re-imported next run. Granularity moves from 1 file to N; the
+   * invariant "a file is only marked done once its rows are committed" still holds.
+   */
+  const FLUSH_EVERY = 250;
+  interface Pending { events: EventRow[]; sessions: SessionRow[]; files: FileRow[]; deletes: string[] }
+  const pending = new Map<string, Pending>();
+  const pend = (k: string): Pending => {
+    let b = pending.get(k);
+    if (!b) { b = { events: [], sessions: [], files: [], deletes: [] }; pending.set(k, b); }
+    return b;
+  };
+
+  async function flush(): Promise<void> {
+    for (const [shardKey, b] of pending) {
+      if (!b.events.length && !b.sessions.length && !b.files.length && !b.deletes.length) continue;
+      const store = await shards.get(shardKey === "_unresolved" ? null : shardKey);
+      // Deletes FIRST and as a unit: a re-imported file must drop its old rows before
+      // the new ones land, or the two generations coexist.
+      for (const fp of b.deletes) await store.deleteEventsOf(fp);
+      // One commit per TABLE per batch — not per row. Looping putSession/putFile here
+      // was the original bug in this fix: it batched events and left the other two
+      // committing per row, so a 250-file batch still cost 500 commits.
+      if (b.events.length)   await store.putEvents(b.events);
+      if (b.sessions.length) await store.putSessions(b.sessions);
+      if (b.files.length)    await store.putFiles(b.files);
+      b.events = []; b.sessions = []; b.files = []; b.deletes = [];
+    }
+  }
+
+  let sinceFlush = 0;
+
   for (const file of found) {
     try {
       const p = await file.parser(file.path);
@@ -88,9 +135,10 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         org: loc.org, project: loc.project, dir: loc.dir,
       }));
 
-      if (seen) await store.deleteEventsOf(file.path);
-      await store.putEvents(events);
-      await store.putSession({
+      const batch = pend(shardKey);
+      if (seen) batch.deletes.push(file.path);
+      batch.events.push(...events);
+      batch.sessions.push({
         session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
         project_dir: file.projectDir, tier: file.tier, source: file.source,
         cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
@@ -100,10 +148,11 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
         description: p.description ?? "", title: p.title ?? "", git_branch: p.gitBranch ?? "", imported_at: nowISO(),
       });
-      await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
+      batch.files.push({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
       man.set(file.path, { mtime: file.mtime, size: file.size });
       added += events.length;
       imported++;
+      if (++sinceFlush >= FLUSH_EVERY) { await flush(); sinceFlush = 0; }
     } catch (err) {
       failed++;
       if (o.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
@@ -119,6 +168,8 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     } else if (!o.progress) done++;
   }
   if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
+
+  await flush();   // anything left below the batch threshold
 
   for (const key of shards.keys()) {
     try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); } catch {}

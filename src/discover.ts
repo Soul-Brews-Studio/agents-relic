@@ -139,7 +139,7 @@ function walkOmp(root: string, sinceMs: number | null, out: Found[], srcKey: str
  * because lab subprojects inside the vault carry both, and vendored markdown is
  * 280 files of other people's READMEs, not vault content.
  */
-function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser, depth = 0) {
+function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser, depth = 0, onFound?: () => void) {
   if (depth > 12) return;                     // pathological-symlink guard, not a scope limit
   for (const f of files(root, ".md")) {
     const p = join(root, f);
@@ -150,22 +150,43 @@ function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: s
   }
   for (const d of dirs(root)) {
     if (d === "node_modules" || d === ".git") continue;
-    walkVault(join(root, d), sinceMs, out, srcKey, parser, depth + 1);
+    walkVault(join(root, d), sinceMs, out, srcKey, parser, depth + 1, onFound);
   }
+}
+
+/**
+ * Progress for the DISCOVERY phase.
+ *
+ * Import had progress; discovery had none — and discovery is the part that walks the
+ * whole tree before a single file is read. On a 10k-file source that silent window is
+ * most of the wall time and is indistinguishable from a hang.
+ *
+ * Newline-delimited when stderr is not a TTY: the import progress uses `\r` to
+ * overwrite one line, which renders live in a terminal but emits NOTHING visible
+ * through a pipe or into a CI log until the process exits.
+ */
+function progressLine(msg: string): void {
+  if (!process.stderr.isTTY) { process.stderr.write(msg + "\n"); return; }
+  process.stderr.write("\r" + msg.padEnd(72) + "\r");
 }
 
 export function discover(only: string[] | null, sinceMs: number | null): Found[] {
   const out: Found[] = [];
+  const tick = () => {
+    if (out.length && out.length % 2000 === 0) progressLine(`  scanning… ${out.length.toLocaleString()} files found`);
+  };
   for (const src of loadSources()) {
     const wanted = only ? only.includes(src.key) : src.enabled;
     if (!wanted || !existsSync(src.path)) continue;
+    progressLine(`  scanning ${src.key}…`);
     const before = out.length;
-    if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser);
+    if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
     else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
     else walkClaude(src.path, sinceMs, out, src.key, src.parser);
     void before;
   }
+  if (out.length >= 2000) progressLine(`  scanned ${out.length.toLocaleString()} files`);
   return out;
 }
 

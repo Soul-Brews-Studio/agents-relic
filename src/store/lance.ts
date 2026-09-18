@@ -115,9 +115,17 @@ export class LanceStore {
     this.cache.delete(name);   // reopen so the cached handle sees the new schema
   }
 
-  putEvents  = (rows: EventRow[])  => this.upsert("events",   "uid",       rows as unknown as Record<string, unknown>[]);
-  putSession = (row: SessionRow)   => this.upsert("sessions", "file_path", [row as unknown as Record<string, unknown>]);
-  putFile    = (row: FileRow)      => this.upsert("files",    "file_path", [row as unknown as Record<string, unknown>]);
+  // ALL THREE take arrays. Every upsert is one versioned LanceDB commit, so a
+  // single-row signature quietly forces one commit per row — which is invisible for
+  // transcripts (one session row per file, thousands of events) and dominates for
+  // document sources (one of EVERY row type per file).
+  putEvents   = (rows: EventRow[])   => this.upsert("events",   "uid",       rows as unknown as Record<string, unknown>[]);
+  putSessions = (rows: SessionRow[]) => this.upsert("sessions", "file_path", rows as unknown as Record<string, unknown>[]);
+  putFiles    = (rows: FileRow[])    => this.upsert("files",    "file_path", rows as unknown as Record<string, unknown>[]);
+
+  /** Single-row conveniences — prefer the array forms in any loop. */
+  putSession = (row: SessionRow) => this.putSessions([row]);
+  putFile    = (row: FileRow)    => this.putFiles([row]);
 
   /** A shrinking file must not leave orphaned events behind. */
   async deleteEventsOf(filePath: string): Promise<void> {
