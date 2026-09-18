@@ -20,6 +20,17 @@ export interface ParsedFile {
   startedAt: string | null;
   endedAt: string | null;
   description: string | null;  // first user message, truncated
+  /**
+   * The session's NAME, when the host wrote one.
+   *
+   * Claude Code emits `{"type":"ai-title","aiTitle":...}` — the label its own resume
+   * picker shows. It repeats on nearly every turn (201 records in one session, all
+   * identical), so take the LAST: a title written after the work is a better name for
+   * it than one guessed from the opening message.
+   *
+   * null for Codex, which has no equivalent record. Callers fall back to description.
+   */
+  title: string | null;
 }
 
 export type Parser = (filePath: string) => Promise<ParsedFile>;

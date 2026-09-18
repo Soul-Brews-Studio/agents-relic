@@ -96,7 +96,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         file_mtime: file.mtime, file_size: file.size,
         line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
         started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
-        description: p.description ?? "", imported_at: nowISO(),
+        description: p.description ?? "", title: p.title ?? "", imported_at: nowISO(),
       });
       await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
       man.set(file.path, { mtime: file.mtime, size: file.size });

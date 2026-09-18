@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
+  statsOf, neighbours, nameOf,
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { trace } from "./trace.js";
@@ -73,7 +74,8 @@ const TOOLS = [
   {
     name: "relic_sessions",
     description:
-      "List or count indexed sessions, newest first, each with its opening user message. " +
+      "List or count indexed sessions, newest first, each with its NAME (the title the " +
+      "host assigned, falling back to the opening user message). " +
       "Answers 'what was I working on' over a time range. Filters on the session's own " +
       "first timestamp, not file mtime — an old session that got one new line stays old.",
     inputSchema: {
@@ -90,16 +92,24 @@ const TOOLS = [
   {
     name: "relic_session",
     description:
-      "Resolve a session id (or any prefix of one) to every transcript it names. " +
-      "A session uuid names a TREE — the parent conversation plus its subagent and " +
-      "workflow-agent children — so this usually returns many files, not one. " +
-      "If the id is not indexed yet, it is located on disk and imported first, so this " +
-      "does not fail with 'run index first'.",
+      "Look up one session by id OR BY NAME, and describe it: totals, tier breakdown, " +
+      "workflow-run count, its transcripts, and the sessions either side of it in the " +
+      "same worktree. A session uuid names a TREE — the parent conversation plus its " +
+      "subagent and workflow-agent children — so this describes many files, not one. " +
+      "An unindexed id is located on disk and imported first, so this does not fail " +
+      "with 'run index first'. If a name matches several sessions, all are listed for " +
+      "you to choose from.",
     inputSchema: {
       type: "object",
       properties: {
-        id: str("Session uuid or a prefix of it, e.g. '04d1d650'."),
-        repo: str("Optional repo filter; usually unnecessary since an id is unique."),
+        id: str("Session uuid, a prefix of it ('04d1d650'), or the session's NAME — " +
+                "matched against the title the host assigned and the opening message, " +
+                "case-insensitive substring, e.g. 'ralph-dig'."),
+        repo: str("Repo filter. Unnecessary for an id; RECOMMENDED for a name, which " +
+                  "otherwise searches every indexed repo."),
+        limit: num("Max transcripts listed (default 10). Stats always cover all of them."),
+        neighbours: { type: "boolean" as const, description:
+          "Include the sessions before and after this one in the same worktree (default true)." },
         no_index: { type: "boolean" as const, description:
           "Do not import on a miss. Answers strictly from the index." },
       },
@@ -213,26 +223,67 @@ async function run(name: string, a: any): Promise<string> {
     for (const r of rows) {
       L.push(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
              `${String(r.event_count).padStart(6)} ev  ${r.repo}${r.worktree ? ` [${r.worktree}]` : ""}`);
-      if (r.description) L.push(`    ${oneLine(r.description, 110)}`);
+      L.push(`    ${oneLine(nameOf(r), 110)}`);
     }
     if (total > rows.length) L.push("", `... and ${total - rows.length} more (raise limit)`);
     return L.join("\n");
   }
 
   if (name === "relic_session") {
-    const { rows, imported } = await resolveSession(String(a.id), { ...scope, noIndex: Boolean(a?.no_index) });
+    const { rows, imported, matchedBy } = await resolveSession(String(a.id), { ...scope, noIndex: Boolean(a?.no_index) });
     if (!rows.length)
-      return `no session matches ${a.id}` +
-             (a?.no_index ? " in the index (no_index was set, so disk was not searched)" : " — not in the index and not on disk");
-    const L = [`${rows.length} transcript${rows.length === 1 ? "" : "s"} for ${a.id}` +
-               (imported ? ` (${imported} imported on demand)` : ""), ""];
-    for (const r of rows) {
-      L.push(`${String(r.started_at).slice(0, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ` +
-             `${r.repo}${r.worktree ? ` [${r.worktree}]` : ""}`);
-      L.push(`  ${r.file_path}`);
-      if (r.description) L.push(`  ${oneLine(r.description, 110)}`);
+      return `nothing matches ${a.id} — tried it as an id, then as a name ` +
+             `(a name is matched against the session title and opening message)` +
+             (a?.no_index ? ". no_index was set, so disk was not searched." : "");
+
+    // A name can legitimately match several sessions. Listing them is the answer —
+    // picking one would be a guess, and the id is right there to disambiguate with.
+    const uuids = new Set(rows.map(r => r.session_uuid));
+    if (matchedBy === "name" && uuids.size > 1) {
+      const L = [`${uuids.size} sessions named like "${a.id}" — call again with one id:`, ""];
+      for (const r of rows)
+        L.push(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid}  ` +
+               `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}`);
+      return L.join("\n");
     }
-    if (rows.length > 1) L.push("", "a session uuid names a TREE — parent plus subagent/workflow children.");
+
+    const st = statsOf(rows)!;
+    const parent = rows.find(r => r.tier === "session") ?? rows[0];
+    const L = [
+      nameOf(parent),
+      `${parent.session_uuid} · matched by ${matchedBy}${imported ? ` · ${imported} imported on demand` : ""}`,
+      `${st.repo}${st.worktree ? ` [${st.worktree}]` : ""}${st.model ? ` · ${st.model}` : ""}`,
+      `${String(st.startedAt).slice(0, 16)} → ${String(st.endedAt).slice(0, 16)} · ` +
+      `${fmt(st.transcripts)} transcripts · ${fmt(st.events)} events` +
+      (st.runs ? ` · ${st.runs} workflow runs` : ""),
+      `  ${st.tiers.map(t => `${t.tier} ${t.n}`).join(" · ")}`,
+    ];
+
+    if (a?.neighbours !== false) {
+      const nb = await neighbours(parent, scope);
+      if (nb.before.length || nb.after.length) {
+        L.push("", "same worktree, either side:");
+        const row = (r: typeof parent, m: string) =>
+          L.push(`${m} ${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
+                 `${String(r.event_count).padStart(6)} ev  ${oneLine(nameOf(r), 60)}`);
+        for (const r of nb.before) row(r, "  ");
+        row(parent, ">>");
+        for (const r of nb.after) row(r, "  ");
+      }
+    }
+
+    // Children sit under the parent's own directory, so their full paths repeat a long
+    // identical prefix. Print it once.
+    const limit = Number(a?.limit ?? 10);
+    const base = parent.file_path.replace(/\.jsonl$/, "/");
+    L.push("", `transcripts (under ${base}):`);
+    for (const r of rows.slice(0, limit)) {
+      const path = r.file_path === parent.file_path ? parent.file_path
+                 : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path;
+      L.push(`  ${String(r.started_at).slice(11, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${path}`);
+    }
+    if (rows.length > limit) L.push(`  ... and ${rows.length - limit} more (raise limit)`);
+    if (rows.length > 1) L.push("", `relic_chain id=${parent.session_uuid.slice(0, 8)} — the same tree on a time axis`);
     return L.join("\n");
   }
 

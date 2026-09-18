@@ -43,6 +43,7 @@ export interface SessionRow {
   file_mtime: number; file_size: number;
   line_count: number; event_count: number; bad_lines: number;
   started_at: string; ended_at: string; description: string; imported_at: string;
+  title: string;   // the host's own session name; "" when it wrote none
 }
 
 /** (path, mtime, size) is the import-diff identity — no content hashing. */
@@ -82,7 +83,30 @@ export class LanceStore {
       this.cache.set(name, t);
       return;                                     // the create WAS the insert
     }
+    await this.widen(name, t, rows[0]);
     await t.mergeInsert(key).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(rows);
+  }
+
+  /**
+   * Add columns a row has but the table does not.
+   *
+   * A schema addition would otherwise mean reindexing every shard — 345 of them here,
+   * 3.2M events, hours — to gain one string. `addColumns` backfills existing rows with
+   * the default instead, so an old shard keeps answering and fills the column in as its
+   * sessions are re-imported. Cheap and idempotent: it only runs when a field is
+   * genuinely absent, and a shard created after this change never triggers it.
+   */
+  private async widen(name: string, t: lancedb.Table, row: Record<string, unknown>): Promise<void> {
+    const have = new Set((await t.schema()).fields.map(f => f.name));
+    const missing = Object.keys(row).filter(k => !have.has(k));
+    if (!missing.length) return;
+    await t.addColumns(missing.map(k => ({
+      name: k,
+      // The default must match the column's type or the backfill writes nulls that
+      // later reads have to guard. Only string and numeric columns exist in this schema.
+      valueSql: typeof row[k] === "number" ? "0" : "''",
+    })));
+    this.cache.delete(name);   // reopen so the cached handle sees the new schema
   }
 
   putEvents  = (rows: EventRow[])  => this.upsert("events",   "uid",       rows as unknown as Record<string, unknown>[]);
@@ -188,6 +212,53 @@ export class LanceStore {
    * first timestamp — NOT file mtime, which moves every time a transcript is appended
    * to and would make an old session look new.
    */
+  /**
+   * Find a session by NAME rather than id — the host's `title`, falling back to the
+   * opening user message. Case-insensitive substring, because nobody retypes a title.
+   *
+   * `title` may be absent on a shard written before the column existed, so this probes
+   * the schema rather than assuming. A missing column is a hard error in a Lance filter,
+   * not an empty result — it would take down the whole fan-out.
+   */
+  async findSessionByName(q: string, limit = 40): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const needle = q.replace(/'/g, "''").toLowerCase();
+    const has = (await t.schema()).fields.some(f => f.name === "title");
+    const cols = has ? ["title", "description"] : ["description"];
+    // tier='session' ONLY. A name belongs to the conversation, not to each of the 122
+    // child transcripts that inherit its description — without this, one match floods
+    // the result with the same uuid repeated once per file.
+    const rows = await t.query()
+      .where(`tier = 'session' AND (${cols.map(c => `lower(${c}) LIKE '%${needle}%'`).join(" OR ")})`)
+      .toArray() as unknown as SessionRow[];
+    rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+    return rows.slice(0, limit);
+  }
+
+  /**
+   * Sessions either side of an instant, in time order — the neighbourhood a session
+   * sits in. Answers "what else was I doing around then", which a single session row
+   * cannot, and which is usually why someone looked the session up at all.
+   */
+  async around(iso: string, opts: { worktree?: string; before?: number; after?: number } = {}): Promise<{ before: SessionRow[]; after: SessionRow[] }> {
+    const t = await this.existing("sessions");
+    if (!t) return { before: [], after: [] };
+    // Parent transcripts only. Including subagents would bury the neighbours under the
+    // dozens of children a single fan-out produced.
+    const base = [`tier = 'session'`, `started_at != ''`];
+    if (opts.worktree) base.push(`worktree = ${sqlStr(opts.worktree)}`);
+    const pull = async (cmp: string, desc: boolean, n: number) => {
+      const rows = await t.query().where([...base, `started_at ${cmp} ${sqlStr(iso)}`].join(" AND "))
+        .toArray() as unknown as SessionRow[];
+      rows.sort((a, b) => desc ? String(b.started_at).localeCompare(String(a.started_at))
+                               : String(a.started_at).localeCompare(String(b.started_at)));
+      return rows.slice(0, n);
+    };
+    const before = (await pull("<", true, opts.before ?? 5)).reverse();  // oldest-first for display
+    return { before, after: await pull(">", false, opts.after ?? 5) };
+  }
+
   async sessions(opts: { since?: string; until?: string; worktree?: string; limit?: number } = {}): Promise<SessionRow[]> {
     const t = await this.existing("sessions");
     if (!t) return [];

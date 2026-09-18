@@ -202,11 +202,56 @@ relic sessions --repo my-repo --since 24h             # list, newest first
 relic sessions --since 24h --plain | cut -f1             # just the session ids
 ```
 
-Shows start time · short uuid · event count · repo · `[worktree]`, with the session's
-opening user message beneath so the list is scannable.
+Shows start time · short uuid · `+N` children · tree event count · repo · `[worktree]`,
+with the session's **name** beneath it.
+
+**One row per conversation, not per file.** A fan-out that spawned 110 workflow agents
+is 111 transcripts sharing one uuid; ungrouped it reads as 111 sessions and the listing
+fills with agent prompts instead of the human's. Measured here: 325 transcripts over
+three days are **24 real conversations**. `--all-tiers` turns grouping off.
 
 Filters on `started_at` — the session's own first timestamp — **not** file mtime, which
 moves on every append and would make an old session look new.
+
+### `session` — one session, by id **or by name**
+
+```bash
+relic session 04d1d650                      # by id, or any prefix of one
+relic session "ralph-dig" --repo neo-oracle # by name
+relic session 04d1d650 --limit 20           # more transcripts listed
+relic session 04d1d650 --no-neighbours      # skip the either-side block
+```
+
+Claude Code names its own sessions — it writes `{"type":"ai-title","aiTitle":...}`, the
+label its resume picker shows. relic stores that as `title`; anything without one falls
+back to the opening message, with slash-command markup unwrapped so `/dig deep find …`
+reads as itself rather than as `<command-name>` tag soup.
+
+`relic session <arg>` tries the argument as an id first, then on disk, then as a name.
+A name that matches several sessions lists them all rather than guessing one.
+
+```
+Jsonl app in ralph-dig
+
+04d1d650-031a-44f6-9c22-3e400e68390f  ·  matched by name  ·  laris-co/neo-oracle [neo-jsonl-…]
+2026-09-16 10:06 → 2026-09-18 09:27  ·  117 transcripts  ·  5,840 ev  ·  5 workflow runs
+  workflow_agent 105 · subagent 11 · session 1  ·  claude-sonnet-5
+
+same worktree, either side:
+   2026-09-16 10:05  b658931d       2 ev  ok
+>> 2026-09-16 10:06  04d1d650    1487 ev  Jsonl app in ralph-dig
+```
+
+**The either-side block is the point.** The question right after "which session was
+that" is almost always "and what came before it" — a session is one stretch of a longer
+thread of work. Answering it from a session row alone means going back to the index with
+a hand-built time filter, which is exactly the improvisation the tool exists to remove.
+Scoped to the same worktree, because that is the unit of work.
+
+Adding `title` did **not** require reindexing 345 shards. `upsert` compares the row's
+keys against the table schema and calls `addColumns` for what is missing, backfilling
+old rows with a default — so an old shard keeps answering and fills the column in as its
+sessions are re-imported.
 
 ### `chain` — what ran in parallel
 
@@ -298,7 +343,7 @@ Six tools, each one deterministic lookup with named parameters:
 | `relic_status` | what is indexed — **call first**, the repo keys it lists are what `repo` accepts |
 | `relic_search` | full-text over transcripts; returns `file` + `seq` pointers |
 | `relic_sessions` | what was I working on, over a time range |
-| `relic_session` | one id → every transcript in its tree (seeks and imports on a miss) |
+| `relic_session` | one id **or name** → the tree, its stats, and the sessions either side |
 | `relic_chain` | what ran in parallel inside that session |
 | `relic_show` | the conversation around one hit, read from the source `.jsonl` |
 

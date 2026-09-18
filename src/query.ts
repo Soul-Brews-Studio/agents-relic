@@ -83,13 +83,54 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
 
 export interface SessionsOpts extends Scope {
   limit?: number; since?: string; until?: string; worktree?: string;
+  /** false lists every transcript separately, children included. Default true. */
+  group?: boolean;
 }
 
+/** A session row plus what its children add up to. */
+export type SessionSummary = SessionRow & {
+  repo: string;
+  children: number;      // subagent + workflow_agent transcripts under it
+  treeEvents: number;    // events across the whole tree, not just the parent
+};
+
 export interface SessionsResult {
-  rows: (SessionRow & { repo: string })[];   // already sliced to `limit`
-  total: number;                             // before the slice
-  events: number;                            // summed event_count over ALL matches
+  rows: SessionSummary[];                    // already sliced to `limit`
+  total: number;                             // conversations, after grouping
+  transcripts: number;                       // files behind them
+  events: number;                            // summed over ALL matches
   shards: number;
+}
+
+/**
+ * Fold a flat transcript list into one row per conversation.
+ *
+ * Without this, `sessions` counts FILES: one fan-out that spawned 110 workflow agents
+ * reads as 111 sessions, all sharing a uuid, and the listing fills with agent prompts
+ * instead of the human's. Measured on this index — 325 rows over 3 days collapse to 44
+ * real conversations.
+ *
+ * The parent row represents the group. When a tree was indexed without its parent
+ * (possible: children are separate files), the earliest child stands in, so a session
+ * is never silently dropped.
+ */
+function groupTranscripts(rows: (SessionRow & { repo: string })[]): SessionSummary[] {
+  const by = new Map<string, (SessionRow & { repo: string })[]>();
+  for (const r of rows) {
+    const k = r.session_uuid || r.file_path;
+    (by.get(k) ?? by.set(k, []).get(k)!).push(r);
+  }
+  const out: SessionSummary[] = [];
+  for (const group of by.values()) {
+    group.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+    const parent = group.find(r => r.tier === "session") ?? group[0];
+    out.push({
+      ...parent,
+      children: group.length - 1,
+      treeEvents: group.reduce((a, r) => a + Number(r.event_count ?? 0), 0),
+    });
+  }
+  return out;
 }
 
 export async function listSessions(o: SessionsOpts = {}): Promise<SessionsResult> {
@@ -105,9 +146,38 @@ export async function listSessions(o: SessionsOpts = {}): Promise<SessionsResult
       searched++;
     } catch { /* skip unreadable shard */ }
   }
-  rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
   const events = rows.reduce((a, r) => a + Number(r.event_count ?? 0), 0);
-  return { rows: rows.slice(0, o.limit ?? 40), total: rows.length, events, shards: searched };
+  const grouped = o.group === false
+    ? rows.map(r => ({ ...r, children: 0, treeEvents: Number(r.event_count ?? 0) }))
+    : groupTranscripts(rows);
+  grouped.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+  return { rows: grouped.slice(0, o.limit ?? 40), total: grouped.length,
+           transcripts: rows.length, events, shards: searched };
+}
+
+/**
+ * Does this look like a session id, or like a name?
+ *
+ * A Claude/Codex session id is hex-and-dashes, so anything with a letter past `f`, a
+ * space, or punctuation is a name. Getting this wrong is cheap in one direction only:
+ * a name tried as an id returns nothing, so `resolveSession` tries the id first and
+ * falls back — it never refuses to look.
+ */
+export function looksLikeId(s: string): boolean {
+  return /^[0-9a-f]{4,}(-[0-9a-f]+)*$/i.test(s.trim());
+}
+
+/** Sessions matching a NAME — the host's title, or the opening message. Parents only. */
+export async function findSessionByName(q: string, s: Scope = {}, limit = 40): Promise<(SessionRow & { repo: string })[]> {
+  const rows: (SessionRow & { repo: string })[] = [];
+  for (const sh of pickShards(s)) {
+    try {
+      const store = await LanceStore.open(sh.dir);
+      for (const r of await store.findSessionByName(q, limit)) rows.push({ ...r, repo: sh.key });
+    } catch { /* skip unreadable shard */ }
+  }
+  rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+  return rows.slice(0, limit);
 }
 
 /** Every indexed transcript whose session_uuid starts with `id`. Index only. */
@@ -125,6 +195,7 @@ export async function findSessionById(id: string, s: Scope = {}): Promise<(Sessi
 export interface ResolveResult {
   rows: (SessionRow & { repo: string })[];
   imported: number;    // files pulled in on demand, 0 when the index already had it
+  matchedBy: "id" | "name" | "none";
 }
 
 /**
@@ -138,15 +209,37 @@ export interface ResolveResult {
 export async function resolveSession(
   id: string, s: Scope & { noIndex?: boolean; skipNoise?: boolean } = {},
 ): Promise<ResolveResult> {
-  let rows = await findSessionById(id, s);
-  if (rows.length || s.noIndex) return { rows, imported: 0 };
+  const rows = await findSessionById(id, s);
+  if (rows.length) return { rows, imported: 0, matchedBy: "id" };
 
-  const found = seekOnDisk(id);
-  if (!found.length) return { rows, imported: 0 };
-  await importFiles(found, {
-    dataRoot: s.dataRoot ?? null, inRepo: Boolean(s.inRepo), skipNoise: Boolean(s.skipNoise),
-  });
-  return { rows: await findSessionById(id, s), imported: found.length };
+  // Only seek on disk for something that could BE a filename. A name has no file to
+  // find, so seeking on it would walk every source directory to return nothing.
+  if (!s.noIndex && looksLikeId(id)) {
+    const found = seekOnDisk(id);
+    if (found.length) {
+      await importFiles(found, {
+        dataRoot: s.dataRoot ?? null, inRepo: Boolean(s.inRepo), skipNoise: Boolean(s.skipNoise),
+      });
+      return { rows: await findSessionById(id, s), imported: found.length, matchedBy: "id" };
+    }
+  }
+
+  // Fall back to the name. Ambiguity is the caller's to resolve: return every match
+  // rather than picking one, because two sessions can share a title.
+  const byName = await findSessionByName(id, s);
+  if (!byName.length) return { rows: [], imported: 0, matchedBy: "none" };
+
+  // A name matches the PARENT row only — titles belong to the conversation. Expand a
+  // unique match back to its whole tree, so `session <name>` and `session <id>` answer
+  // with the same thing. Without this the same session reports 1 transcript or 122
+  // depending on how it was named, which is the kind of inconsistency that makes a
+  // caller stop trusting the tool.
+  const uuids = new Set(byName.map(r => r.session_uuid));
+  if (uuids.size === 1) {
+    const tree = await findSessionById(byName[0].session_uuid, s);
+    if (tree.length) return { rows: tree, imported: 0, matchedBy: "name" };
+  }
+  return { rows: byName, imported: 0, matchedBy: "name" };
 }
 
 /** The session tree on one time axis. Resolves the id the same way `session` does. */
@@ -209,4 +302,93 @@ export async function indexStatus(s: Scope = {}): Promise<{ root: string; rows: 
   }
   rows.sort((a, b) => b.events - a.events);
   return { root: s.dataRoot ?? defaultRoot(), rows };
+}
+
+export interface SessionStats {
+  transcripts: number; events: number;
+  tiers: { tier: string; n: number }[];
+  runs: number;                 // distinct workflow runs
+  startedAt: string; endedAt: string;
+  repo: string; worktree: string; model: string;
+}
+
+/** Roll a session's tree up into the few numbers worth printing above it. */
+export function statsOf(rows: (SessionRow & { repo: string })[]): SessionStats | null {
+  if (!rows.length) return null;
+  const tiers = new Map<string, number>();
+  const runs = new Set<string>();
+  let events = 0, start = "", end = "";
+  for (const r of rows) {
+    tiers.set(r.tier, (tiers.get(r.tier) ?? 0) + 1);
+    if (r.workflow_run_id) runs.add(r.workflow_run_id);
+    events += Number(r.event_count ?? 0);
+    const s = String(r.started_at ?? ""), e = String(r.ended_at ?? "");
+    if (s && (!start || s < start)) start = s;
+    if (e && (!end || e > end)) end = e;
+  }
+  const parent = rows.find(r => r.tier === "session") ?? rows[0];
+  return {
+    transcripts: rows.length, events,
+    tiers: [...tiers].map(([tier, n]) => ({ tier, n })).sort((a, b) => b.n - a.n),
+    runs: runs.size, startedAt: start, endedAt: end,
+    repo: parent.repo, worktree: parent.worktree ?? "", model: parent.model ?? "",
+  };
+}
+
+export interface Neighbours {
+  before: (SessionRow & { repo: string })[];
+  after: (SessionRow & { repo: string })[];
+}
+
+/**
+ * The sessions either side of this one, same repo, same worktree.
+ *
+ * A session rarely stands alone — it is one stretch of a longer thread of work, and
+ * the question that follows "which session was that" is almost always "and what came
+ * before it". Answering that from a session row alone means going back to the index
+ * with a hand-built time filter, which is exactly the improvisation the tool exists to
+ * remove. Scoped to the same worktree because that, not the repo, is the unit of work.
+ */
+export async function neighbours(
+  row: SessionRow & { repo: string }, s: Scope = {}, before = 5, after = 5,
+): Promise<Neighbours> {
+  const iso = String(row.started_at ?? "");
+  if (!iso) return { before: [], after: [] };
+  const shard = pickShards({ ...s, repo: row.repo }).find(x => x.key === row.repo);
+  if (!shard) return { before: [], after: [] };
+  try {
+    const store = await LanceStore.open(shard.dir);
+    const n = await store.around(iso, { worktree: row.worktree || undefined, before, after });
+    const tag = (r: SessionRow) => ({ ...r, repo: row.repo });
+    return { before: n.before.map(tag), after: n.after.map(tag) };
+  } catch { return { before: [], after: [] }; }
+}
+
+/**
+ * Display name for a session: the host's own title, else its opening message.
+ *
+ * The fallback needs cleaning because an opening message is very often a slash command,
+ * and Claude Code stores those wrapped in markup a human never typed —
+ * `<command-message>dig</command-message><command-name>/dig</command-name>` and the
+ * `<local-command-caveat>` preamble. Shown raw, the listing fills with tag soup and
+ * every /dig session looks identical.
+ */
+export function nameOf(r: SessionRow): string {
+  const t = String((r as any).title ?? "").trim();
+  if (t) return t;
+
+  let d = String(r.description ?? "");
+  // A slash command: the command NAME is the useful part, so promote it.
+  const cmd = d.match(/<command-name>\s*(\/?[\w:-]+)\s*<\/command-name>/)?.[1];
+  const args = d.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim();
+  if (cmd) return (args ? `${cmd} ${args}` : cmd).replace(/\s+/g, " ").slice(0, 70);
+
+  // description is truncated at 200 chars, so a caveat block often has no closing tag
+  // to match against. Drop from the opening tag to the end rather than leaving the
+  // boilerplate as the session's name.
+  d = d.replace(/<local-command-caveat>[\s\S]*$/, "")
+       .replace(/^\s*Caveat: The messages below were generated[\s\S]*$/, "")
+       .replace(/<[^>]{1,40}>/g, " ")
+       .replace(/\s+/g, " ").trim();
+  return d ? d.slice(0, 70) : "(untitled)";
 }

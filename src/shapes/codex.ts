@@ -95,5 +95,6 @@ export const parseCodex: Parser = async (filePath) => {
     }
   }
 
-  return { sessionUuid, cwd, model, events, lines, badLines, typeCounts, startedAt, endedAt, description };
+  // Codex rollouts carry no title record — the caller falls back to description.
+  return { sessionUuid, cwd, model, events, lines, badLines, typeCounts, startedAt, endedAt, description, title: null };
 };

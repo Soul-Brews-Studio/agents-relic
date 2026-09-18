@@ -8,7 +8,8 @@ import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
-import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO } from "./query.js";
+import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
+         statsOf, neighbours, nameOf } from "./query.js";
 import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -174,33 +175,81 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
 }
 // ---- session (resolve one id) ----
 async function cmdSession(id: string, f: Record<string, string | boolean>) {
-  const { rows, imported } = await resolveSession(id, {
-    dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
-    noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined };
+  const { rows, imported, matchedBy } = await resolveSession(id, {
+    ...scope, noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
   });
   if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
 
   const mode = outFmt(f);
-  if (mode === "json")  { console.log(JSON.stringify({ query: id, matches: rows.length, sessions: rows }, null, 2)); return; }
   if (mode === "jsonl") { for (const r of rows) console.log(JSON.stringify(r)); return; }
   if (mode === "plain") { for (const r of rows) console.log(r.file_path); return; }
 
   if (!rows.length) {
-    console.log(`no indexed session matches ${id}`);
+    if (mode === "json") { console.log(JSON.stringify({ query: id, matchedBy, matches: 0, sessions: [] }, null, 2)); return; }
+    console.log(`nothing matches ${id} — tried it as an id, then as a name`);
+    console.log(`  a name is matched against the session's title and opening message`);
     console.log(`  the file may exist but be unindexed — try: relic index --since 30d`);
     return;
   }
-  // A uuid names a tree, so say how many files it resolved to before listing them.
-  console.log(`${rows.length} transcript${rows.length === 1 ? "" : "s"} for ${id}\n`);
-  for (const r of rows) {
-    const wt = r.worktree ? ` [${r.worktree}]` : "";
-    console.log(`${String(r.started_at).slice(0, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
-    console.log(`  ${r.file_path}`);
-    if (r.description) console.log(`  ${r.description.replace(/\s+/g, " ").slice(0, 92)}`);
-    console.log();
+
+  // A NAME can match several distinct sessions. Listing them is the answer; picking one
+  // would be a guess, and the id is right there to disambiguate with.
+  const uuids = new Set(rows.map(r => r.session_uuid));
+  if (matchedBy === "name" && uuids.size > 1) {
+    if (mode === "json") { console.log(JSON.stringify({ query: id, matchedBy, matches: uuids.size, sessions: rows }, null, 2)); return; }
+    console.log(`${uuids.size} sessions named like "${id}"\n`);
+    for (const r of rows)
+      console.log(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
+                  `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}`);
+    console.log(`\npick one:  relic session <id>`);
+    return;
   }
-  if (rows.length > 1)
-    console.log(`note: a session_uuid names a TREE — parent plus subagent/workflow children.`);
+
+  const st = statsOf(rows)!;
+  const parent = rows.find(r => r.tier === "session") ?? rows[0];
+  const nb = f["no-neighbours"] ? { before: [], after: [] } : await neighbours(parent, scope);
+
+  if (mode === "json") {
+    console.log(JSON.stringify({ query: id, matchedBy, name: nameOf(parent), stats: st,
+      sessions: rows, neighbours: nb }, null, 2));
+    return;
+  }
+
+  const wt = st.worktree ? ` [${st.worktree}]` : "";
+  console.log(`${nameOf(parent)}\n`);
+  console.log(`${parent.session_uuid}  ·  matched by ${matchedBy}  ·  ${st.repo.replace("github.com/", "")}${wt}`);
+  console.log(`${String(st.startedAt).slice(0, 16).replace("T", " ")} → ${String(st.endedAt).slice(0, 16).replace("T", " ")}` +
+              `  ·  ${fmt(st.transcripts)} transcript${st.transcripts === 1 ? "" : "s"}  ·  ${fmt(st.events)} ev` +
+              (st.runs ? `  ·  ${st.runs} workflow run${st.runs === 1 ? "" : "s"}` : ""));
+  console.log(`  ${st.tiers.map(t => `${t.tier} ${t.n}`).join(" · ")}${st.model ? `  ·  ${st.model}` : ""}`);
+
+  // The neighbourhood. A session is a stretch of a longer thread of work, and the
+  // question right after "which session was that" is "what came before it".
+  if (nb.before.length || nb.after.length) {
+    console.log(`\nsame worktree, either side:`);
+    const line = (r: typeof parent, mark: string) =>
+      console.log(`${mark} ${String(r.started_at).slice(0, 16).replace("T", " ")}  ${r.session_uuid.slice(0, 8)}  ` +
+                  `${String(r.event_count).padStart(6)} ev  ${nameOf(r).slice(0, 56)}`);
+    for (const r of nb.before) line(r, "  ");
+    line(parent, ">>");
+    for (const r of nb.after) line(r, "  ");
+  }
+
+  // Children live UNDER the parent transcript's own directory, so their full paths
+  // repeat a 120-char prefix 121 times and bury the part that differs. Print the
+  // parent absolute once and everything else relative to it.
+  const limit = Number(f.limit ?? 10);
+  const base = parent.file_path.replace(/\.jsonl$/, "/");
+  console.log(`\ntranscripts (under ${base}):`);
+  for (const r of rows.slice(0, limit)) {
+    const p = r.file_path === parent.file_path ? parent.file_path
+            : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path;
+    console.log(`  ${String(r.started_at).slice(11, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${p}`);
+  }
+  if (rows.length > limit) console.log(`  ... and ${rows.length - limit} more (--limit N, or --plain for full paths)`);
+  if (rows.length > 1) console.log(`\nrelic chain ${parent.session_uuid.slice(0, 8)}  — the same tree on a time axis`);
 }
 
 // ---- sessions ----
@@ -209,25 +258,27 @@ async function cmdSessions(f: Record<string, string | boolean>) {
                   repo: f.repo ? String(f.repo) : undefined };
   if (!pickShards(scope).length) { console.log("no shards match"); return; }
 
-  const { rows: top, total, events, shards } = await listSessions({
+  const { rows: top, total, transcripts, events, shards } = await listSessions({
     ...scope, limit: Number(f.limit ?? 40),
     since: f.since as string, until: f.until as string, worktree: f.worktree as string,
+    group: !f["all-tiers"],
   });
   void shards;
   const since = toISO(f.since);
 
   const mode = outFmt(f);
-  if (mode === "json")  { console.log(JSON.stringify({ total, sessions: top }, null, 2)); return; }
+  if (mode === "json")  { console.log(JSON.stringify({ total, transcripts, sessions: top }, null, 2)); return; }
   if (mode === "jsonl") { for (const r of top) console.log(JSON.stringify(r)); return; }
   if (mode === "plain") { for (const r of top) console.log([r.session_uuid, r.started_at, r.repo, r.worktree, r.event_count].join("\t")); return; }
 
   if (f.count) { console.log(`${total} sessions`); return; }
-  console.log(`${fmt(total)} sessions · ${fmt(events)} events` +
+  console.log(`${fmt(total)} sessions · ${fmt(transcripts)} transcripts · ${fmt(events)} events` +
     (since ? ` · since ${since.slice(0, 16)}` : "") + (f.repo ? ` · repo~${f.repo}` : "") + "\n");
   for (const r of top) {
     const wt = r.worktree ? `  [${r.worktree}]` : "";
-    console.log(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
-    if (r.description) console.log(`    ${r.description.replace(/\s+/g, " ").slice(0, 96)}`);
+    const kids = r.children ? ` +${r.children}` : "";
+    console.log(`${String(r.started_at).slice(0, 16).replace("T", " ")}  ${r.session_uuid.slice(0, 8)}${kids.padEnd(5)}  ${String(r.treeEvents).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
+    console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}`);
   }
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }

@@ -20,7 +20,7 @@ export const parseClaude: Parser = async (filePath) => {
   let cwd: string | null = null, model: string | null = null;
   let sessionUuid = fileKey.replace(/\.jsonl$/, "");
   let startedAt: string | null = null, endedAt: string | null = null;
-  let description: string | null = null;
+  let description: string | null = null, title: string | null = null;
 
   const rl = createInterface({ input: createReadStream(filePath, "utf8") });
   for await (const line of rl) {
@@ -43,6 +43,10 @@ export const parseClaude: Parser = async (filePath) => {
 
     const ts = str(rec.timestamp);
     if (ts) { if (!startedAt) startedAt = ts; endedAt = ts; }
+
+    // Overwrite, never keep-first: the record repeats on nearly every turn and the
+    // title is refined as the session goes on. The last one names what it became.
+    if (type === "ai-title") { const t = str(rec.aiTitle); if (t) title = t; }
 
     if (!INDEXED.has(type)) continue;
 
@@ -70,5 +74,5 @@ export const parseClaude: Parser = async (filePath) => {
     });
   }
 
-  return { sessionUuid, cwd, model, events, lines, badLines, typeCounts, startedAt, endedAt, description };
+  return { sessionUuid, cwd, model, events, lines, badLines, typeCounts, startedAt, endedAt, description, title };
 };
