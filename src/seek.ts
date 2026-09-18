@@ -91,6 +91,12 @@ export function seekOnDisk(id: string): Found[] {
         for (const run of dirs(wf)) {
           if (!run.startsWith("wf_")) continue;
           for (const f of files(join(wf, run))) {
+            // journal.jsonl is the workflow RUNNER's event log, not a transcript.
+            // discover.ts skips it; this path did not, so an on-demand
+            // `relic session <id>` imported one bogus workflow_agent row per run.
+            // Found by porting seek to Python: 162 files there against 169 here,
+            // and this session has exactly 7 wf_ runs.
+            if (f === "journal.jsonl") continue;
             const st = statOf(join(wf, run, f));
             if (st) out.push({ path: join(wf, run, f), projectDir: project, tier: "workflow_agent",
               source: src.key, bank, workflowRunId: run, agentId: basename(f, ".jsonl"), ...st, parser: src.parser });

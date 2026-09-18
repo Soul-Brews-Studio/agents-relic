@@ -69,7 +69,8 @@ class EventRow(LanceModel):
     ts: str
     text: str
     source: str
-    tier: str
+    tier: str           # session | subagent | workflow_agent — POSITION only
+    kind: str           # transcript | note | memory | message — WHAT it is
     worktree: str
     cwd: str
     org: str
