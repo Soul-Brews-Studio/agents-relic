@@ -208,6 +208,42 @@ opening user message beneath so the list is scannable.
 Filters on `started_at` — the session's own first timestamp — **not** file mtime, which
 moves on every append and would make an old session look new.
 
+### `chain` — what ran in parallel
+
+```bash
+relic chain 04d1d650                 # every transcript the session spawned, on a time axis
+relic chain 04d1d650 --limit 4       # cap rows per group
+relic chain 04d1d650 --width 60      # wider bars
+```
+
+A session is not a line, it is a tree: the parent transcript, the subagents it spawned
+directly, and one group per workflow run. `sessions` can only sort those by start time,
+which hides the thing worth knowing — how many were running **at once**.
+
+```
+04d1d650 · 117 transcripts · 2026-09-16 10:06 → 2026-09-18 09:09
+wall 47.0h · agent-time 52.3h · 1.1x parallel
+
+wf_8c815d81-6ef   10 transcripts · 10:40–10:42 · 2m · peak 10 at once
+  10:40 agent-adac9b749f457960 |▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬|    2m    10ev
+  10:40 agent-a6b7a0aebb23b6d6 | ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬|    2m     8ev
+                               10:40──────────────────────────────10:42
+```
+
+Two numbers carry the answer:
+
+- **`agent-time` vs `wall`** — summed duration against elapsed span. It can only exceed
+  wall time when work genuinely overlapped, so the ratio *is* the parallelism.
+- **`peak N at once`** — an edge sweep over start/end times, not a row count. Ten agents
+  that ran one after another have peak 1.
+
+**Each group is scaled to its own span, not a shared axis.** A 47-hour parent session on
+a shared axis compresses a 2-minute workflow to one cell and the overlap disappears —
+the single thing the view exists to show. Bars compare within a run, never across.
+
+`journal.jsonl` rows are dropped: a workflow directory holds one, it has no events and no
+clock, and it renders as a zero-length bar at the origin of every group.
+
 ### `show` — read the surrounding conversation
 
 ```bash

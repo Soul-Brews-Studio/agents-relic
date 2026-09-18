@@ -8,6 +8,7 @@ import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { seekOnDisk } from "./seek.js";
+import { buildChain, renderChain, type ChainRow } from "./chain.js";
 import { repoKeyOf, contextOf, cwdOfFile, shardDirFor, ghqRoot, defaultRoot, guardShardDir, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -475,6 +476,7 @@ if (!cmd || f.help) {
                   [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix>          resolve a session id to its transcript file(s)
+  chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -567,6 +569,26 @@ else if (cmd === "trace") {
     if (t.neverTop.length)
       console.log(`\n${t.neverTop.length} shard(s) never produced a best hit — no constituency:\n  ` +
         t.neverTop.slice(0, 12).map(s2 => s2.replace("github.com/", "")).join("\n  "));
+  }
+}
+else if (cmd === "chain") {
+  if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
+  let rows = await lookup(pos[1], dataRoot, inRepo) as ChainRow[];
+  if (!rows.length && !f["no-index"]) {
+    const found = seekOnDisk(pos[1]);
+    if (found.length) {
+      process.stderr.write(`not indexed — found ${found.length} file(s) on disk, importing…\n`);
+      await importFiles(found, { dataRoot, inRepo, skipNoise: Boolean(f["skip-noise"]) });
+      rows = await lookup(pos[1], dataRoot, inRepo) as ChainRow[];
+    }
+  }
+  if (!rows.length) { console.log(`no session matches ${pos[1]}`); }
+  else {
+    const c = buildChain(pos[1], rows);
+    if (outFmt(f) === "json") console.log(JSON.stringify(c, null, 2));
+    else console.log(renderChain(c, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
   }
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
