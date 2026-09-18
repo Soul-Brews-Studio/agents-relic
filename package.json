@@ -12,7 +12,8 @@
     "index": "bun src/cli.ts index",
     "search": "bun src/cli.ts search",
     "status": "bun src/cli.ts status",
-    "mcp": "bun src/mcp.ts"
+    "mcp": "bun src/mcp.ts",
+    "test": "bun test ./test/"
   },
   "dependencies": {
     "@lancedb/lancedb": "^0.39.0",

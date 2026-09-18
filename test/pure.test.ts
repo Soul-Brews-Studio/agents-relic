@@ -1,0 +1,170 @@
+import { expect, test, describe } from "bun:test";
+import { localDateTime, localTime, localDate } from "../src/time.js";
+import { encodeProjectDir, encodeOmpDir } from "../src/live.js";
+import { locationOf } from "../src/repo.js";
+import { classify } from "../src/noise.js";
+import { nameOf, looksLikeId, toISO } from "../src/query.js";
+
+/**
+ * Pure-function tests — no LanceDB, no filesystem, no fixtures.
+ *
+ * Every case here is a bug that ACTUALLY SHIPPED and was found by hand. This file
+ * exists so the next one is caught by `bun test` instead of by someone noticing a
+ * wrong number hours later.
+ */
+
+describe("time — storage is UTC, display is local (the 7-hour split)", () => {
+  // `session` sliced the stored ISO (UTC) while `dig` converted to local, so the same
+  // session reported 10:06 and 17:06. One formatter, or they drift again.
+  test("formats a UTC ISO through the local formatter", () => {
+    const iso = "2026-09-16T10:06:00.000Z";
+    expect(localDateTime(iso)).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(localTime(iso)).toMatch(/^\d{2}:\d{2}$/);
+    expect(localDate(iso)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  test("localDateTime and localTime agree on the same instant", () => {
+    const iso = "2026-09-16T10:06:00.000Z";
+    expect(localDateTime(iso).slice(11)).toBe(localTime(iso));
+  });
+
+  test("unparseable input returns the raw value, never a fabricated date", () => {
+    expect(localDateTime("not-a-date")).toBe("not-a-date");
+    expect(localTime("")).toBe("");
+  });
+});
+
+describe("cwd encoding — each agent encodes differently", () => {
+  const cwd = "/opt/Code/github.com/laris-co/neo-oracle";
+
+  // Claude maps BOTH "/" and "." to "-"; omp keeps dots and wraps in "--".
+  // Using one encoder on the other's root silently matches nothing, which is
+  // indistinguishable from "that agent has no session here".
+  test("claude maps / and . to -", () => {
+    expect(encodeProjectDir(cwd)).toBe("-opt-Code-github-com-laris-co-neo-oracle");
+  });
+
+  test("omp keeps dots and wraps in --", () => {
+    expect(encodeOmpDir(cwd)).toBe("--opt-Code-github.com-laris-co-neo-oracle--");
+  });
+
+  test("the two encoders never agree", () => {
+    expect(encodeProjectDir(cwd)).not.toBe(encodeOmpDir(cwd));
+  });
+});
+
+describe("locationOf — org/repo/project/worktree/dir", () => {
+  const base = "/opt/Code/github.com/laris-co/neo-oracle/wt/neo-jsonl-big-boss-16sep-wed2026";
+
+  test("plain vault note has no project", () => {
+    const l = locationOf(`${base}/ψ/memory/learnings/x.md`);
+    expect(l.org).toBe("laris-co");
+    expect(l.repo).toBe("neo-oracle");
+    expect(l.project).toBe("");
+    expect(l.worktree).toBe("neo-jsonl-big-boss-16sep-wed2026");
+    expect(l.dir).toBe("ψ/memory/learnings");
+  });
+
+  // The bug this facet exists for: another oracle's ENTIRE vault nested inside this
+  // one (4,439 notes) attributed to the HOST repo, so searching arra's memory
+  // returned it labelled as neo's.
+  test("nested oracle vault carries its own project", () => {
+    const l = locationOf(`${base}/ψ/soul-brews-studio/arra-oracle-v3/memory/y.md`);
+    expect(l.repo).toBe("neo-oracle");
+    expect(l.project).toBe("arra-oracle-v3");
+  });
+
+  test("lab and incubate both yield the project", () => {
+    expect(locationOf(`${base}/ψ/lab/agents-relic/README.md`).project).toBe("agents-relic");
+    expect(locationOf(`${base}/ψ/incubate/Soul-Brews-Studio/agents-relic/origin/src/cli.ts`).project)
+      .toBe("agents-relic");
+  });
+
+  test("dir excludes the worktree segment and the filename", () => {
+    const l = locationOf(`${base}/ψ/inbox/msg.md`);
+    expect(l.dir).toBe("ψ/inbox");
+    expect(l.dir).not.toContain("wt/");
+    expect(l.dir).not.toContain(".md");
+  });
+
+  test("a path outside github.com yields nothing rather than a guess", () => {
+    const l = locationOf("/tmp/somewhere/else.md");
+    expect(l.org).toBe("");
+    expect(l.repo).toBe("");
+  });
+});
+
+describe("noise.classify — prose is never noise", () => {
+  // Three rules were wrong on first write. One compared against MAX_TEXT (16000) when
+  // the cap is 4000 and matched nothing; one ate a tokenizer's source code; one used
+  // length as a proxy and would have deleted real results.
+  test("prose roles are never dropped, whatever they contain", () => {
+    for (const role of ["user", "assistant", "thinking", "system"]) {
+      const v = classify("[tool_use Read] {\"file_path\":\"/x\"}", role);
+      expect(v.skip).toBe(false);
+    }
+  });
+
+  test("a navigation-only tool_use is dropped", () => {
+    expect(classify('[tool_use Read] {"file_path":"/x"}', "tool_use").skip).toBe(true);
+  });
+
+  test("a file readback is detected by ascending line numbers, not by length", () => {
+    // MUST exceed 500 chars — the rule is (tool_result && >500 && ascending numbers).
+    // My first version of this fixture was ~294 chars and failed for that reason, not
+    // because the rule was broken. A too-small fixture makes a working rule look wrong.
+    const dump = "[tool_result] " + Array.from({ length: 60 },
+      (_, i) => `${i + 1}→some source code line with enough text to matter`).join("\n");
+    expect(classify(dump, "tool_result").skip).toBe(true);
+    // Long output WITHOUT line numbers must survive — a metrics table is not a dump.
+    const table = "[tool_result] " + "some genuine long output. ".repeat(60);
+    expect(classify(table, "tool_result").skip).toBe(false);
+  });
+});
+
+describe("nameOf — slash-command markup must not become the session name", () => {
+  test("promotes the command name out of its wrapper", () => {
+    const r: any = { title: "", description: "<command-message>dig</command-message><command-name>/dig</command-name>" };
+    expect(nameOf(r)).toBe("/dig");
+  });
+
+  test("an UNTERMINATED caveat block is still stripped", () => {
+    // description is truncated at 200 chars, so the closing tag is often missing —
+    // the non-greedy match failed and the boilerplate became the name.
+    const r: any = { title: "", description: "<local-command-caveat>Caveat: The messages below were generated" };
+    expect(nameOf(r)).toBe("(untitled)");
+  });
+
+  test("a real title always wins", () => {
+    expect(nameOf({ title: "Jsonl app in ralph-dig", description: "x" } as any))
+      .toBe("Jsonl app in ralph-dig");
+  });
+});
+
+describe("looksLikeId — decides id-lookup vs name-lookup", () => {
+  test("hex uuids and prefixes are ids", () => {
+    expect(looksLikeId("04d1d650")).toBe(true);
+    expect(looksLikeId("04d1d650-031a-44f6-9c22-3e400e68390f")).toBe(true);
+  });
+
+  test("names are not ids", () => {
+    expect(looksLikeId("ralph-dig")).toBe(false);
+    expect(looksLikeId("Jsonl app")).toBe(false);
+  });
+});
+
+describe("toISO — relative spans, bare dates, passthrough", () => {
+  test("a bare date becomes an inclusive range end when asked", () => {
+    expect(toISO("2026-09-01")).toBe("2026-09-01T00:00:00Z");
+    expect(toISO("2026-09-01", true)).toBe("2026-09-01T23:59:59Z");
+  });
+
+  test("relative spans resolve to an instant", () => {
+    expect(toISO("7d")).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test("empty input is undefined, not epoch zero", () => {
+    expect(toISO("")).toBeUndefined();
+    expect(toISO(undefined)).toBeUndefined();
+  });
+});
