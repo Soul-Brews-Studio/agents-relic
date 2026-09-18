@@ -60,3 +60,42 @@ describe("native/TypeScript parity for the live scan", () => {
     expect(roots.some(r => r.endsWith(".hermes"))).toBe(false);
   });
 });
+
+describe("native/TypeScript parity for the layout commands", () => {
+  // These two are the ONLY commands bin/relic-dispatch.sh routes to the binary, so
+  // they are the only place a whole command's output can differ by which engine ran.
+  // `now` used to be routed too and printed three lines natively against the
+  // TypeScript block; it was removed rather than pinned, because the TypeScript `now`
+  // already calls the binary for the expensive part.
+  const run = async (args: string[]) => {
+    const ts = Bun.spawn(["bun", join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.ts"), ...args],
+                         { stdout: "pipe", stderr: "ignore", env: { ...process.env, RELIC_NATIVE: "0" } });
+    const nat = Bun.spawn([BIN, ...args], { stdout: "pipe", stderr: "ignore" });
+    const [a, b] = await Promise.all([new Response(ts.stdout).text(), new Response(nat.stdout).text()]);
+    await Promise.all([ts.exited, nat.exited]);
+    return [a.trim().split("\n").sort().join("\n"), b.trim().split("\n").sort().join("\n")];
+  };
+
+  test.if(have)("banks agrees", async () => {
+    const [ts, nat] = await run(["banks"]);
+    expect(nat).toBe(ts);
+  });
+
+  test.if(have)("shards --count agrees", async () => {
+    const [ts, nat] = await run(["shards", "--count"]);
+    expect(nat).toBe(ts);
+  });
+
+  test.if(have)("shards full listing agrees row for row", async () => {
+    const [ts, nat] = await run(["shards"]);
+    expect(nat).toBe(ts);
+  });
+
+  test.if(have)("--repo matches the repo portion, not the shard key, in BOTH", async () => {
+    // Every key begins with its bank name, so a key-matching implementation would
+    // return a whole bank here instead of nothing.
+    const [ts, nat] = await run(["shards", "--repo", "projects", "--count"]);
+    expect(ts).toBe("0");
+    expect(nat).toBe("0");
+  });
+});

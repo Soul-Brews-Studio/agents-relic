@@ -253,6 +253,33 @@ function nativeBin(): string | null {
 
 type FreshMap = { project: string; uuids: string[] }[];
 
+/**
+ * Why the binary is or is not being used — for `relic backend`.
+ *
+ * "Is it faster" is the second question. The first is "is it even running", and
+ * before this existed the only way to find out was to read the source: an unbuilt
+ * binary, a stale RELIC_NATIVE, and a working native path all looked identical from
+ * the outside, because the fallback is silent by design.
+ */
+export function nativeInfo(): { path: string | null; usable: boolean; reason: string } {
+  const env = process.env.RELIC_NATIVE;
+  if (env === "0" || env === "false")
+    return { path: null, usable: false, reason: "disabled by RELIC_NATIVE=0" };
+  if (env)
+    return existsSync(env)
+      ? { path: env, usable: true, reason: "set by RELIC_NATIVE" }
+      : { path: env, usable: false, reason: "RELIC_NATIVE points at a missing file" };
+  try {
+    const p = join(dirname(fileURLToPath(import.meta.url)), "..",
+                   "rust", "target", "release", "relic-native");
+    return existsSync(p)
+      ? { path: p, usable: true, reason: "auto-detected" }
+      : { path: p, usable: false, reason: "not built — cargo build --release --manifest-path rust/Cargo.toml" };
+  } catch {
+    return { path: null, usable: false, reason: "could not resolve module path" };
+  }
+}
+
 async function nativeFresh(roots: string[], windowSec: number): Promise<FreshMap | null> {
   const bin = nativeBin();
   if (!bin || !roots.length) return null;
