@@ -52,6 +52,26 @@ export function truncate(s: string, max = MAX_TEXT): string {
   return s.length <= max ? s : s.slice(0, max) + `...[+${s.length - max}]`;
 }
 
+/**
+ * What a content array actually IS, regardless of the message envelope carrying it.
+ * Returns null for ordinary prose so the caller falls back to the envelope role.
+ */
+export function blockRole(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const kinds = new Set<string>();
+  for (const raw of content) {
+    const item = asObj(raw);
+    const t = item ? str(item.type) : null;
+    if (t) kinds.add(t);
+  }
+  if (kinds.size === 0) return null;
+  // A block array that is ONLY tool traffic is tool traffic, whoever sent it.
+  if (kinds.has("tool_result") && !kinds.has("text")) return "tool_result";
+  if (kinds.has("tool_use") && !kinds.has("text")) return "tool_use";
+  if (kinds.has("thinking") && kinds.size === 1) return "thinking";
+  return null;
+}
+
 /** Flatten Claude/Codex content arrays into plain searchable text. */
 export function flattenContent(content: unknown): string {
   if (typeof content === "string") return content;

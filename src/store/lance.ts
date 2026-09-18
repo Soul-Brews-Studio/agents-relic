@@ -150,7 +150,7 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const limit = opts.limit ?? 20;
@@ -165,6 +165,11 @@ export class LanceStore {
     // no parsing, and it pushes down into the scan. Verified on a 20k-row sample that
     // every indexed event carries a ts: relic only indexes user/assistant/system
     // records, not the UI/state types where the field is often absent.
+    // Role filtering is the highest-value filter this index has: 80% of a session
+    // transcript is tool traffic, so unfiltered ranking buries human and assistant
+    // prose under command output — including this tool's own output.
+    if (opts.role)  filters.push(`role = ${sqlStr(opts.role)}`);
+    if (opts.prose) filters.push(`(role = 'user' OR role = 'assistant')`);
     if (opts.since)    filters.push(`ts >= ${sqlStr(opts.since)}`);
     if (opts.until)    filters.push(`ts <= ${sqlStr(opts.until)}`);
 

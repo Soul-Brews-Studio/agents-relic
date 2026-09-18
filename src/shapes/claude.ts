@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
-import { asObj, str, truncate, flattenContent, uidOf, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
+import { asObj, str, truncate, flattenContent, blockRole, uidOf, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
 
 /** Roles whose text is worth full-text indexing. UI/state events are counted, not indexed. */
 const INDEXED = new Set(["user", "assistant", "system"]);
@@ -48,9 +48,20 @@ export const parseClaude: Parser = async (filePath) => {
 
     const msg = asObj(rec.message);
     if (!model) model = str(msg?.model);
-    const role = str(msg?.role) ?? type;
-    const text = flattenContent(msg?.content ?? rec.content ?? "").trim();
+    const raw = msg?.content ?? rec.content ?? "";
+    const text = flattenContent(raw).trim();
     if (!text) continue;
+
+    // Label by what the block ACTUALLY is, not by the envelope that carried it.
+    //
+    // Claude delivers a tool result as a `user` message whose content is a
+    // tool_result block — so taking the envelope role at face value files machine
+    // output as something the human said. Measured on one shard before this fix:
+    // 68.5% of indexed text was tool-output-shaped while only 3.7% carried the
+    // tool_result role. That buries human prose under command output in every
+    // ranked search, and it is why a search for a term printed by a tool ranks the
+    // tool's own output first.
+    const role = blockRole(raw) ?? str(msg?.role) ?? type;
 
     if (!description && role === "user") description = truncate(text, 200);
     events.push({

@@ -207,7 +207,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     try {
       const store = await LanceStore.open(s.dir);
       for (const h of await store.search(q, { limit, tier: f.tier as string, source: f.source as string,
-        worktree: f.worktree as string, path: f.path as string, since: sinceISO, until: untilISO }))
+        worktree: f.worktree as string, path: f.path as string, since: sinceISO, until: untilISO,
+        role: f.role as string, prose: Boolean(f.prose) }))
         hits.push({ ...h, repo: s.key });
       searched++;
     } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
@@ -379,6 +380,8 @@ if (!cmd || f.help) {
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--dry-run]
   search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
+                  [--prose]  humans + assistant only — 80% of a transcript is tool traffic
+                  [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
