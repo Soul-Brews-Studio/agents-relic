@@ -103,13 +103,39 @@ function walkFlat(root: string, sinceMs: number | null, out: Found[], srcKey: st
   for (const d of dirs(root)) walkFlat(join(root, d), sinceMs, out, srcKey, parser, depth + 1);
 }
 
+/**
+ * omp: ~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<id>.jsonl
+ *
+ * One directory per cwd, flat .jsonl files inside — plus a same-named EXTENSIONLESS
+ * directory beside each transcript holding that session's bash output logs
+ * (`16.bash.log`). `files()` filters on the .jsonl extension, so those are skipped
+ * without needing a rule.
+ *
+ * Deliberately not `walkFlat`: that sets projectDir to the source key and throws the
+ * per-cwd directory away, which is the one thing `currentSession` needs to resolve
+ * "which session am I in" without parsing every file.
+ */
+function walkOmp(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  for (const project of dirs(root)) {
+    const projectPath = join(root, project);
+    for (const f of files(projectPath)) {
+      const p = join(projectPath, f);
+      const st = statOf(p);
+      if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
+      out.push({ path: p, projectDir: project, tier: "session", source: srcKey,
+        workflowRunId: null, agentId: null, ...st, parser });
+    }
+  }
+}
+
 export function discover(only: string[] | null, sinceMs: number | null): Found[] {
   const out: Found[] = [];
   for (const src of loadSources()) {
     const wanted = only ? only.includes(src.key) : src.enabled;
     if (!wanted || !existsSync(src.path)) continue;
     const before = out.length;
-    if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
+    if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
     else walkClaude(src.path, sinceMs, out, src.key, src.parser);
     void before;
   }

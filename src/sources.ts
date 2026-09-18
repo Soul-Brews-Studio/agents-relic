@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { parseClaude } from "./shapes/claude.js";
 import { parseCodex } from "./shapes/codex.js";
+import { parseOmp } from "./shapes/omp.js";
 import type { Parser } from "./types.js";
 
 const HOME = homedir();
@@ -10,7 +11,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat";   // how to find files under `path`
+  walk: "claude-tiers" | "flat" | "omp";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -24,14 +25,23 @@ export interface SourceDef {
  *
  *   ~/.claude/projects   24 GB   3 tiers            YES
  *   ~/.codex/sessions    14 GB   rollouts           YES
+ *   ~/.omp/agent/sessions        <cwd>/<ts>_<id>    YES   (see correction below)
  *   ~/.omx-runs          39 MB   registry + logs    jsonl, but OPS LOGS not conversation
- *   ~/.omp/agent         405 MB  history.db         real conversation, but SQLITE
  *   ~/.hermes            56 MB   *.db               no jsonl at all
  *   ~/.copilot           16 KB   *.log              plain logs
  *
- * So the defaults are claude + codex. Everything else is opt-in and honest about what
- * it would actually give you — indexing ops logs as if they were conversation is how
- * a search corpus quietly fills with noise.
+ * CORRECTION, 2026-09-18: the line above previously read
+ *   "~/.omp/agent  405 MB  history.db  real conversation, but SQLITE"
+ * and omp was filed under KNOWN_NON_JSONL as out of scope. That was wrong. It was
+ * derived from `du` on ~/.omp/agent plus the presence of history.db — i.e. measuring
+ * the directory and reading the DB's name, without listing what else was in it.
+ * ~/.omp/agent/sessions/ holds plain per-session JSONL, one event per line, sitting
+ * directly beside that database.
+ *
+ * The cost of the error was not a missing corpus, it was a WRONG ANSWER: an omp agent
+ * calling `relic_now` got somebody else's session id back, every time, because omp had
+ * no source of its own to be found in and the lookup fell through to whichever Claude
+ * Code transcript was newest in the same directory. Observed live before the fix.
  */
 export const BUILTIN: SourceDef[] = [
   {
@@ -50,6 +60,11 @@ export const BUILTIN: SourceDef[] = [
     note: "Codex CLI rollouts",
   },
   {
+    key: "omp", path: join(HOME, ".omp", "agent", "sessions"),
+    walk: "omp", parser: parseOmp, enabled: true,
+    note: "omp — one dir per encoded cwd, flat <timestamp>_<id>.jsonl inside",
+  },
+  {
     key: "omx-logs", path: join(HOME, ".omx-runs"),
     walk: "flat", parser: parseClaude, enabled: false,
     note: "omx run logs — OPS LOGS, not conversation. Opt in only if you want them.",
@@ -61,7 +76,11 @@ export const BUILTIN: SourceDef[] = [
  * is visible rather than forgotten. Both hold real history behind a different reader.
  */
 export const KNOWN_NON_JSONL = [
-  { key: "omp", path: join(HOME, ".omp", "agent", "history.db"), note: "omp/omx-box — SQLite: history, history_fts, session_titles" },
+  // omp's history.db is still SQLite and still unread — but it is an INDEX over the
+  // same conversations, not the only copy of them. The JSONL beside it is now a real
+  // source (key "omp" above), so this entry is a note about a redundant store, not a
+  // gap in coverage.
+  { key: "omp-db", path: join(HOME, ".omp", "agent", "history.db"), note: "omp — SQLite mirror of ~/.omp/agent/sessions/*.jsonl, which IS indexed" },
   { key: "hermes", path: join(HOME, ".hermes"), note: "Hermes — SQLite (kanban.db, profiles/*/state.db)" },
 ];
 

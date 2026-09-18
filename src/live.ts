@@ -28,6 +28,37 @@ export function encodeProjectDir(cwd: string): string {
   return cwd.replace(/[/.]/g, "-");
 }
 
+/**
+ * omp encodes a cwd differently, and the difference is silent if you assume otherwise.
+ *
+ *   Claude  /opt/Code/github.com/x  ->  -opt-Code-github-com-x     ('/' AND '.' -> '-')
+ *   omp     /opt/Code/github.com/x  ->  --opt-Code-github.com-x--  ('/' -> '-', dots KEPT,
+ *                                                                   wrapped in '--')
+ *
+ * Verified against a real directory on disk rather than inferred. Using Claude's encoder
+ * on an omp root silently matches nothing — existsSync just returns false and the source
+ * is skipped, which looks identical to "omp has no session here".
+ */
+export function encodeOmpDir(cwd: string): string {
+  return "--" + cwd.split("/").filter(Boolean).join("-") + "--";
+}
+
+/** The directory name a given source would use for this cwd. */
+function encodeFor(walk: string, cwd: string): string {
+  return walk === "omp" ? encodeOmpDir(cwd) : encodeProjectDir(cwd);
+}
+
+/**
+ * omp filenames are <timestamp>_<id>.jsonl; the id after the underscore is the session
+ * identity that its own `session` record carries. Claude's filename IS the uuid.
+ */
+function uuidFromFile(walk: string, fileName: string): string {
+  const base = fileName.replace(/\.jsonl$/, "");
+  if (walk !== "omp") return base;
+  const i = base.indexOf("_");
+  return i >= 0 ? base.slice(i + 1) : base;
+}
+
 export interface LiveFile {
   path: string;
   tier: "session" | "subagent" | "workflow_agent";
@@ -109,7 +140,9 @@ async function peek(path: string, maxLines = 400): Promise<{ cwd: string | null;
       try {
         const r = JSON.parse(line);
         if (!cwd && typeof r.cwd === "string") cwd = r.cwd;
+        // Claude writes {type:"ai-title", aiTitle}; omp writes {type:"title"|"title_change", title}.
         if (r.type === "ai-title" && typeof r.aiTitle === "string") title = r.aiTitle;
+        if ((r.type === "title" || r.type === "title_change") && typeof r.title === "string") title = r.title;
       } catch { /* a half-written line on a live file is normal */ }
     }
     rl.close();
@@ -146,28 +179,36 @@ export async function currentSession(cwd = process.cwd()): Promise<CurrentSessio
 }
 
 async function sessionIn(cand: string, cwd: string): Promise<CurrentSession | null> {
-  const want = encodeProjectDir(cand);
+  // Collect from EVERY source, then take the globally newest — do not return the first
+  // source that happens to have a directory for this cwd.
+  //
+  // Returning first-match meant source ORDER decided the answer: claude-live is first in
+  // the builtin list, so an omp agent asking "which session am I in" got the newest
+  // CLAUDE transcript in the same worktree — a different agent's conversation — every
+  // single time, with no error to notice. Observed live: omp got 04d1d650 back, which
+  // was the lead Claude session actively writing beside it.
+  let best: { uuid: string; path: string; mtimeMs: number; dir: string } | null = null;
+
   for (const src of loadSources()) {
     if (src.walk === "flat") continue;              // Codex has no project-dir layout
-    const dir = join(src.path, want);
+    const dir = join(src.path, encodeFor(src.walk, cand));
     if (!existsSync(dir)) continue;
 
-    let best: { uuid: string; path: string; mtimeMs: number } | null = null;
     for (const f of jsonlIn(dir)) {
       const st = statOf(join(dir, f));
-      if (st && (!best || st.mtimeMs > best.mtimeMs))
-        best = { uuid: basename(f, ".jsonl"), path: join(dir, f), mtimeMs: st.mtimeMs };
+      if (!st) continue;
+      if (best && st.mtimeMs <= best.mtimeMs) continue;
+      best = { uuid: uuidFromFile(src.walk, f), path: join(dir, f), mtimeMs: st.mtimeMs, dir };
     }
-    if (!best) continue;
-
-    const { cwd: own, title } = await peek(best.path);
-    return { sessionUuid: best.uuid, projectDir: dir, path: best.path,
-             cwd: own ?? cand, title, ageSec: age(best.mtimeMs),
-             // The transcript's own cwd is the authority. It matches the directory we
-             // walked up to, not necessarily the one the caller is standing in.
-             confident: own === cand };
   }
-  return null;
+  if (!best) return null;
+
+  const { cwd: own, title } = await peek(best.path);
+  return { sessionUuid: best.uuid, projectDir: best.dir, path: best.path,
+           cwd: own ?? cand, title, ageSec: age(best.mtimeMs),
+           // The transcript's own cwd is the authority. It matches the directory we
+           // walked up to, not necessarily the one the caller is standing in.
+           confident: own === cand };
 }
 
 export interface LiveSession {
