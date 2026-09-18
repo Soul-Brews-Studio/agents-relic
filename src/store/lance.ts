@@ -202,6 +202,25 @@ export class LanceStore {
     return opts.limit ? rows.slice(0, opts.limit) : rows;
   }
 
+  /**
+   * Resolve a session id — or a prefix of one — to the transcript files it names.
+   *
+   * Returns MANY rows on purpose. A session_uuid is not a key: subagent and
+   * workflow-agent transcripts inherit the parent's, so one uuid identifies a session
+   * TREE. Measured on one shard: 1,881 files carry 153 distinct uuids. A lookup that
+   * returned a single row would silently hide every child.
+   */
+  async findSession(idOrPrefix: string): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const q = idOrPrefix.replace(/'/g, "''");
+    const rows = await t.query()
+      .where(`session_uuid LIKE '${q}%' OR file_path LIKE '%${q}%'`)
+      .toArray() as unknown as SessionRow[];
+    rows.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
+    return rows;
+  }
+
   async counts(): Promise<{ events: number; sessions: number; files: number }> {
     const names = await this.db.tableNames();
     const n = async (x: string) => names.includes(x) ? await (await this.db.openTable(x)).countRows() : 0;

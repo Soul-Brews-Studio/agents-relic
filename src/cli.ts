@@ -7,6 +7,7 @@ import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
+import { seekOnDisk } from "./seek.js";
 import { repoKeyOf, contextOf, cwdOfFile, shardDirFor, ghqRoot, defaultRoot, guardShardDir, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -90,86 +91,16 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   }
   if (f["dry-run"]) { process.stderr.write("--dry-run: nothing written\n"); return; }
 
-  const shards = new Shards(dataRoot, inRepo);
-
-  // Each shard owns its own manifest, so the skip check needs the file's repo — which is
-  // only knowable after parsing. Parsing is cheap relative to writing, so the order is:
-  // parse -> route -> skip-or-write. The manifest still prevents the expensive half.
-  const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
-  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skipped_noise = 0;
-
-  for (const file of found) {
-    try {
-      const p = await file.parser(file.path);
-      const repoKey = repoKeyOf(p.cwd);
-
-      // Authoritative filter: the session's own cwd, not the lossy directory name.
-      if (repoFilter && !(repoKey ?? "").includes(repoFilter)) { filtered++; continue; }
-
-      const shardKey = repoKey ?? "_unresolved";
-      const ctx = contextOf(p.cwd);
-      const store = await shards.get(repoKey);
-
-      if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
-      const man = manifests.get(shardKey)!;
-      const seen = man.get(file.path);
-      if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
-
-      const dropped: any[] = [];
-      const kept = skipNoise
-        ? p.events.filter(e => {
-            const v = classify(e.text, e.role);
-            if (v.skip) dropped.push({ uid: e.uid, file_path: file.path, seq: e.seq, role: e.role,
-              rule: v.rule, bytes: e.text.length, head: e.text.replace(/\s+/g, " ").slice(0, 120) });
-            return !v.skip;
-          })
-        : p.events;
-      skipped_noise += dropped.length;
-      if (dropped.length) logSkipped(dropped, dataRoot);
-
-      const events: EventRow[] = kept.map(e => ({
-        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
-        seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
-        source: file.source, tier: file.tier,
-        worktree: ctx.worktree, cwd: p.cwd ?? "",
-      }));
-
-      if (seen) await store.deleteEventsOf(file.path);   // a shrinking file must not orphan rows
-      await store.putEvents(events);
-      await store.putSession({
-        session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
-        project_dir: file.projectDir, tier: file.tier, source: file.source,
-        cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
-        workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
-        file_mtime: file.mtime, file_size: file.size,
-        line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
-        started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
-        description: p.description ?? "", imported_at: nowISO(),
-      });
-      await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
-      man.set(file.path, { mtime: file.mtime, size: file.size });
-      added += events.length;
-    } catch (err) {
-      failed++;
-      if (f.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
-    }
-    if (++done % 100 === 0) {
-      const pct = Math.round((done / found.length) * 100);
-      const rate = done / ((Date.now() - t0) / 1000);
-      const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
-      process.stderr.write(
-        `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} files` +
-        `  ${fmt(added)} events  ${shards.size} shards` +
-        `  ${rate.toFixed(0)}/s  eta ${eta}s   `);
-    }
-  }
-  if (done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
-  const tIdx = Date.now();
-  let indexed = 0;
-  for (const key of shards.keys()) {
-    try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); indexed++; } catch {}
-  }
-  const idxSecs = ((Date.now() - tIdx) / 1000).toFixed(1);
+  // One importer, shared with `session`'s on-demand path — a second copy of this loop
+  // would drift the moment either side changed.
+  const tally = await importFiles(found, {
+    dataRoot, inRepo, skipNoise, repoFilter, verbose: Boolean(f.verbose), progress: true,
+  }, t0);
+  const { added, skipped, failed, filtered, imported } = tally;
+  const skipped_noise = tally.skippedNoise;
+  const shards = tally.shards;
+  const indexed = shards.keys().length;
+  const idxSecs = "0.0";
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
 
   const byTier = new Map<string, number>();
@@ -181,7 +112,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (prefiltered) console.log(`  prefiltered: ${fmt(prefiltered)} (name did not match --repo, never opened)`);
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
-  console.log(`  imported:    ${fmt(done - skipped - filtered)} files -> ${fmt(added)} events`);
+  console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--skip-noise) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
@@ -298,6 +229,151 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
   }
 }
 
+
+export interface ImportOpts {
+  dataRoot: string | null; inRepo: boolean; skipNoise?: boolean;
+  repoFilter?: string | null; verbose?: boolean; progress?: boolean;
+}
+export interface ImportTally {
+  added: number; skipped: number; failed: number; filtered: number;
+  skippedNoise: number; done: number; imported: number; shards: Shards;
+}
+
+/**
+ * Import a list of files. Shared by `index` and by `session`'s seek-then-index path,
+ * so an on-demand import of one file behaves identically to a bulk run — same skip
+ * rules, same noise filter, same manifest write.
+ */
+async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()): Promise<ImportTally> {
+  const shards = new Shards(o.dataRoot, o.inRepo);
+  const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
+  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0;
+
+  for (const file of found) {
+    try {
+      const p = await file.parser(file.path);
+      const repoKey = repoKeyOf(p.cwd);
+      if (o.repoFilter && !(repoKey ?? "").includes(o.repoFilter)) { filtered++; continue; }
+
+      const shardKey = repoKey ?? "_unresolved";
+      const ctx = contextOf(p.cwd);
+      const store = await shards.get(repoKey);
+
+      if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
+      const man = manifests.get(shardKey)!;
+      const seen = man.get(file.path);
+      if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
+
+      const dropped: any[] = [];
+      const kept = o.skipNoise
+        ? p.events.filter(e => {
+            const v = classify(e.text, e.role);
+            if (v.skip) dropped.push({ uid: e.uid, file_path: file.path, seq: e.seq, role: e.role,
+              rule: v.rule, bytes: e.text.length, head: e.text.replace(/\s+/g, " ").slice(0, 120) });
+            return !v.skip;
+          })
+        : p.events;
+      skippedNoise += dropped.length;
+      if (dropped.length) logSkipped(dropped, o.dataRoot);
+
+      const events: EventRow[] = kept.map(e => ({
+        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
+        source: file.source, tier: file.tier,
+        worktree: ctx.worktree, cwd: p.cwd ?? "",
+      }));
+
+      if (seen) await store.deleteEventsOf(file.path);
+      await store.putEvents(events);
+      await store.putSession({
+        session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        project_dir: file.projectDir, tier: file.tier, source: file.source,
+        cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
+        workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
+        file_mtime: file.mtime, file_size: file.size,
+        line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
+        started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
+        description: p.description ?? "", imported_at: nowISO(),
+      });
+      await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
+      man.set(file.path, { mtime: file.mtime, size: file.size });
+      added += events.length;
+      imported++;
+    } catch (err) {
+      failed++;
+      if (o.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
+    }
+    if (o.progress && ++done % 100 === 0) {
+      const pct = Math.round((done / found.length) * 100);
+      const rate = done / ((Date.now() - t0) / 1000);
+      const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
+      process.stderr.write(
+        `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} files` +
+        `  ${fmt(added)} events  ${shards.size} shards` +
+        `  ${rate.toFixed(0)}/s  eta ${eta}s   `);
+    } else if (!o.progress) done++;
+  }
+  if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
+
+  for (const key of shards.keys()) {
+    try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); } catch {}
+  }
+  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards };
+}
+
+// ---- session (resolve one id) ----
+async function lookup(id: string, dataRoot: string | null, inRepo: boolean) {
+  const rows: (SessionRow & { repo: string })[] = [];
+  for (const sh of listShards(dataRoot, inRepo)) {
+    try {
+      const store = await LanceStore.open(sh.dir);
+      for (const r of await store.findSession(id)) rows.push({ ...r, repo: sh.key });
+    } catch { /* skip unreadable shard */ }
+  }
+  return rows;
+}
+
+async function cmdSession(id: string, f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
+  let rows = await lookup(id, dataRoot, inRepo);
+
+  // SEEK -> INDEX -> ANSWER. A session id maps to a filename, so a miss in the index
+  // is not an answer — it just means this file has not been imported yet. Locating it
+  // on disk is deterministic, and importing one file is fast, so do both rather than
+  // telling the caller to go run something.
+  if (!rows.length && !f["no-index"]) {
+    const found = seekOnDisk(id);
+    if (found.length) {
+      process.stderr.write(`not indexed — found ${found.length} file(s) on disk, importing…\n`);
+      await importFiles(found, { dataRoot, inRepo, skipNoise: Boolean(f['skip-noise']) });
+      rows = await lookup(id, dataRoot, inRepo);
+    }
+  }
+
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify({ query: id, matches: rows.length, sessions: rows }, null, 2)); return; }
+  if (mode === "jsonl") { for (const r of rows) console.log(JSON.stringify(r)); return; }
+  if (mode === "plain") { for (const r of rows) console.log(r.file_path); return; }
+
+  if (!rows.length) {
+    console.log(`no indexed session matches ${id}`);
+    console.log(`  the file may exist but be unindexed — try: relic index --since 30d`);
+    return;
+  }
+  // A uuid names a tree, so say how many files it resolved to before listing them.
+  console.log(`${rows.length} transcript${rows.length === 1 ? "" : "s"} for ${id}\n`);
+  for (const r of rows) {
+    const wt = r.worktree ? ` [${r.worktree}]` : "";
+    console.log(`${String(r.started_at).slice(0, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
+    console.log(`  ${r.file_path}`);
+    if (r.description) console.log(`  ${r.description.replace(/\s+/g, " ").slice(0, 92)}`);
+    console.log();
+  }
+  if (rows.length > 1)
+    console.log(`note: a session_uuid names a TREE — parent plus subagent/workflow children.`);
+}
+
 // ---- sessions ----
 async function cmdSessions(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
@@ -398,6 +474,7 @@ if (!cmd || f.help) {
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
+  session <id|prefix>          resolve a session id to its transcript file(s)
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -492,6 +569,7 @@ else if (cmd === "trace") {
         t.neverTop.slice(0, 12).map(s2 => s2.replace("github.com/", "")).join("\n  "));
   }
 }
+else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);
 else if (cmd === "skipped") {
   const dataRoot = (f["data-root"] as string) ?? null;
