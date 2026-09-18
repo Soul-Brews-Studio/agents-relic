@@ -221,19 +221,19 @@ describe("dedupeHits — the key is content, NOT uid", () => {
 describe("shardDirFor — the bank is the top segment", () => {
   test("bank comes before the repo key", () => {
     expect(shardDirFor("github.com/acme/repo", "/data", false, "projects"))
-      .toBe("/data/projects/github.com/acme/repo");
+      .toBe("/data/banks/projects/github.com/acme/repo");
   });
 
   test("an unresolved repo still lands inside its bank", () => {
-    expect(shardDirFor(null, "/data", false, "codex")).toBe("/data/codex/_unresolved");
+    expect(shardDirFor(null, "/data", false, "codex")).toBe("/data/banks/codex/_unresolved");
   });
 
   test("a caller with no bank does not write to the data root itself", () => {
-    expect(shardDirFor("github.com/acme/repo", "/data")).toBe(`/data/${DEFAULT_BANK}/github.com/acme/repo`);
+    expect(shardDirFor("github.com/acme/repo", "/data")).toBe(`/data/banks/${DEFAULT_BANK}/github.com/acme/repo`);
   });
 
   test("in-repo puts the bank INSIDE .relic, so one checkout can hold several", () => {
     const d = shardDirFor("github.com/acme/repo", null, true, "projects-archive");
-    expect(d.endsWith("github.com/acme/repo/.relic/projects-archive")).toBe(true);
+    expect(d.endsWith("github.com/acme/repo/.relic/banks/projects-archive")).toBe(true);
   });
 });

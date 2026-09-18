@@ -171,7 +171,7 @@ export const SHARD_DIR = ".relic";
 /**
  * A BANK is the top level of the shard path — one namespace per source root.
  *
- *   ~/.relic/<bank>/github.com/<org>/<repo>/{events,sessions,files}
+ *   ~/.relic/banks/<bank>/github.com/<org>/<repo>/{events,sessions,files}
  *
  * The three Claude roots are three snapshots of the same machine's history, and they
  * OVERLAP: 742 session uuids appear in two of them, and 455 of 455 of
@@ -186,6 +186,17 @@ export const SHARD_DIR = ".relic";
  * path. Every import path passes the real bank from `bankOf(source)`.
  */
 export const DEFAULT_BANK = "default";
+
+/**
+ * Banks live under ONE container, never loose at the data root.
+ *
+ * Without it, "a bank" is defined as "any directory at the top level" — so relic's own
+ * trace.jsonl/skipped.jsonl/dig-cache.json are only NOT banks by being files, a renamed
+ * bank's leftover directory is still enumerated and searched, and the first cache or
+ * vector directory anyone adds becomes a phantom bank with no error anywhere.
+ * `ls ~/.relic/banks` IS the bank list.
+ */
+export const BANKS_DIR = "banks";
 
 /** The default home: ~/.relic/github.com/<org>/<repo>/ — mirrors ghq, touches no repo. */
 export function defaultRoot(): string { return join(homedir(), ".relic"); }
@@ -203,9 +214,10 @@ export function defaultRoot(): string { return join(homedir(), ".relic"); }
 export function shardDirFor(repoKey: string | null, dataRoot: string | null, inRepo = false, bank = DEFAULT_BANK): string {
   const key = repoKey ?? "_unresolved";
   const b = bank || DEFAULT_BANK;
-  if (dataRoot) return join(dataRoot, b, key);
-  if (inRepo) return repoKey ? join(ghqRoot(), repoKey, SHARD_DIR, b) : join(ghqRoot(), "_relic-unresolved", b);
-  return join(defaultRoot(), b, key);
+  if (dataRoot) return join(dataRoot, BANKS_DIR, b, key);
+  if (inRepo) return repoKey ? join(ghqRoot(), repoKey, SHARD_DIR, BANKS_DIR, b)
+                             : join(ghqRoot(), "_relic-unresolved", BANKS_DIR, b);
+  return join(defaultRoot(), BANKS_DIR, b, key);
 }
 
 /** Self-ignoring, so no repo's own .gitignore is ever edited. */
@@ -243,8 +255,8 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
   if (!dataRoot && !inRepo) dataRoot = defaultRoot();
 
   if (dataRoot) {
-    for (const bank of banks(dataRoot)) {
-      const base = join(dataRoot, bank.name);
+    for (const bank of banks(join(dataRoot, BANKS_DIR))) {
+      const base = join(dataRoot, BANKS_DIR, bank.name);
       const gh = join(base, "github.com");
       for (const org of ls(gh)) {
         if (!org.isDirectory()) continue;
@@ -269,12 +281,12 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
       const key = `github.com/${org.name}/${repo.name}`;
       // in-repo: the bank sits INSIDE the checkout's .relic/, so one repo can hold
       // several banks without them colliding.
-      for (const bank of banks(join(gh, org.name, repo.name, SHARD_DIR)))
-        out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name, SHARD_DIR, bank.name), bank: bank.name, repo: key });
+      for (const bank of banks(join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR)))
+        out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR, bank.name), bank: bank.name, repo: key });
     }
   }
-  for (const bank of banks(join(root, "_relic-unresolved")))
-    out.push({ key: `${bank.name}/_unresolved`, dir: join(root, "_relic-unresolved", bank.name), bank: bank.name, repo: "_unresolved" });
+  for (const bank of banks(join(root, "_relic-unresolved", BANKS_DIR)))
+    out.push({ key: `${bank.name}/_unresolved`, dir: join(root, "_relic-unresolved", BANKS_DIR, bank.name), bank: bank.name, repo: "_unresolved" });
   return out;
 }
 
