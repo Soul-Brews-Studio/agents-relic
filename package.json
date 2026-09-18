@@ -1,0 +1,29 @@
+{
+  "name": "agents-relic",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Per-repo LanceDB index of AI coding-agent session transcripts (Claude Code + Codex). Keyword search, no embeddings.",
+  "bin": {
+    "relic": "src/cli.ts",
+    "agents-relic": "src/cli.ts"
+  },
+  "scripts": {
+    "index": "bun src/cli.ts index",
+    "search": "bun src/cli.ts search",
+    "status": "bun src/cli.ts status"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.39.0",
+    "apache-arrow": "18.1.0"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "lancedb",
+    "jsonl",
+    "session",
+    "search",
+    "oracle"
+  ],
+  "license": "MIT"
+}

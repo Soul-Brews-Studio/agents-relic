@@ -1,0 +1,270 @@
+#!/usr/bin/env bun
+import { createReadStream, existsSync, readdirSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { join } from "node:path";
+import { LanceStore, type EventRow } from "./store/lance.js";
+import { discover, parseSince, type Found } from "./discover.js";
+import { detect, KNOWN_NON_JSONL } from "./sources.js";
+import { repoKeyOf, contextOf, shardDirFor, ghqRoot, guardShardDir, listShards } from "./repo.js";
+
+function flags(argv: string[]) {
+  const f: Record<string, string | boolean> = {};
+  const pos: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const [k, v] = a.slice(2).split("=");
+      if (v !== undefined) f[k] = v;
+      else if (argv[i + 1] && !argv[i + 1].startsWith("--")) f[k] = argv[++i];
+      else f[k] = true;
+    } else pos.push(a);
+  }
+  return { f, pos };
+}
+const fmt = (n: number) => n.toLocaleString("en-US");
+const nowISO = () => new Date().toISOString();
+
+/** One store per repo, opened on first write. */
+class Shards {
+  private pool = new Map<string, LanceStore>();
+  constructor(private dataRoot: string | null) {}
+  async get(repoKey: string | null): Promise<LanceStore> {
+    const key = repoKey ?? "_unresolved";
+    let s = this.pool.get(key);
+    if (!s) {
+      const dir = shardDirFor(repoKey, this.dataRoot);
+      guardShardDir(dir);
+      s = await LanceStore.open(dir);
+      this.pool.set(key, s);
+    }
+    return s;
+  }
+  get size() { return this.pool.size; }
+  keys() { return [...this.pool.keys()]; }
+}
+
+// ---- index -----------------------------------------------------------------
+async function cmdIndex(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
+  const sinceMs = parseSince(f.since as string | undefined);
+
+  const t0 = Date.now();
+  const mode = [only ? only.join("+") : "all enabled sources",
+                sinceMs ? `since ${new Date(sinceMs).toISOString().slice(0, 16)}` : "full history",
+                f.repo ? `repo~${f.repo}` : null,
+                f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
+  console.log(`\u{1F3FA} relic indexing  (${mode})`);
+  let found = discover(only, sinceMs);
+
+  // --repo scopes the index to one repo — "personal memory" rather than fleet-wide.
+  // Cheap prefilter first: the encoded project dir name contains the repo name with
+  // "/" and "." both mapped to "-", so a substring test on it rejects most files
+  // WITHOUT opening them. The authoritative check still happens after parse, against
+  // the session's own cwd, because the encoding is lossy and cannot be reversed.
+  const repoFilter = f.repo ? String(f.repo) : null;
+  let prefiltered = 0;
+  if (repoFilter) {
+    const needle = repoFilter.replace(/[/.]/g, "-");
+    const before = found.length;
+    found = found.filter(x => x.projectDir.includes(needle) || x.source === "codex");
+    prefiltered = before - found.length;
+  }
+  if (f["dry-run"]) { process.stderr.write("--dry-run: nothing written\n"); return; }
+
+  const shards = new Shards(dataRoot);
+
+  // Each shard owns its own manifest, so the skip check needs the file's repo — which is
+  // only knowable after parsing. Parsing is cheap relative to writing, so the order is:
+  // parse -> route -> skip-or-write. The manifest still prevents the expensive half.
+  const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
+  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0;
+
+  for (const file of found) {
+    try {
+      const p = await file.parser(file.path);
+      const repoKey = repoKeyOf(p.cwd);
+
+      // Authoritative filter: the session's own cwd, not the lossy directory name.
+      if (repoFilter && !(repoKey ?? "").includes(repoFilter)) { filtered++; continue; }
+
+      const shardKey = repoKey ?? "_unresolved";
+      const ctx = contextOf(p.cwd);
+      const store = await shards.get(repoKey);
+
+      if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
+      const man = manifests.get(shardKey)!;
+      const seen = man.get(file.path);
+      if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
+
+      const events: EventRow[] = p.events.map(e => ({
+        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
+        source: file.source, tier: file.tier,
+        worktree: ctx.worktree, cwd: p.cwd ?? "",
+      }));
+
+      if (seen) await store.deleteEventsOf(file.path);   // a shrinking file must not orphan rows
+      await store.putEvents(events);
+      await store.putSession({
+        session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
+        project_dir: file.projectDir, tier: file.tier, source: file.source,
+        cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
+        workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
+        file_mtime: file.mtime, file_size: file.size,
+        line_count: p.lines, event_count: p.events.length, bad_lines: p.badLines,
+        started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
+        description: p.description ?? "", imported_at: nowISO(),
+      });
+      await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
+      man.set(file.path, { mtime: file.mtime, size: file.size });
+      added += events.length;
+    } catch (err) {
+      failed++;
+      if (f.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
+    }
+    if (++done % 100 === 0) {
+      const pct = Math.round((done / found.length) * 100);
+      const rate = done / ((Date.now() - t0) / 1000);
+      const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
+      process.stderr.write(
+        `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} files` +
+        `  ${fmt(added)} events  ${shards.size} shards` +
+        `  ${rate.toFixed(0)}/s  eta ${eta}s   `);
+    }
+  }
+  if (done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
+  const tIdx = Date.now();
+  let indexed = 0;
+  for (const key of shards.keys()) {
+    try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); indexed++; } catch {}
+  }
+  const idxSecs = ((Date.now() - tIdx) / 1000).toFixed(1);
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+
+  const byTier = new Map<string, number>();
+  for (const x of found) byTier.set(`${x.source}/${x.tier}`, (byTier.get(`${x.source}/${x.tier}`) ?? 0) + 1);
+
+  console.log(`  scanned:     ${fmt(found.length + prefiltered)} files`);
+  for (const [k, v] of [...byTier].sort((a, b) => b[1] - a[1]))
+    console.log(`               ${String(fmt(v)).padStart(7)}  ${k}`);
+  if (prefiltered) console.log(`  prefiltered: ${fmt(prefiltered)} (name did not match --repo, never opened)`);
+  if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
+  console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
+  console.log(`  imported:    ${fmt(done - skipped - filtered)} files -> ${fmt(added)} events`);
+  if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
+  console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
+  console.log(`  wrote:       ${dataRoot ? dataRoot : "in-repo .relic/"} in ${secs}s`);
+}
+
+// ---- search ----------------------------------------------------------------
+async function cmdSearch(q: string, f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const limit = Number(f.limit ?? 20);
+  let shards = listShards(dataRoot);
+  if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
+  if (!shards.length) { console.log("no shards yet — run `index` first"); return; }
+
+  const hits: (EventRow & { repo: string })[] = [];
+  let searched = 0;
+  const t0 = performance.now();
+  for (const s of shards) {
+    try {
+      const store = await LanceStore.open(s.dir);
+      for (const h of await store.search(q, { limit, tier: f.tier as string, source: f.source as string, worktree: f.worktree as string, path: f.path as string }))
+        hits.push({ ...h, repo: s.key });
+      searched++;
+    } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
+  }
+  const ms = performance.now() - t0;
+
+  if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms.toFixed(0)} ms)`); return; }
+  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms.toFixed(0)} ms\n`);
+  for (const h of hits.slice(0, limit)) {
+    const i = h.text.toLowerCase().indexOf(q.toLowerCase());
+    const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
+    const wt = h.worktree ? `  [${h.worktree}]` : "";
+    console.log(`${h.repo.replace("github.com/", "")}${wt}  ${h.source}/${h.tier}  ${h.role} ${h.ts}`);
+    console.log(`  ...${snip.replace(/\s+/g, " ").trim()}...`);
+    console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
+  }
+}
+
+// ---- show ------------------------------------------------------------------
+async function cmdShow(path: string, f: Record<string, string | boolean>) {
+  const target = Number(f.seq ?? 1), before = Number(f.before ?? 2), after = Number(f.after ?? 2);
+  const rl = createInterface({ input: createReadStream(path, "utf8") });
+  let seq = 0;
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    seq++;
+    if (seq < target - before) continue;
+    if (seq > target + after) break;
+    let role = "?", text = line.slice(0, 400);
+    try {
+      const rec = JSON.parse(line);
+      role = rec.message?.role ?? rec.type ?? "?";
+      const c = rec.message?.content ?? rec.payload?.content ?? rec.content;
+      text = typeof c === "string" ? c : JSON.stringify(c ?? rec).slice(0, 600);
+    } catch {}
+    console.log(`${seq === target ? ">>" : "  "} #${seq} ${role}: ${String(text).replace(/\s+/g, " ").slice(0, 300)}`);
+  }
+}
+
+// ---- status ----------------------------------------------------------------
+async function cmdStatus(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const shards = listShards(dataRoot);
+  if (!shards.length) { console.log("nothing indexed yet"); return; }
+  console.log(`layout  ${dataRoot ? `mirror under ${dataRoot}` : `in-repo: ${ghqRoot()}/<org>/<repo>/.relic/`}`);
+  console.log(`store   LanceDB only — no FTS index, no tokenizer, no routing\n`);
+
+  const rows: { key: string; ev: number; se: number }[] = [];
+  for (const s of shards) {
+    try { const c = await (await LanceStore.open(s.dir)).counts(); rows.push({ key: s.key, ev: c.events, se: c.sessions }); }
+    catch { /* skip unreadable shard */ }
+  }
+  rows.sort((a, b) => b.ev - a.ev);
+  const limit = Number(f.limit ?? 15);
+  for (const r of rows.slice(0, limit))
+    console.log(`  ${r.key.replace("github.com/", "").padEnd(48)} ${String(r.se).padStart(6)} sess ${fmt(r.ev).padStart(10)} ev`);
+  if (rows.length > limit) console.log(`  ... and ${rows.length - limit} more (--limit N)`);
+  console.log(`\ntotal   ${fmt(rows.reduce((a, r) => a + r.ev, 0))} events · ${fmt(rows.reduce((a, r) => a + r.se, 0))} sessions · ${rows.length} shards`);
+  console.log("vectors: none yet — they land in the same `events` table, no migration.");
+}
+
+// ---- main ------------------------------------------------------------------
+const { f, pos } = flags(process.argv.slice(2));
+const cmd = pos[0];
+
+if (!cmd || f.help) {
+  console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
+
+  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--dry-run]
+  search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...] [--limit N]
+  show    <file> --seq N [--before 2] [--after 2]
+  status  [--limit 15]
+  sources                      what this machine has, and what is on/off
+
+  --data-root PATH   mirror tree instead of writing inside repos
+
+Sharded per repo, ghq-style:
+  ${ghqRoot()}/github.com/<org>/<repo>/.relic/
+
+LanceDB only. Substring search, so Thai and sub-3-character needles work with no
+tokenizer. Vectors land in the same table later.`);
+  process.exit(0);
+}
+
+if (cmd === "index") await cmdIndex(f);
+else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
+else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
+else if (cmd === "sources") {
+  console.log("configured sources (~/.relic/sources.json overrides)\n");
+  for (const s of detect())
+    console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  ${s.path}\n         ${s.note}`);
+  console.log("\nreal history that is NOT jsonl — needs a different reader:");
+  for (const k of KNOWN_NON_JSONL) console.log(`  [--]  ${k.key.padEnd(16)} ${k.path}\n         ${k.note}`);
+}
+else if (cmd === "status") await cmdStatus(f);
+else { console.error(`unknown command: ${cmd}`); process.exit(1); }
