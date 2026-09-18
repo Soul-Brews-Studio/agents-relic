@@ -1,4 +1,4 @@
-import { readdirSync, statSync, existsSync } from "node:fs";
+import { readdirSync, statSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { bankOf, loadSources } from "./sources.js";
@@ -164,6 +164,75 @@ function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: s
 }
 
 /**
+ * EVERY oracle's vault, not one.
+ *
+ * `walkVault` takes a single root, which indexes one oracle and leaves the rest dark.
+ * Measured on this machine: 413 repos carry a ψ, and exactly one of them was indexed.
+ *
+ * Four things have to be right here, and each fails SILENTLY if it is not:
+ *
+ * 1. RESOLVE THE ENTRY POINT. `dirs()` filters on `e.isDirectory()`, which is FALSE
+ *    for a symlink — `isSymbolicLink()` is true instead. The /psi skill deliberately
+ *    points a plain repo's ψ at a caretaker oracle's vault, and 77 of the 413 use it,
+ *    including this repo's own. Without an explicit resolve they are not "empty",
+ *    they are invisible.
+ *
+ * 2. DO NOT follow symlinks once INSIDE a vault. `ψ/incubate/<org>/<repo>/origin`
+ *    links back out into the ghq tree, so a walker that follows everything can walk
+ *    from one vault into a repo and back into another vault. walkVault already
+ *    behaves correctly here precisely BECAUSE isDirectory() is false for symlinks —
+ *    the same fact that causes problem 1 prevents problem 2. Resolve at the top only.
+ *
+ * 3. DEDUPE BY REALPATH. 413 paths resolve to 386 targets; walking paths instead of
+ *    targets indexes a shared vault once per repo that points at it.
+ *
+ * 4. SKIP DEAD LINKS. Several point at /Users/nat/Code/..., which does not exist on
+ *    this machine. existsSync on a broken symlink is false, so this falls out of the
+ *    resolve — but only if the resolve is attempted at all.
+ *
+ * Worktrees need no special case: they live at <org>/<repo>/wt/<name>, one level
+ * below what this enumerates.
+ */
+function walkVaults(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  // Resolve every candidate FIRST, then walk. Two passes because the dedup below is
+  // containment, not equality, and containment needs the full set before it can
+  // decide — which is only knowable once everything is resolved.
+  const resolved: string[] = [];
+  for (const org of dirs(root)) {
+    const orgPath = join(root, org);
+    for (const repo of dirs(orgPath)) {
+      const psi = join(orgPath, repo, "\u03c8");
+      try {
+        // lstat first: existsSync FOLLOWS the link, so a dead one is already false —
+        // but a live one must be resolved before `dirs()` refuses to see it.
+        lstatSync(psi);
+        resolved.push(realpathSync(psi));
+      } catch { /* missing, or a dead symlink — contributes nothing */ }
+    }
+  }
+
+  /*
+   * A VAULT CAN CONTAIN ANOTHER VAULT, and equality-dedup does not catch it.
+   *
+   * `ψ/incubate/<org>/<repo>/origin` is a real checkout living inside a vault, and
+   * that checkout has its own ψ. Both are enumerated: the outer one emits the inner
+   * one's notes while recursing, and then the inner one is walked again on its own.
+   * Measured before this: 111 files emitted twice out of 116,952.
+   *
+   * Sorting by length puts every container ahead of anything it contains, so one
+   * forward pass decides it. The trailing separator matters — without it, a sibling
+   * named `ψ-old` would be treated as living inside `ψ`.
+   */
+  resolved.sort((a, b) => a.length - b.length);
+  const kept: string[] = [];
+  for (const real of resolved) {
+    if (kept.some(k => real === k || real.startsWith(k + "/"))) continue;
+    kept.push(real);
+  }
+  for (const real of kept) walkVault(real, sinceMs, out, srcKey, parser);
+}
+
+/**
  * Progress for the DISCOVERY phase.
  *
  * Import had progress; discovery had none — and discovery is the part that walks the
@@ -249,6 +318,7 @@ export function discover(only: string[] | null, sinceMs: number | null): Found[]
     const before = out.length;
     if (src.walk === "memory") walkMemory(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "hermes") walkHermes(src.path, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "vaults") walkVaults(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
     else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
