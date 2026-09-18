@@ -84,8 +84,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   const { added, skipped, failed, filtered, imported } = tally;
   const skipped_noise = tally.skippedNoise;
   const shards = tally.shards;
-  const indexed = shards.keys().length;
-  const idxSecs = "0.0";
+  const idxSecs = (tally.ftsMs / 1000).toFixed(1);
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
 
   const byTier = new Map<string, number>();
@@ -100,7 +99,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--skip-noise) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
-  console.log(`  shards:      ${shards.size} repo${shards.size === 1 ? "" : "s"}, ${indexed} fts index built in ${idxSecs}s`);
+  console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
+              `, ${tally.ftsBuilt} fts index built in ${idxSecs}s` +
+              (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
   console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
 }
 
@@ -132,7 +133,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
   trace({
     ts: new Date().toISOString(), q, chars: [...q].length, filters,
-    shards: searched, hits: hits.length, ms, top_repo: hits[0]?.repo ?? "", fts: true,
+    shards: searched, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
+            top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true,
   }, dataRoot);
 
   const top = hits.slice(0, limit);
@@ -521,7 +523,10 @@ else if (cmd === "ui") {
 else if (cmd === "trace") {
   const cloud = Boolean(f.cloud);
   const dataRoot = (f["data-root"] as string) ?? null;
-  const shards = listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.key);
+  // BARE repo keys, not shard keys: `top_repo` in the log is written bank-less (cli.ts
+  // `show` uses repoKeyOf), so comparing against "<bank>/github.com/..." would report
+  // every shard as "never produced a best hit".
+  const shards = [...new Set(listShards(dataRoot, Boolean(f["in-repo"])).map(s => s.repo))];
   const t = readTrace(dataRoot, shards);
   const tmode = outFmt(f);
   if (t && (tmode === "json" || tmode === "jsonl")) {

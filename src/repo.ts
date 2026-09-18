@@ -233,7 +233,12 @@ export interface Shard {
 export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
   const out: Shard[] = [];
   const ls = (p: string) => { try { return readdirSync(p, { withFileTypes: true }); } catch { return []; } };
-  const banks = (p: string) => ls(p).filter(e => e.isDirectory() && !e.name.startsWith("."));
+  // `.lance` is a LanceDB TABLE directory. A pre-bank in-repo shard is
+  // `<repo>/.relic/{events,sessions,files}.lance`, and without this filter each of those
+  // enumerates as a bank whose store opens fine with zero tables — three phantom 0-row
+  // shards per legacy repo, inflating every "shards searched" count.
+  const banks = (p: string) =>
+    ls(p).filter(e => e.isDirectory() && !e.name.startsWith(".") && !e.name.endsWith(".lance"));
 
   if (!dataRoot && !inRepo) dataRoot = defaultRoot();
 

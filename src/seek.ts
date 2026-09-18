@@ -39,6 +39,10 @@ export function seekOnDisk(id: string): Found[] {
 
   for (const src of loadSources()) {
     if (!existsSync(src.path)) continue;
+    // TRANSCRIPT layouts only. `claude-memory` points at the SAME directory as
+    // `claude-live`, so without this gate every session id matches a second time, is
+    // parsed by parseMemory, and lands as a bogus one-event row in the memory bank.
+    if (src.walk !== "claude-tiers" && src.walk !== "flat" && src.walk !== "omp") continue;
     // Same bank the bulk walker would have stamped. Without it an on-demand
     // `relic session <id>` import writes into the fallback bank instead of the
     // source's own — a misfile that no error would report.

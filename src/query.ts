@@ -54,6 +54,43 @@ export function toISO(v: unknown, endOfDay = false): string | undefined {
 }
 
 /**
+ * Drop events that exist in more than one transcript.
+ *
+ * Resuming a session forks a NEW transcript and copies the history forward, so the same
+ * event lives in two files, and both surface. Measured unfiltered: 213 duplicate rows out
+ * of 2,403 hits (8.9%) for one query, 85 of 1,235 for another.
+ *
+ * THE KEY IS (ts, role, text), NOT uid — and that is the opposite of what it looks like
+ * it should be. `uidOf(shape, basename, seq)` hashes a LINE SLOT, not an event: a resumed
+ * Claude session writes a NEW file under the SAME uuid containing NONE of the earlier
+ * lines, so slot `seq` in the two copies holds two DIFFERENT events under one uid.
+ * Measured across 13 real projects∩projects-1sep pairs: 4 byte-identical, 1 a strict
+ * prefix, and 8 that diverge at line 1. On one of them (ff0f8c22, neo-oracle) 1,018 slots
+ * carry an indexed event in BOTH copies — 1,018 distinct searchable events sharing 1,018
+ * uids. Deduping on uid would silently show one and hide the other, with the winner
+ * decided by whichever text happened to score higher for THAT query.
+ *
+ * Where uid dedup IS correct — byte-identical copies — (ts, role, text) already collapses
+ * them, so the uid pass buys nothing and costs correctness. It survives only as the
+ * fallback for shapes that carry no timestamp (vault, memory), whose uid hashes the FULL
+ * path and therefore does identify one specific chunk of one specific file.
+ *
+ * Sorting by score happens FIRST, so the copy kept is the best-ranked one rather than
+ * whichever shard answered first.
+ */
+export function dedupeHits<T extends { uid: string; ts?: string; role?: string; text?: string }>(hits: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const h of hits) {
+    const k = h.ts ? `e\u001f${h.ts}\u001f${h.role}\u001f${h.text}` : `u\u001f${h.uid}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(h);
+  }
+  return out;
+}
+
+/**
  * The shards a query will touch, after the `--bank` and `--repo` filters.
  *
  * `repo` matches the REPO portion, never the whole key. Once the key gained a bank
@@ -169,38 +206,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    */
   hits.sort((a, b) => Number((b as any)._score ?? 0) - Number((a as any)._score ?? 0));
 
-  /*
-   * Drop events that exist in more than one transcript.
-   *
-   * Resuming a session forks a NEW transcript and copies the history forward, so the
-   * same event lives in two files. relic's uid is (source, filename, seq) — deliberately
-   * path-INdependent within a file but distinct across files — so a copied event is two
-   * legitimate rows, and both surface. Measured unfiltered: 213 duplicate rows out of
-   * 2,403 hits (8.9%) for one query, 85 of 1,235 for another.
-   *
-   * The key is (ts, role, text): a millisecond timestamp plus identical content is the
-   * same event, not a coincidence. Sorting by score happens FIRST, so the copy that is
-   * kept is the best-ranked one rather than whichever shard answered first.
-   */
-  const seenUid = new Set<string>();
-  const seenEvent = new Set<string>();
-  const deduped: typeof hits = [];
-  for (const h of hits) {
-    // uid FIRST, and it is the cross-BANK case: uid excludes the path and the bank, so
-    // one session indexed under two source roots produces the same uid twice. Exact and
-    // cheaper than comparing full text.
-    if (seenUid.has(h.uid)) continue;
-    seenUid.add(h.uid);
-    // ts empty means the shape carries no timestamp (documents). Keying on
-    // ("", role, text) there would collapse genuinely distinct rows, so uid is the only
-    // safe key in that case and the content test is skipped.
-    if (h.ts) {
-      const k = `${h.ts}\u001f${h.role}\u001f${h.text}`;
-      if (seenEvent.has(k)) continue;
-      seenEvent.add(k);
-    }
-    deduped.push(h);
-  }
+  const deduped = dedupeHits(hits);
   hits.length = 0;
   hits.push(...deduped);
 
@@ -495,14 +501,37 @@ export async function neighbours(
   // `row.repo` is a full shard KEY ("<bank>/github.com/<org>/<repo>"), not a repo name,
   // so it must not be fed to the `repo` filter — that filter now matches the repo
   // portion and would return nothing, leaving this function silently empty.
-  const shard = pickShards({ dataRoot: s.dataRoot, inRepo: s.inRepo }).find(x => x.key === row.repo);
+  const all = pickShards({ dataRoot: s.dataRoot, inRepo: s.inRepo });
+  const shard = all.find(x => x.key === row.repo);
   if (!shard) return { before: [], after: [] };
-  try {
-    const store = await LanceStore.open(shard.dir);
-    const n = await store.around(iso, { worktree: row.worktree || undefined, before, after });
-    const tag = (r: SessionRow) => ({ ...r, repo: row.repo });
-    return { before: n.before.map(tag), after: n.after.map(tag) };
-  } catch { return { before: [], after: [] }; }
+  // EVERY bank holding this repo, not just the one the parent was found in. The three
+  // Claude roots are snapshots of the same machine, so "the session before this one"
+  // frequently lives in a different bank — answering from one bank silently drops it.
+  const sibling = all.filter(x => x.repo === shard.repo);
+  const out: Neighbours = { before: [], after: [] };
+  for (const sh of sibling) {
+    try {
+      const store = await LanceStore.open(sh.dir);
+      const n = await store.around(iso, { worktree: row.worktree || undefined, before, after });
+      const tag = (r: SessionRow) => ({ ...r, repo: sh.key });
+      out.before.push(...n.before.map(tag));
+      out.after.push(...n.after.map(tag));
+    } catch { /* a shard mid-write can throw; the others still answer */ }
+  }
+  // One row per session across banks; keep the copy with the most events, then re-slice
+  // — each shard returned its own N, and N shards' worth is not the answer.
+  const fold = (rs: (SessionRow & { repo: string })[], newestFirst: boolean) => {
+    const best = new Map<string, SessionRow & { repo: string }>();
+    for (const r of rs) {
+      const k = String(r.session_uuid);
+      const cur = best.get(k);
+      if (!cur || Number(r.event_count ?? 0) > Number(cur.event_count ?? 0)) best.set(k, r);
+    }
+    const sorted = [...best.values()].sort((a, b) =>
+      String(a.started_at ?? "").localeCompare(String(b.started_at ?? "")));
+    return newestFirst ? sorted.slice(-before) : sorted.slice(0, after);
+  };
+  return { before: fold(out.before, true), after: fold(out.after, false) };
 }
 
 /**
@@ -601,6 +630,30 @@ export async function memoryReport(
   const until = toISO(s.until, true);
   let withOrigin = 0, joined = 0, orphaned = 0, shards = 0;
 
+  /*
+   * THE JOIN CROSSES BANKS, by construction.
+   *
+   * A memory is stamped bank `memory`; the session that produced it lives in a
+   * `projects*` bank. Those are different shard DIRECTORIES for the same repo, so a
+   * per-shard join — read memories and session ids from one store — can only ever
+   * report joined=0, orphaned=withOrigin, transcripts=0. Every number would render
+   * confidently and every one of them would be wrong.
+   *
+   * So the transcript side is collected across ALL shards first, and it deliberately
+   * ignores `--bank`: narrowing to `memory` leaves no transcripts to join against, and
+   * narrowing to `projects` leaves no memories. `--bank` still narrows which MEMORIES
+   * are reported.
+   */
+  const allIds = new Set<string>();
+  const txByRepo = new Map<string, number>();
+  for (const sh of pickShards({ ...s, bank: undefined })) {
+    try {
+      const store = await LanceStore.open(sh.dir);
+      for (const id of await store.sessionIds()) allIds.add(id);
+      txByRepo.set(sh.repo, (txByRepo.get(sh.repo) ?? 0) + await store.transcriptCount());
+    } catch { /* unreadable shard contributes nothing to the join */ }
+  }
+
   for (const sh of pickShards(s)) {
     let store;
     try { store = await LanceStore.open(sh.dir); } catch { continue; }
@@ -609,8 +662,6 @@ export async function memoryReport(
     if (!mems.length) continue;
     shards++;
 
-    const ids = await store.sessionIds();
-    const transcripts = await store.transcriptCount();
     const producing = new Set<string>();
     let kept = 0;
 
@@ -620,7 +671,7 @@ export async function memoryReport(
       if (until && m.ts && m.ts > until) continue;
       kept++;
       const origin = String(m.origin_session ?? "");
-      const originIndexed = Boolean(origin) && ids.has(origin);
+      const originIndexed = Boolean(origin) && allIds.has(origin);
       if (origin) { withOrigin++; originIndexed ? joined++ : orphaned++; }
       if (originIndexed) producing.add(origin);
       const type = String(m.mem_type || "(untyped)");
@@ -633,7 +684,7 @@ export async function memoryReport(
         originIndexed,
       });
     }
-    if (kept) perRepo.push({ repo: sh.key, memories: kept, transcripts, producing: producing.size });
+    if (kept) perRepo.push({ repo: sh.repo, memories: kept, transcripts: txByRepo.get(sh.repo) ?? 0, producing: producing.size });
   }
 
   rows.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
@@ -685,7 +736,10 @@ export async function pendingReport(
   }
 
   const sinceMs = s.since ? parseSince(s.since) : null;
-  const found = discover(s.corpus ?? null, sinceMs);
+  // `--bank` must narrow BOTH sides. It already narrows the manifest via pickShards
+  // above; without the same filter here, discover() returns every source's files and
+  // each one counts as `missing` against a manifest that was never asked for them.
+  const found = discover(s.corpus ?? null, sinceMs).filter(f => !s.bank || f.bank === s.bank);
 
   const groups = new Map<string, PendingGroup>();
   let indexed = 0, changed = 0, missing = 0, newest: number | null = null;

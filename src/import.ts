@@ -48,6 +48,8 @@ export interface ImportOpts {
 export interface ImportTally {
   added: number; skipped: number; failed: number; filtered: number;
   skippedNoise: number; done: number; imported: number; shards: Shards;
+  /** FTS indexes actually built or confirmed, and what that phase cost. */
+  ftsBuilt: number; ftsFailed: number; ftsMs: number;
 }
 
 /**
@@ -200,8 +202,27 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
 
   await flush();   // anything left below the batch threshold
 
-  for (const store of shards.stores()) {
-    try { await store.ensureFtsIndex(); } catch {}
+  /*
+   * THE FTS PHASE IS THE QUIET ONE, and quiet is what gets a run killed.
+   *
+   * It happens after the last flush, after the progress line has been erased, and at
+   * ~900 shards it is not instant. A run killed here leaves shards that still ANSWER —
+   * `search` catches the missing-index error and falls back to a LIKE scan, 7-28x slower
+   * with no `_score` — so the index looks complete and silently ranks wrong. The old code
+   * printed a hardcoded "fts index built in 0.0s", which is the same lie with a number.
+   */
+  const tf0 = Date.now();
+  const stores = shards.stores();
+  let ftsBuilt = 0, ftsFailed = 0;
+  for (let i = 0; i < stores.length; i++) {
+    if (o.progress) process.stderr.write(`\r  building full-text index  ${i + 1}/${stores.length} shards   `);
+    try { await stores[i].ensureFtsIndex(); ftsBuilt++; }
+    catch (err) {
+      ftsFailed++;
+      if (o.verbose) process.stderr.write(`\n  FTS FAIL: ${String(err).slice(0, 160)}\n`);
+    }
   }
-  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards };
+  if (o.progress && stores.length) process.stderr.write("\r" + " ".repeat(60) + "\r");
+  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards,
+           ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0 };
 }

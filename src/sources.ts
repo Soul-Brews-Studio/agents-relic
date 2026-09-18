@@ -192,7 +192,36 @@ export function loadSources(): SourceDef[] {
       });
     }
   } catch { /* a broken config must not stop an index run */ }
-  return out;
+
+  /*
+   * A DUPLICATE SOURCE IS A DOUBLED BANK, and nothing downstream would say so.
+   *
+   * Re-adding an entry that a builtin already covers — the exact shape of the deleted
+   * ~/.relic/sources.json, which defined claude-1sep before it moved in here — yields two
+   * sources over one root: the builtin writing bank `projects-1sep-tue2026` and the added
+   * one writing bank `claude-1sep`. Both enabled, 25,389 files read and stored twice,
+   * `--corpus claude-1sep` matching both, and search hiding the doubling. Only disk and
+   * wall-clock would show it. `disable:` cannot switch the copy off either, since `find`
+   * returns the first match only.
+   *
+   * Loud beats silent: drop the later duplicate and say so on stderr.
+   */
+  const seenKey = new Set<string>(), seenPath = new Set<string>(), seenBank = new Set<string>();
+  const kept: SourceDef[] = [];
+  for (const s of out) {
+    const bank = bankOf(s);
+    // claude-live and claude-memory SHARE a path on purpose — two readings of one root —
+    // so a path clash is only a duplicate when the bank clashes too.
+    const dup = seenKey.has(s.key) ? "key" : seenBank.has(bank) ? "bank"
+              : (seenPath.has(s.path) && seenBank.has(bank)) ? "path" : null;
+    if (dup) {
+      process.stderr.write(`  relic: dropping duplicate source ${s.key} (${dup} already taken — check ~/.relic/sources.json)\n`);
+      continue;
+    }
+    seenKey.add(s.key); seenPath.add(s.path); seenBank.add(bank);
+    kept.push(s);
+  }
+  return kept;
 }
 
 /** What is actually on this machine, for the `sources` command. */
