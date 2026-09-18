@@ -122,6 +122,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
+    org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
     allTiers: Boolean(f["all-tiers"] || f.tier),
   });
@@ -410,7 +411,7 @@ if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
-  search  <query> [--repo S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
+  search  <query> [--repo S] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]

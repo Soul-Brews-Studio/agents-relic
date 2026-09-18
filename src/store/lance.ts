@@ -34,6 +34,11 @@ export interface EventRow {
   tier: string;           // session | subagent | workflow_agent
   worktree: string;       // which worktree/agent/lab the session ran in — "" = main checkout
   cwd: string;            // full working dir, so a path substring is searchable too
+  // The location hierarchy: org / repo / project / worktree / dir. repo_key fuses the
+  // first two and drops the rest, which mis-attributes a nested vault to its host repo.
+  org: string;
+  project: string;        // nested oracle/lab/incubated repo, "" when not nested
+  dir: string;            // directory below the worktree, e.g. "ψ/memory/learnings"
 }
 
 export interface SessionRow {
@@ -175,16 +180,23 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const limit = opts.limit ?? 20;
     const filters: string[] = [];
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
+    // The "main" default: the human's own thread plus vault notes, excluding the
+    // subagent/workflow chatter that is 73% of the corpus by file count.
+    else if (opts.mainTiers) filters.push(`(tier = 'session' OR tier = 'note')`);
     if (opts.source) filters.push(`source = ${sqlStr(opts.source)}`);
     // worktree is context, not noise: "which worktree was this said in" is usually
     // the same question as "what was I working on".
     if (opts.worktree) filters.push(`worktree LIKE '%${opts.worktree.replace(/'/g, "''")}%'`);
+    if (opts.org)     filters.push(`org = ${sqlStr(opts.org)}`);
+    if (opts.project) filters.push(`project = ${sqlStr(opts.project)}`);
+    // dir is a PREFIX match: --dir ψ/memory must return ψ/memory/learnings too.
+    if (opts.dir)     filters.push(`dir LIKE '${opts.dir.replace(/'/g, "''")}%'`);
     if (opts.path)     filters.push(`cwd LIKE '%${opts.path.replace(/'/g, "''")}%'`);
     // ts is ISO-8601 with a Z suffix, so lexicographic comparison IS chronological —
     // no parsing, and it pushes down into the scan. Verified on a 20k-row sample that

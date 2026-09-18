@@ -27,6 +27,7 @@ export interface Scope {
 export interface SearchOpts extends Scope {
   limit?: number;
   tier?: string; source?: string; worktree?: string; path?: string; role?: string;
+  org?: string; project?: string; dir?: string;
   /**
    * Include subagent and workflow_agent transcripts. Default FALSE — see searchEvents.
    */
@@ -113,7 +114,13 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    * MCP both SAY SO on every result rather than silently narrowing.
    */
   const tier = o.tier ?? (o.allTiers ? undefined : "session");
-  const opts = { limit, tier, source: o.source, worktree: o.worktree, path: o.path,
+  // Vault notes are the OPPOSITE of the noise the tier default exists to cut: hand
+  // written, one per idea, no near-duplicates. Excluding them by default would make
+  // `relic search` silently miss the most deliberate writing in the corpus, so the
+  // default narrows to session AND note, dropping only subagent/workflow chatter.
+  const mainOnly = !o.tier && !o.allTiers;
+  const opts = { limit, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
+                 org: o.org, project: o.project, dir: o.dir,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
 
   let next = 0;

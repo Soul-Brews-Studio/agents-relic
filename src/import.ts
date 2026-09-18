@@ -1,7 +1,7 @@
 import { LanceStore, type EventRow } from "./store/lance.js";
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
-import { repoKeyOf, contextOf, shardDirFor, guardShardDir } from "./repo.js";
+import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir } from "./repo.js";
 
 /**
  * Writing into the index.
@@ -60,6 +60,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
 
       const shardKey = repoKey ?? "_unresolved";
       const ctx = contextOf(p.cwd);
+      const loc = locationOf(p.cwd);
       const store = await shards.get(repoKey);
 
       if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
@@ -84,6 +85,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
         source: file.source, tier: file.tier,
         worktree: ctx.worktree, cwd: p.cwd ?? "",
+        org: loc.org, project: loc.project, dir: loc.dir,
       }));
 
       if (seen) await store.deleteEventsOf(file.path);

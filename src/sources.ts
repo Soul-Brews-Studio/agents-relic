@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { parseClaude } from "./shapes/claude.js";
 import { parseCodex } from "./shapes/codex.js";
 import { parseOmp } from "./shapes/omp.js";
+import { parseVault } from "./shapes/vault.js";
 import type { Parser } from "./types.js";
 
 const HOME = homedir();
@@ -11,7 +12,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat" | "omp";   // how to find files under `path`
+  walk: "claude-tiers" | "flat" | "omp" | "vault";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -65,6 +66,19 @@ export const BUILTIN: SourceDef[] = [
     note: "omp — one dir per encoded cwd, flat <timestamp>_<id>.jsonl inside",
   },
   {
+    // Oracle vault notes. DISABLED by default: the path is per-oracle, so there is no
+    // correct machine-wide default, and indexing someone's memory vault should be a
+    // deliberate act. Enable per-machine via ~/.relic/sources.json, or one-shot with
+    // `relic index --corpus oracle-vault --source-path <repo>/psi`.
+    //
+    // Measured on one vault before building this: 10,058 .md / 19 MB / 92% carrying
+    // YAML frontmatter / 94% under 4 KB — i.e. small, structured, and worth one row
+    // per note rather than chunking. See src/shapes/vault.ts.
+    key: "oracle-vault", path: join(HOME, ".relic-vault-unset"),
+    walk: "vault", parser: parseVault, enabled: false,
+    note: "Oracle ψ vault markdown — set its path in ~/.relic/sources.json",
+  },
+  {
     key: "omx-logs", path: join(HOME, ".omx-runs"),
     walk: "flat", parser: parseClaude, enabled: false,
     note: "omx run logs — OPS LOGS, not conversation. Opt in only if you want them.",
@@ -99,11 +113,27 @@ export function loadSources(): SourceDef[] {
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
     for (const k of cfg.disable ?? []) { const s = out.find(x => x.key === k); if (s) s.enabled = false; }
     for (const k of cfg.enable ?? []) { const s = out.find(x => x.key === k); if (s) s.enabled = true; }
+    // Let config point a builtin at a real path — the vault's location is per-machine,
+    // so its builtin entry ships with a placeholder and MUST be repointed here.
+    for (const [k, v] of Object.entries(cfg.path ?? {})) {
+      const s = out.find(x => x.key === k);
+      if (s && typeof v === "string") { s.path = v; s.enabled = true; }
+    }
     for (const a of cfg.add ?? []) {
       out.push({
         key: String(a.key), path: String(a.path),
-        walk: a.walk === "claude-tiers" ? "claude-tiers" : "flat",
-        parser: a.shape === "codex" ? parseCodex : parseClaude,
+        // walk and shape are INDEPENDENT knobs and both must be mapped explicitly.
+        // Defaulting shape to parseClaude while accepting walk:"vault" would walk a
+        // vault correctly and then parse every note with the transcript parser — which
+        // yields zero events per file and looks exactly like an empty vault.
+        walk: a.walk === "claude-tiers" ? "claude-tiers"
+            : a.walk === "vault" ? "vault"
+            : a.walk === "omp" ? "omp"
+            : "flat",
+        parser: a.shape === "codex" ? parseCodex
+              : a.shape === "vault" ? parseVault
+              : a.shape === "omp" ? parseOmp
+              : parseClaude,
         enabled: a.enabled !== false,
         note: String(a.note ?? "user-configured"),
       });
