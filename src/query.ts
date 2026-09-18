@@ -369,6 +369,17 @@ export interface ContextLine { seq: number; role: string; text: string; target: 
 export async function readAround(
   path: string, target: number, before = 2, after = 2,
 ): Promise<ContextLine[]> {
+  // A Hermes "file" is <db>#<session_id> — there is nothing to open as a stream.
+  // Without this, every Hermes search result printed a `show` pointer that crashed
+  // with ENOENT, which makes a hit unopenable and the source effectively read-only.
+  if (path.includes(".db#")) {
+    const { parseHermes } = await import("./shapes/hermes.js");
+    const p = await parseHermes(path);
+    return p.events
+      .filter(e => e.seq >= target - before && e.seq <= target + after)
+      .map(e => ({ seq: e.seq, role: e.role, text: e.text, target: e.seq === target }));
+  }
+
   const out: ContextLine[] = [];
   const rl = createInterface({ input: createReadStream(path, "utf8") });
   let seq = 0;

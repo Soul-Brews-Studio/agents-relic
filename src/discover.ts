@@ -2,6 +2,7 @@ import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { loadSources } from "./sources.js";
+import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
 
 // "note" is not a transcript tier — a vault document has no turns. It shares the
@@ -170,6 +171,43 @@ function progressLine(msg: string): void {
   process.stderr.write("\r" + msg.padEnd(72) + "\r");
 }
 
+/**
+ * Hermes: SQLite DBs, one per profile, MANY sessions each.
+ *
+ * Emits one Found per SESSION with a synthetic `<db>#<session_id>` path, because the
+ * Parser contract is one file -> one session and a DB holds many. That keeps the
+ * manifest, uids and `show` working unchanged instead of special-casing a DB source
+ * through the whole pipeline.
+ *
+ * mtime is the session's own last_activity_at, NOT the file's: a live SQLite file's
+ * mtime changes constantly while its rows mostly do not, so keying on the file would
+ * re-import every session on every run.
+ */
+function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  const dbs: string[] = [];
+  const scan = (dir: string, depth: number) => {
+    if (depth > 3) return;
+    for (const f of files(dir, ".db")) if (f === "state.db") dbs.push(join(dir, f));
+    for (const d of dirs(dir)) scan(join(dir, d), depth + 1);
+  };
+  scan(root, 0);
+
+  for (const db of dbs) {
+    for (const s of hermesSessions(db)) {
+      if (sinceMs && s.mtime * 1000 < sinceMs) continue;
+      out.push({
+        path: `${db}#${s.id}`, projectDir: srcKey, tier: "session", source: srcKey,
+        workflowRunId: null, agentId: null,
+        mtime: s.mtime,
+        // Row count stands in for size: it changes exactly when the session gains a
+        // message, which is what the manifest needs to detect.
+        size: s.rows,
+        parser,
+      });
+    }
+  }
+}
+
 export function discover(only: string[] | null, sinceMs: number | null): Found[] {
   const out: Found[] = [];
   const tick = () => {
@@ -180,7 +218,8 @@ export function discover(only: string[] | null, sinceMs: number | null): Found[]
     if (!wanted || !existsSync(src.path)) continue;
     progressLine(`  scanning ${src.key}…`);
     const before = out.length;
-    if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
+    if (src.walk === "hermes") walkHermes(src.path, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
     else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
     else walkClaude(src.path, sinceMs, out, src.key, src.parser);

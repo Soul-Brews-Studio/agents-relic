@@ -108,6 +108,46 @@ for indexing *less*, not faster.
 ---
 
 
+## Sources
+
+Four shapes, one index. Each declares how to find its files and how to parse them.
+
+| source | shape | default |
+|---|---|---|
+| `claude-live` / `claude-archive` | JSONL, 3 tiers (session/subagent/workflow_agent) | on |
+| `codex` | JSONL rollouts, date-nested | on |
+| `omp` | JSONL, one dir per encoded cwd | on |
+| `oracle-vault` | `ψ/**.md` documents | off — path is per-machine |
+| `hermes` | **SQLite**, one DB per profile | off |
+
+### Hermes is SQLite, and that is not the omp mistake
+
+The omp source exists because a prior survey called it "SQLite-only" after measuring
+the directory and reading a filename — the JSONL was sitting right beside the DB.
+Hermes was re-checked against that lesson and the classification holds: its only
+`.jsonl` files are a tool log and a curator ledger, and `sessions/` is a single
+`sessions.json`. There is no per-session JSONL.
+
+**One DB holds many sessions**, which `Parser` does not — it is one file → one session.
+Rather than special-case a DB source through the whole pipeline, the walker emits one
+entry per session with a synthetic path:
+
+```
+/Users/you/.hermes/profiles/<profile>/state.db#<session_id>
+```
+
+Manifest, uids, `show` and `read` all work unchanged. `mtime` is the session's own
+`last_activity_at`, **not** the file's — a live SQLite file's mtime changes constantly
+while its rows mostly do not, so keying on the file would re-import everything every run.
+
+Facets come from the `sessions` row, which carries real `cwd`, `git_branch` and
+`git_repo_root` — so Hermes sessions shard into the correct repo exactly like a
+transcript, with no path guessing.
+
+Noise filtering is declarative here rather than heuristic: `active = 1` and
+`compacted = 0` are exact column predicates, unlike `--skip-noise`, which has to infer
+from text shape.
+
 ## Two front ends: TypeScript (reference) + optional native binary
 
 `bunx` keeps working with **no Rust toolchain and no build step** — the native
