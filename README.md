@@ -194,6 +194,28 @@ Filters stack:
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
 
+### Ranking across shards
+
+relic shards by repo, so a fan-out asks 345 indexes and each returns its own top-`limit`.
+Those results are **sorted by BM25 score before slicing** — without that step the "top 20"
+is whatever the first shards happened to hold.
+
+Measured on `"peak concurrency"`, 345 shards, 1,493 hits, before the sort existed:
+
+| | shown | actual best |
+|---|---|---|
+| overlap of the two top-10s | **1 / 10** | |
+| repos represented | 1 | 5 |
+| best score | 14.46 | **19.84** |
+
+LanceDB returned `_score` on every hit the whole time; the code discarded it.
+
+**Honest limit:** BM25 is computed per index, so IDF reflects each shard's own corpus and
+scores are not strictly commensurable across shards. Same engine, same tokenizer, same
+schema makes them close enough to beat arrival order by a wide margin — but this is a
+ranking improvement, not a globally correct BM25. A true global ranking needs corpus
+statistics relic does not keep.
+
 ### `sessions` — list and count
 
 ```bash

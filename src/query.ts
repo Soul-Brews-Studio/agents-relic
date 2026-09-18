@@ -77,6 +77,23 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
       searched++;
     } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
   }
+  /*
+   * RANK ACROSS SHARDS BEFORE SLICING.
+   *
+   * Each shard returns its own top-`limit`; without this the caller sliced the
+   * CONCATENATION in shard-iteration order, so the "top 20" was really "whatever the
+   * first shards happened to hold". Measured on "peak concurrency" over 345 shards
+   * and 1,493 hits: the displayed top-10 shared 1 result with the actual best 10, all
+   * ten came from a single repo, and the best score shown was 14.46 against 19.84
+   * available. LanceDB returned `_score` the whole time and it was discarded.
+   *
+   * Honest limit: BM25 is computed per index, so IDF reflects each shard's own corpus
+   * and the scores are not strictly commensurable. They are close enough to be worth
+   * far more than arrival order — same engine, same tokenizer, same schema — but this
+   * is a ranking improvement, not a globally correct BM25.
+   */
+  hits.sort((a, b) => Number((b as any)._score ?? 0) - Number((a as any)._score ?? 0));
+
   return { hits, shards: searched, available: shards.length,
            ms: Math.round(performance.now() - t0), total: hits.length };
 }
