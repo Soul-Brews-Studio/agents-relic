@@ -283,6 +283,45 @@ tool, without copying rows. **This writes to that database.** See Interop below.
 
 ---
 
+## MCP — the same lookups, for a model
+
+```bash
+claude mcp add relic -- bun /path/to/agents-relic/src/mcp.ts
+# or, if `relic` is on PATH:
+claude mcp add relic -- relic mcp
+```
+
+Six tools, each one deterministic lookup with named parameters:
+
+| tool | answers |
+|---|---|
+| `relic_status` | what is indexed — **call first**, the repo keys it lists are what `repo` accepts |
+| `relic_search` | full-text over transcripts; returns `file` + `seq` pointers |
+| `relic_sessions` | what was I working on, over a time range |
+| `relic_session` | one id → every transcript in its tree (seeks and imports on a miss) |
+| `relic_chain` | what ran in parallel inside that session |
+| `relic_show` | the conversation around one hit, read from the source `.jsonl` |
+
+**Why this exists: a model should not improvise a query.** Without tools, "find session
+1f3db67f" becomes a guessed `find` or a `grep -r` over 25k transcripts — slow, often
+wrong, and a different command every time. These name the lookup instead.
+
+**Both front ends call `src/query.ts`.** The CLI renders those results for a human, MCP
+serialises them for a model; neither reimplements a query. A second copy drifts, and the
+copy a model gets is the one no human ever runs by hand.
+
+Two behaviours worth knowing:
+
+- **`repo` is not cosmetic.** Measured on this index: `repo=neo-oracle` is **329 ms over
+  1 shard**; the same query unfiltered is **10.7 s over 345**. Every tool description that
+  takes `repo` says so, so the model narrows by default.
+- **MCP queries land in the same trace log** as CLI ones. Otherwise `relic trace`'s
+  "which shards ever answer anything" question silently loses every query a model made —
+  which, once an agent is using this, is most of them.
+
+Environment: `RELIC_DATA_ROOT` to point at another index, `RELIC_IN_REPO=1` for in-repo
+shards. Both match the CLI flags.
+
 ## Output modes
 
 Every command takes `--plain`, `--json`, or `--jsonl` (or `--format X`):

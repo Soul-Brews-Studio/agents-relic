@@ -5,25 +5,29 @@
   "description": "Per-repo LanceDB index of AI coding-agent session transcripts (Claude Code + Codex). Keyword search, no embeddings.",
   "bin": {
     "relic": "src/cli.ts",
-    "agents-relic": "src/cli.ts"
+    "agents-relic": "src/cli.ts",
+    "relic-mcp": "src/mcp.ts"
   },
   "scripts": {
     "index": "bun src/cli.ts index",
     "search": "bun src/cli.ts search",
-    "status": "bun src/cli.ts status"
+    "status": "bun src/cli.ts status",
+    "mcp": "bun src/mcp.ts"
   },
   "dependencies": {
     "@lancedb/lancedb": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "apache-arrow": "18.1.0"
   },
   "keywords": [
     "claude-code",
     "codex",
-    "lancedb",
     "jsonl",
-    "session",
+    "lancedb",
+    "mcp",
+    "oracle",
     "search",
-    "oracle"
+    "session"
   ],
   "license": "MIT"
 }

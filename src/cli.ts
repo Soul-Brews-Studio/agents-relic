@@ -1,15 +1,15 @@
 #!/usr/bin/env bun
-import { createReadStream, existsSync, readdirSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
-import { seekOnDisk } from "./seek.js";
-import { buildChain, renderChain, type ChainRow } from "./chain.js";
-import { repoKeyOf, contextOf, cwdOfFile, shardDirFor, ghqRoot, defaultRoot, guardShardDir, listShards } from "./repo.js";
+import { renderChain } from "./chain.js";
+import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
+import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO } from "./query.js";
+import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
   const f: Record<string, string | boolean> = {};
@@ -39,26 +39,6 @@ function outFmt(f: Record<string, string | boolean>): Fmt {
   if (f.plain) return "plain";
   const v = String(f.format ?? "");
   return v === "json" || v === "jsonl" || v === "plain" ? v : "pretty";
-}
-const nowISO = () => new Date().toISOString();
-
-/** One store per repo, opened on first write. */
-class Shards {
-  private pool = new Map<string, LanceStore>();
-  constructor(private dataRoot: string | null, private inRepo = false) {}
-  async get(repoKey: string | null): Promise<LanceStore> {
-    const key = repoKey ?? "_unresolved";
-    let s = this.pool.get(key);
-    if (!s) {
-      const dir = shardDirFor(repoKey, this.dataRoot, this.inRepo);
-      guardShardDir(dir);
-      s = await LanceStore.open(dir);
-      this.pool.set(key, s);
-    }
-    return s;
-  }
-  get size() { return this.pool.size; }
-  keys() { return [...this.pool.keys()]; }
 }
 
 // ---- index -----------------------------------------------------------------
@@ -124,22 +104,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const limit = Number(f.limit ?? 20);
-  // --since accepts 7d / 12h / 30m / 2026-09-01; --until the same. Both normalise to
-  // an ISO prefix so they compare against the stored ts directly.
-  const toISO = (v: unknown, endOfDay = false): string | undefined => {
-    if (!v) return undefined;
-    const raw = String(v);
-    const rel = parseSince(raw);
-    if (rel && /^\d+[mhd]$/.test(raw)) return new Date(rel).toISOString();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw + (endOfDay ? "T23:59:59Z" : "T00:00:00Z");
-    return raw;
-  };
-  const sinceISO = toISO(f.since);
-  const untilISO = toISO(f.until, true);
+  const scope = { dataRoot, inRepo: Boolean(f["in-repo"]), repo: f.repo ? String(f.repo) : undefined };
 
-  let shards = listShards(dataRoot, Boolean(f["in-repo"]));
-  if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
-  if (!shards.length) {
+  if (!pickShards(scope).length) {
     const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
     console.log(`no shards found in  ${where}\n`);
     console.log(`  index one first:   relic index --since 7d${dataRoot ? ` --data-root ${dataRoot}` : ""}`);
@@ -147,27 +114,18 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     return;
   }
 
-  const hits: (EventRow & { repo: string })[] = [];
-  let searched = 0;
-  const t0 = performance.now();
-  for (const s of shards) {
-    try {
-      const store = await LanceStore.open(s.dir);
-      for (const h of await store.search(q, { limit, tier: f.tier as string, source: f.source as string,
-        worktree: f.worktree as string, path: f.path as string, since: sinceISO, until: untilISO,
-        role: f.role as string, prose: Boolean(f.prose) }))
-        hits.push({ ...h, repo: s.key });
-      searched++;
-    } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
-  }
-  const ms = performance.now() - t0;
+  const { hits, shards: searched, ms } = await searchEvents(q, {
+    ...scope, limit,
+    tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
+    path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
+    since: f.since as string, until: f.until as string,
+  });
 
   const filters: Record<string, string> = {};
   for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
   trace({
     ts: new Date().toISOString(), q, chars: [...q].length, filters,
-    shards: searched, hits: hits.length, ms: Math.round(ms),
-    top_repo: hits[0]?.repo ?? "", fts: true,
+    shards: searched, hits: hits.length, ms, top_repo: hits[0]?.repo ?? "", fts: true,
   }, dataRoot);
 
   const top = hits.slice(0, limit);
@@ -188,8 +146,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     return;
   }
 
-  if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms.toFixed(0)} ms)`); return; }
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms.toFixed(0)} ms\n`);
+  if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`); return; }
+  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms\n`);
   for (const h of hits.slice(0, limit)) {
     const i = h.text.toLowerCase().indexOf(q.toLowerCase());
     const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
@@ -211,146 +169,16 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
     opened: path,
   }, (f["data-root"] as string) ?? null);
 
-  const target = Number(f.seq ?? 1), before = Number(f.before ?? 2), after = Number(f.after ?? 2);
-  const rl = createInterface({ input: createReadStream(path, "utf8") });
-  let seq = 0;
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    seq++;
-    if (seq < target - before) continue;
-    if (seq > target + after) break;
-    let role = "?", text = line.slice(0, 400);
-    try {
-      const rec = JSON.parse(line);
-      role = rec.message?.role ?? rec.type ?? "?";
-      const c = rec.message?.content ?? rec.payload?.content ?? rec.content;
-      text = typeof c === "string" ? c : JSON.stringify(c ?? rec).slice(0, 600);
-    } catch {}
-    console.log(`${seq === target ? ">>" : "  "} #${seq} ${role}: ${String(text).replace(/\s+/g, " ").slice(0, 300)}`);
-  }
+  for (const l of await readAround(path, Number(f.seq ?? 1), Number(f.before ?? 2), Number(f.after ?? 2)))
+    console.log(`${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ${l.text.replace(/\s+/g, " ").slice(0, 300)}`);
 }
-
-
-export interface ImportOpts {
-  dataRoot: string | null; inRepo: boolean; skipNoise?: boolean;
-  repoFilter?: string | null; verbose?: boolean; progress?: boolean;
-}
-export interface ImportTally {
-  added: number; skipped: number; failed: number; filtered: number;
-  skippedNoise: number; done: number; imported: number; shards: Shards;
-}
-
-/**
- * Import a list of files. Shared by `index` and by `session`'s seek-then-index path,
- * so an on-demand import of one file behaves identically to a bulk run — same skip
- * rules, same noise filter, same manifest write.
- */
-async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()): Promise<ImportTally> {
-  const shards = new Shards(o.dataRoot, o.inRepo);
-  const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
-  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0;
-
-  for (const file of found) {
-    try {
-      const p = await file.parser(file.path);
-      const repoKey = repoKeyOf(p.cwd);
-      if (o.repoFilter && !(repoKey ?? "").includes(o.repoFilter)) { filtered++; continue; }
-
-      const shardKey = repoKey ?? "_unresolved";
-      const ctx = contextOf(p.cwd);
-      const store = await shards.get(repoKey);
-
-      if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
-      const man = manifests.get(shardKey)!;
-      const seen = man.get(file.path);
-      if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
-
-      const dropped: any[] = [];
-      const kept = o.skipNoise
-        ? p.events.filter(e => {
-            const v = classify(e.text, e.role);
-            if (v.skip) dropped.push({ uid: e.uid, file_path: file.path, seq: e.seq, role: e.role,
-              rule: v.rule, bytes: e.text.length, head: e.text.replace(/\s+/g, " ").slice(0, 120) });
-            return !v.skip;
-          })
-        : p.events;
-      skippedNoise += dropped.length;
-      if (dropped.length) logSkipped(dropped, o.dataRoot);
-
-      const events: EventRow[] = kept.map(e => ({
-        uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
-        seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
-        source: file.source, tier: file.tier,
-        worktree: ctx.worktree, cwd: p.cwd ?? "",
-      }));
-
-      if (seen) await store.deleteEventsOf(file.path);
-      await store.putEvents(events);
-      await store.putSession({
-        session_uuid: p.sessionUuid, file_path: file.path, repo_key: shardKey,
-        project_dir: file.projectDir, tier: file.tier, source: file.source,
-        cwd: p.cwd ?? "", model: p.model ?? "", worktree: ctx.worktree,
-        workflow_run_id: file.workflowRunId ?? "", agent_id: file.agentId ?? "",
-        file_mtime: file.mtime, file_size: file.size,
-        line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
-        started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
-        description: p.description ?? "", imported_at: nowISO(),
-      });
-      await store.putFile({ file_path: file.path, repo_key: shardKey, mtime: file.mtime, size: file.size, imported_at: nowISO() });
-      man.set(file.path, { mtime: file.mtime, size: file.size });
-      added += events.length;
-      imported++;
-    } catch (err) {
-      failed++;
-      if (o.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
-    }
-    if (o.progress && ++done % 100 === 0) {
-      const pct = Math.round((done / found.length) * 100);
-      const rate = done / ((Date.now() - t0) / 1000);
-      const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
-      process.stderr.write(
-        `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} files` +
-        `  ${fmt(added)} events  ${shards.size} shards` +
-        `  ${rate.toFixed(0)}/s  eta ${eta}s   `);
-    } else if (!o.progress) done++;
-  }
-  if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
-
-  for (const key of shards.keys()) {
-    try { await (await shards.get(key === "_unresolved" ? null : key)).ensureFtsIndex(); } catch {}
-  }
-  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards };
-}
-
 // ---- session (resolve one id) ----
-async function lookup(id: string, dataRoot: string | null, inRepo: boolean) {
-  const rows: (SessionRow & { repo: string })[] = [];
-  for (const sh of listShards(dataRoot, inRepo)) {
-    try {
-      const store = await LanceStore.open(sh.dir);
-      for (const r of await store.findSession(id)) rows.push({ ...r, repo: sh.key });
-    } catch { /* skip unreadable shard */ }
-  }
-  return rows;
-}
-
 async function cmdSession(id: string, f: Record<string, string | boolean>) {
-  const dataRoot = (f["data-root"] as string) ?? null;
-  const inRepo = Boolean(f["in-repo"]);
-  let rows = await lookup(id, dataRoot, inRepo);
-
-  // SEEK -> INDEX -> ANSWER. A session id maps to a filename, so a miss in the index
-  // is not an answer — it just means this file has not been imported yet. Locating it
-  // on disk is deterministic, and importing one file is fast, so do both rather than
-  // telling the caller to go run something.
-  if (!rows.length && !f["no-index"]) {
-    const found = seekOnDisk(id);
-    if (found.length) {
-      process.stderr.write(`not indexed — found ${found.length} file(s) on disk, importing…\n`);
-      await importFiles(found, { dataRoot, inRepo, skipNoise: Boolean(f['skip-noise']) });
-      rows = await lookup(id, dataRoot, inRepo);
-    }
-  }
+  const { rows, imported } = await resolveSession(id, {
+    dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+    noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
+  });
+  if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
 
   const mode = outFmt(f);
   if (mode === "json")  { console.log(JSON.stringify({ query: id, matches: rows.length, sessions: rows }, null, 2)); return; }
@@ -377,48 +205,31 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
 
 // ---- sessions ----
 async function cmdSessions(f: Record<string, string | boolean>) {
-  const dataRoot = (f["data-root"] as string) ?? null;
-  const toISO = (v: unknown, end = false): string | undefined => {
-    if (!v) return undefined;
-    const raw = String(v);
-    const rel = parseSince(raw);
-    if (rel && /^\d+[mhd]$/.test(raw)) return new Date(rel).toISOString();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw + (end ? "T23:59:59Z" : "T00:00:00Z");
-    return raw;
-  };
-  const since = toISO(f.since), until = toISO(f.until, true);
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined };
+  if (!pickShards(scope).length) { console.log("no shards match"); return; }
 
-  let shards = listShards(dataRoot, Boolean(f["in-repo"]));
-  if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
-  if (!shards.length) { console.log("no shards match"); return; }
-
-  const rows: (SessionRow & { repo: string })[] = [];
-  for (const sh of shards) {
-    try {
-      const store = await LanceStore.open(sh.dir);
-      for (const r of await store.sessions({ since, until, worktree: f.worktree as string }))
-        rows.push({ ...r, repo: sh.key });
-    } catch { /* skip unreadable shard */ }
-  }
-  rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
-  const limit = Number(f.limit ?? 40);
-  const top = rows.slice(0, limit);
+  const { rows: top, total, events, shards } = await listSessions({
+    ...scope, limit: Number(f.limit ?? 40),
+    since: f.since as string, until: f.until as string, worktree: f.worktree as string,
+  });
+  void shards;
+  const since = toISO(f.since);
 
   const mode = outFmt(f);
-  if (mode === "json")  { console.log(JSON.stringify({ total: rows.length, sessions: top }, null, 2)); return; }
+  if (mode === "json")  { console.log(JSON.stringify({ total, sessions: top }, null, 2)); return; }
   if (mode === "jsonl") { for (const r of top) console.log(JSON.stringify(r)); return; }
   if (mode === "plain") { for (const r of top) console.log([r.session_uuid, r.started_at, r.repo, r.worktree, r.event_count].join("\t")); return; }
 
-  if (f.count) { console.log(`${rows.length} sessions`); return; }
-  const events = rows.reduce((a, r) => a + Number(r.event_count ?? 0), 0);
-  console.log(`${fmt(rows.length)} sessions · ${fmt(events)} events` +
+  if (f.count) { console.log(`${total} sessions`); return; }
+  console.log(`${fmt(total)} sessions · ${fmt(events)} events` +
     (since ? ` · since ${since.slice(0, 16)}` : "") + (f.repo ? ` · repo~${f.repo}` : "") + "\n");
   for (const r of top) {
     const wt = r.worktree ? `  [${r.worktree}]` : "";
     console.log(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
     if (r.description) console.log(`    ${r.description.replace(/\s+/g, " ").slice(0, 96)}`);
   }
-  if (rows.length > top.length) console.log(`\n... and ${rows.length - top.length} more (--limit N)`);
+  if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }
 
 // ---- status ----------------------------------------------------------------
@@ -477,6 +288,7 @@ if (!cmd || f.help) {
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix>          resolve a session id to its transcript file(s)
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
+  mcp                          run the MCP server on stdio (same lookups, for a model)
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -573,23 +385,14 @@ else if (cmd === "trace") {
 }
 else if (cmd === "chain") {
   if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
-  const dataRoot = (f["data-root"] as string) ?? null;
-  const inRepo = Boolean(f["in-repo"]);
-  let rows = await lookup(pos[1], dataRoot, inRepo) as ChainRow[];
-  if (!rows.length && !f["no-index"]) {
-    const found = seekOnDisk(pos[1]);
-    if (found.length) {
-      process.stderr.write(`not indexed — found ${found.length} file(s) on disk, importing…\n`);
-      await importFiles(found, { dataRoot, inRepo, skipNoise: Boolean(f["skip-noise"]) });
-      rows = await lookup(pos[1], dataRoot, inRepo) as ChainRow[];
-    }
-  }
-  if (!rows.length) { console.log(`no session matches ${pos[1]}`); }
-  else {
-    const c = buildChain(pos[1], rows);
-    if (outFmt(f) === "json") console.log(JSON.stringify(c, null, 2));
-    else console.log(renderChain(c, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
-  }
+  const { chain, imported } = await chainOf(pos[1], {
+    dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+    noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
+  });
+  if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
+  if (!chain) console.log(`no session matches ${pos[1]}`);
+  else if (outFmt(f) === "json") console.log(JSON.stringify(chain, null, 2));
+  else console.log(renderChain(chain, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);
@@ -610,6 +413,17 @@ else if (cmd === "skipped") {
       console.log(`            ${x.file_path.split("/").pop()} --seq ${x.seq}`);
     }
   }
+}
+else if (cmd === "mcp") {
+  // exec rather than import: the server owns stdin/stdout for its whole lifetime.
+  const { spawn } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  // fileURLToPath, NOT url.pathname — pathname is percent-encoded, so a repo living
+  // under a non-ASCII directory (this one sits below `ψ/`) resolves to a %CF%88 path
+  // that does not exist. It fails only on the machines that have such a path.
+  const here = fileURLToPath(new URL("./mcp.ts", import.meta.url));
+  spawn(process.execPath, [here, ...process.argv.slice(3)], { stdio: "inherit" })
+    .on("exit", c => process.exit(c ?? 0));
 }
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
