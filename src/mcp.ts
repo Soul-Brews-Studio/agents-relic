@@ -7,6 +7,7 @@ import {
   statsOf, neighbours, nameOf,
 } from "./query.js";
 import { renderChain } from "./chain.js";
+import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { trace } from "./trace.js";
 
@@ -292,7 +293,7 @@ async function run(name: string, a: any): Promise<string> {
     if (!total) return "no sessions match those filters";
     const L = [`${fmt(total)} sessions · ${fmt(events)} events`, ""];
     for (const r of rows) {
-      L.push(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
+      L.push(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
              `${String(r.event_count).padStart(6)} ev  ${r.repo}${r.worktree ? ` [${r.worktree}]` : ""}`);
       L.push(`    ${oneLine(nameOf(r), 110)}`);
     }
@@ -313,7 +314,7 @@ async function run(name: string, a: any): Promise<string> {
     if (matchedBy === "name" && uuids.size > 1) {
       const L = [`${uuids.size} sessions named like "${a.id}" — call again with one id:`, ""];
       for (const r of rows)
-        L.push(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid}  ` +
+        L.push(`${localDateTime(r.started_at)}  ${r.session_uuid}  ` +
                `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}`);
       return L.join("\n");
     }
@@ -324,7 +325,7 @@ async function run(name: string, a: any): Promise<string> {
       nameOf(parent),
       `${parent.session_uuid} · matched by ${matchedBy}${imported ? ` · ${imported} imported on demand` : ""}`,
       `${st.repo}${st.worktree ? ` [${st.worktree}]` : ""}${st.model ? ` · ${st.model}` : ""}`,
-      `${String(st.startedAt).slice(0, 16)} → ${String(st.endedAt).slice(0, 16)} · ` +
+      `${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)} · ` +
       `${fmt(st.transcripts)} transcripts · ${fmt(st.events)} events` +
       (st.runs ? ` · ${st.runs} workflow runs` : ""),
       `  ${st.tiers.map(t => `${t.tier} ${t.n}`).join(" · ")}`,
@@ -335,7 +336,7 @@ async function run(name: string, a: any): Promise<string> {
       if (nb.before.length || nb.after.length) {
         L.push("", "same worktree, either side:");
         const row = (r: typeof parent, m: string) =>
-          L.push(`${m} ${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
+          L.push(`${m} ${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
                  `${String(r.event_count).padStart(6)} ev  ${oneLine(nameOf(r), 60)}`);
         for (const r of nb.before) row(r, "  ");
         row(parent, ">>");
@@ -351,7 +352,7 @@ async function run(name: string, a: any): Promise<string> {
     for (const r of rows.slice(0, limit)) {
       const path = r.file_path === parent.file_path ? parent.file_path
                  : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path;
-      L.push(`  ${String(r.started_at).slice(11, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${path}`);
+      L.push(`  ${localTime(r.started_at)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${path}`);
     }
     if (rows.length > limit) L.push(`  ... and ${rows.length - limit} more (raise limit)`);
     if (rows.length > 1) L.push("", `relic_chain id=${parent.session_uuid.slice(0, 8)} — the same tree on a time axis`);

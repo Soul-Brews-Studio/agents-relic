@@ -1,4 +1,4 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { parseSince } from "./discover.js";
@@ -391,4 +391,24 @@ export function nameOf(r: SessionRow): string {
        .replace(/<[^>]{1,40}>/g, " ")
        .replace(/\s+/g, " ").trim();
   return d ? d.slice(0, 70) : "(untitled)";
+}
+
+
+/**
+ * How far the index has fallen behind the file it points at.
+ *
+ * relic stores a POINTER, not an archive, so a live session keeps growing after it was
+ * imported — that is by design. It only becomes a trap when two commands are compared:
+ * `dig` reads the file and `session` reads the index, so they report different end
+ * times for the same session and the difference looks like a timezone bug. Measured
+ * here: index ended 09:27Z, file had reached 10:28Z, exactly one hour of drift.
+ *
+ * Returns null when the file is gone or the index is current.
+ */
+export function staleness(row: SessionRow): { behindSec: number; fileMtimeMs: number } | null {
+  try {
+    const st = statSync(row.file_path);
+    const behind = Math.round((st.mtimeMs - Number(row.file_mtime ?? 0) * 1000) / 1000);
+    return behind > 60 ? { behindSec: behind, fileMtimeMs: st.mtimeMs } : null;
+  } catch { return null; }
 }

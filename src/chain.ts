@@ -1,4 +1,5 @@
 import type { SessionRow } from "./store/lance.js";
+import { localTime, localDate, zoneOffset } from "./time.js";
 
 /**
  * A session and everything it spawned, on one time axis.
@@ -89,8 +90,10 @@ export function buildChain(id: string, all: ChainRow[]): Chain {
   return { id, total: rows.length, startMs, endMs, groups: out, wallMs: endMs - startMs, workMs };
 }
 
-const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16);
-const dayOf = (t: number) => new Date(t).toISOString().slice(0, 10);
+// Local, not UTC. The axis of `chain` and the axis of `now` describe the same clock;
+// when one was ISO-sliced and the other toTimeString'd they disagreed by the offset.
+const hhmm = (t: number) => localTime(t);
+const dayOf = (t: number) => localDate(t);
 
 function dur(msv: number): string {
   const s = Math.round(msv / 1000);
@@ -117,7 +120,7 @@ export function renderChain(c: Chain, opts: { width?: number; maxRows?: number }
   const multiDay = dayOf(c.startMs) !== dayOf(c.endMs);
 
   L.push(`${c.id} · ${c.total} transcripts · ${dayOf(c.startMs)} ${hhmm(c.startMs)} → ` +
-         `${multiDay ? dayOf(c.endMs) + " " : ""}${hhmm(c.endMs)}`);
+         `${multiDay ? dayOf(c.endMs) + " " : ""}${hhmm(c.endMs)}  (UTC${zoneOffset()})`);
   // work > wall is the whole point: it only happens when things ran at the same time.
   L.push(`wall ${dur(c.wallMs)} · agent-time ${dur(c.workMs)} · ` +
          `${(c.workMs / Math.max(1, c.wallMs)).toFixed(1)}x parallel`);

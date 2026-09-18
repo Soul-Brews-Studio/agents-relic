@@ -7,11 +7,12 @@ import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
+import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
-         statsOf, neighbours, nameOf } from "./query.js";
+         statsOf, neighbours, nameOf, staleness } from "./query.js";
 import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -54,7 +55,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 
   const t0 = Date.now();
   const mode = [only ? only.join("+") : "all enabled sources",
-                sinceMs ? `since ${new Date(sinceMs).toISOString().slice(0, 16)}` : "full history",
+                sinceMs ? `since ${localDateTime(sinceMs)}` : "full history",
                 f.repo ? `repo~${f.repo}` : null,
                 f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
   console.log(`\u{1F3FA} relic indexing  (${mode})`);
@@ -203,7 +204,7 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
     if (mode === "json") { console.log(JSON.stringify({ query: id, matchedBy, matches: uuids.size, sessions: rows }, null, 2)); return; }
     console.log(`${uuids.size} sessions named like "${id}"\n`);
     for (const r of rows)
-      console.log(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ` +
+      console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
                   `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}`);
     console.log(`\npick one:  relic session <id>`);
     return;
@@ -222,17 +223,22 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   const wt = st.worktree ? ` [${st.worktree}]` : "";
   console.log(`${nameOf(parent)}\n`);
   console.log(`${parent.session_uuid}  ·  matched by ${matchedBy}  ·  ${st.repo.replace("github.com/", "")}${wt}`);
-  console.log(`${String(st.startedAt).slice(0, 16).replace("T", " ")} → ${String(st.endedAt).slice(0, 16).replace("T", " ")}` +
+  console.log(`${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)}` +
               `  ·  ${fmt(st.transcripts)} transcript${st.transcripts === 1 ? "" : "s"}  ·  ${fmt(st.events)} ev` +
-              (st.runs ? `  ·  ${st.runs} workflow run${st.runs === 1 ? "" : "s"}` : ""));
+              (st.runs ? `  ·  ${st.runs} workflow run${st.runs === 1 ? "" : "s"}` : "") + `  ·  UTC${zoneOffset()}`);
   console.log(`  ${st.tiers.map(t => `${t.tier} ${t.n}`).join(" · ")}${st.model ? `  ·  ${st.model}` : ""}`);
+  // Say it rather than let the reader discover it by diffing two commands.
+  const stale = staleness(parent);
+  if (stale)
+    console.log(`  (!) index is ${humanAge(stale.behindSec)} behind this file — it has grown since import.` +
+                `  reindex: relic index --since 1d --repo ${st.repo.split("/").pop()}`);
 
   // The neighbourhood. A session is a stretch of a longer thread of work, and the
   // question right after "which session was that" is "what came before it".
   if (nb.before.length || nb.after.length) {
     console.log(`\nsame worktree, either side:`);
     const line = (r: typeof parent, mark: string) =>
-      console.log(`${mark} ${String(r.started_at).slice(0, 16).replace("T", " ")}  ${r.session_uuid.slice(0, 8)}  ` +
+      console.log(`${mark} ${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
                   `${String(r.event_count).padStart(6)} ev  ${nameOf(r).slice(0, 56)}`);
     for (const r of nb.before) line(r, "  ");
     line(parent, ">>");
@@ -248,7 +254,7 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   for (const r of rows.slice(0, limit)) {
     const p = r.file_path === parent.file_path ? parent.file_path
             : r.file_path.startsWith(base) ? r.file_path.slice(base.length) : r.file_path;
-    console.log(`  ${String(r.started_at).slice(11, 16)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${p}`);
+    console.log(`  ${localTime(r.started_at)}  ${r.tier.padEnd(14)} ${String(r.event_count).padStart(6)} ev  ${p}`);
   }
   if (rows.length > limit) console.log(`  ... and ${rows.length - limit} more (--limit N, or --plain for full paths)`);
   if (rows.length > 1) console.log(`\nrelic chain ${parent.session_uuid.slice(0, 8)}  — the same tree on a time axis`);
@@ -275,11 +281,11 @@ async function cmdSessions(f: Record<string, string | boolean>) {
 
   if (f.count) { console.log(`${total} sessions`); return; }
   console.log(`${fmt(total)} sessions · ${fmt(transcripts)} transcripts · ${fmt(events)} events` +
-    (since ? ` · since ${since.slice(0, 16)}` : "") + (f.repo ? ` · repo~${f.repo}` : "") + "\n");
+    (since ? ` · since ${localDateTime(since)}` : "") + (f.repo ? ` · repo~${f.repo}` : "") + ` · times UTC${zoneOffset()}` + "\n");
   for (const r of top) {
     const wt = r.worktree ? `  [${r.worktree}]` : "";
     const kids = r.children ? ` +${r.children}` : "";
-    console.log(`${String(r.started_at).slice(0, 16).replace("T", " ")}  ${r.session_uuid.slice(0, 8)}${kids.padEnd(5)}  ${String(r.treeEvents).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
+    console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}${kids.padEnd(5)}  ${String(r.treeEvents).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
     console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}`);
   }
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
@@ -390,7 +396,7 @@ async function cmdNow(f: Record<string, string | boolean>) {
   console.log(`\nlast ${mins}m  |${sparkline(b.counts)}|  ${active}/40 buckets active` +
               ` (${b.perBucketMin.toFixed(1)}m each)`);
   console.log(`         ${new Date(b.startMs).toTimeString().slice(0, 5)}` +
-              `${" ".repeat(34)}${new Date(b.endMs).toTimeString().slice(0, 5)}`);
+              `${" ".repeat(34)}${localTime(b.endMs)}`);
 }
 
 // ---- main ------------------------------------------------------------------
@@ -410,7 +416,7 @@ if (!cmd || f.help) {
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
-  dig [N] [--deep]             session timeline as JSON — dig.py contract, all 3 tiers
+  dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -544,6 +550,8 @@ else if (cmd === "dig") {
     projectDirs: env.length ? env : defaultProjectDirs(),
     count: Number(pos[1] ?? f.limit ?? 10),
     deep: Boolean(f.deep || f.subagents),
+    dataRoot: (f["data-root"] as string) ?? null,
+    noCache: Boolean(f["no-cache"]),
   });
   console.log(JSON.stringify(rows, null, 2));
 }

@@ -248,6 +248,24 @@ Three measured causes:
 Deep mode adds two fields the Python has no equivalent for: `tier` (which of the three,
 not a yes/no `isSubagent`) and `workflowRunId`, which groups a fan-out back together.
 
+**Cached, because history does not change.** A finished transcript never changes, so it
+is parsed once. The key is `(path, mtime, size)` — the same import-diff identity the
+index uses, no content hashing (hashing 56 MB to avoid parsing 56 MB saves nothing).
+
+| `relic dig 1000 --deep` | time | cache |
+|---|---|---|
+| cold, empty cache | 6.79 s | 0 / 1000 |
+| warm | **0.63 s** | **999 hits, 1 miss** |
+
+The one miss is the session still being written — invalidation working, not a gap. The
+cache holds 1000 entries in 0.6 MB at `~/.relic/dig-cache.json`, written atomically
+(write-then-rename: two overlapping digs must not leave a half-written file that still
+parses as JSON). `--no-cache` bypasses it.
+
+Enumeration is the floor and is never cached: 37,496 candidates across 1,527 project
+directories cost **0.82 s** of `readdir` + `stat`, and that walk is what *detects* the
+change, so skipping it would be skipping correctness.
+
 What this deliberately keeps: the scan is over **files, not the index**. `dig` answers
 "what happened recently" across whatever is on disk, including transcripts nothing has
 imported yet, and routing it through the index would narrow that.
@@ -256,6 +274,28 @@ Every path is checked before it is stat'd. Archived roots are full of symlinks i
 live root which dangle once a session is pruned there; dig.py records an incident where
 one bad link aborted a scan of 38,764 files and emitted zero sessions — reading as "no
 history". The same thing broke a probe written while building this.
+
+### Times are local, everywhere
+
+Transcripts store `timestamp` as ISO-8601 UTC and relic stores that string **verbatim** —
+a stored local time is a stored lie the moment it crosses a machine. But display was
+slicing the ISO in some commands and converting in others, so `relic session` reported
+the same session starting at `10:06` while `relic dig` said `17:06`. Same index, same
+session, 7 hours apart, neither labelled.
+
+One formatter (`src/time.ts`) now feeds every human-facing line, and the offset is named
+in the header (`UTC+07`). Machine output — `--json`, `--jsonl`, `--plain` — keeps the raw
+ISO untouched, because that is what gets diffed.
+
+`relic session` also reports when the **index is behind the file**:
+
+```
+(!) index is 61m behind this file — it has grown since import.
+```
+
+relic stores a pointer, not an archive, so a live session keeps growing after import.
+That is by design, and it only becomes a trap when two commands are compared and the
+difference is mistaken for a timezone bug — which is exactly how it was found.
 
 ### `now` — what is running, and which session am I in
 
