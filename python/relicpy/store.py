@@ -188,7 +188,19 @@ class LanceStore:
         for idx in t.list_indices():
             if idx.index_type == "FTS":
                 return
-        # ICU, not ngram: real Thai word segmentation, and 2-character queries work.
-        # stem off — "indexing" must not collapse into "index".
-        t.create_fts_index("text", use_tantivy=False, base_tokenizer="simple",
-                           language="English", stem=False, remove_stop_words=False)
+        # EVERY ONE OF THESE MATCHES src/store/lance.ts, and each has a reason.
+        #
+        # base_tokenizer="icu" — real Thai word segmentation. Thai has no spaces, and
+        # `simple` splits on whitespace, so a whole Thai sentence becomes ONE token and
+        # nothing inside it is findable. I shipped `simple` here first: measured on one
+        # Thai sentence, the index could find 1 of 12 substrings against ICU's 11.
+        # ngram(3) is the other option and it MISSES 2-character queries entirely.
+        #
+        # stem=False — this is a CODE corpus and the English stemmer mangles
+        # identifiers: structured_output_mode -> structured_output_mod. The cost is
+        # that `sessions` no longer matches `session`, which is the right trade when a
+        # 3,000-event sample holds 354 distinct identifiers over 21 characters.
+        #
+        # max_token_length=128 — long identifiers and 64-char hashes survive whole.
+        t.create_fts_index("text", use_tantivy=False, base_tokenizer="icu",
+                           stem=False, remove_stop_words=False, max_token_length=128)
