@@ -7,6 +7,7 @@ import {
   statsOf, neighbours, nameOf,
 } from "./query.js";
 import { renderChain } from "./chain.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { trace } from "./trace.js";
 
 /**
@@ -151,6 +152,29 @@ const TOOLS = [
     },
   },
   {
+    name: "relic_now",
+    description:
+      "What is running RIGHT NOW. With no arguments: identifies the CURRENT session for " +
+      "the working directory and lists its live agents plus an activity timeline. " +
+      "With all=true: every session written to recently across this machine, newest " +
+      "first — the 'which agents are alive' question. " +
+      "Answered from file mtime, NOT the index: a transcript being appended to right now " +
+      "cannot be in an index that already ran, so this is the only tool here that is " +
+      "current to the second. Use it to learn your own session id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        all: { type: "boolean" as const, description:
+          "List every recently-active session on the machine instead of just this one." },
+        cwd: str("Directory to resolve the session for (default: the server's cwd). " +
+                 "Walks up to the nearest directory an agent was started in."),
+        window: num("Seconds a write must be within to count as live (default 300)."),
+        minutes: num("Span of the activity timeline (default 60)."),
+        limit: num("Max rows (default 15)."),
+      },
+    },
+  },
+  {
     name: "relic_status",
     description:
       "What is indexed: one row per repo with session and event counts, biggest first. " +
@@ -168,6 +192,53 @@ const oneLine = (s: string, n: number) => s.replace(/\s+/g, " ").trim().slice(0,
 
 async function run(name: string, a: any): Promise<string> {
   const scope = scopeOf(a);
+
+  if (name === "relic_now") {
+    const windowSec = Number(a?.window ?? 300);
+
+    if (a?.all) {
+      const live = await liveSessions(windowSec, Number(a?.limit ?? 20));
+      if (!live.length) return `nothing written in the last ${humanAge(windowSec)}`;
+      const L = [`${live.length} session(s) active in the last ${humanAge(windowSec)}`, ""];
+      for (const x of live) {
+        L.push(`${humanAge(x.ageSec).padStart(5)} ago  ${x.sessionUuid}  ` +
+               `${x.agents} live agent(s)  ${x.title ?? "(untitled)"}`);
+        L.push(`            ${x.cwd ?? x.projectDir}`);
+      }
+      return L.join("\n");
+    }
+
+    const cur = await currentSession(a?.cwd ? String(a.cwd) : undefined);
+    if (!cur) return `no session transcript for ${a?.cwd ?? "the current directory"}\n` +
+                     `call again with all=true to see every active session`;
+
+    const all = treeFiles(cur.projectDir, cur.sessionUuid);
+    const agents = all.filter(x => x.tier !== "session" && x.ageSec <= windowSec);
+    const L = [
+      cur.title ?? "(untitled)",
+      `${cur.sessionUuid} · last write ${humanAge(cur.ageSec)} ago`,
+      cur.cwd,
+    ];
+    // The encoding maps both "/" and "." to "-", so two checkouts can share a project
+    // directory. Report the doubt instead of presenting a guess as a fact.
+    if (!cur.confident) L.push(`(!) this transcript's own cwd differs — it may belong to another checkout`);
+    L.push(`${all.length} transcripts in the tree`, "");
+
+    if (agents.length) {
+      L.push(`live agents (written in the last ${humanAge(windowSec)}):`);
+      for (const x of agents.slice(0, Number(a?.limit ?? 15)))
+        L.push(`  ${humanAge(x.ageSec).padStart(5)} ago  ${x.tier.padEnd(14)} ${x.agentId ?? ""}` +
+               (x.workflowRunId ? `  ${x.workflowRunId}` : ""));
+      if (agents.length > 15) L.push(`  ... and ${agents.length - 15} more`);
+    } else {
+      L.push(`no agents running in the last ${humanAge(windowSec)}`);
+    }
+
+    const mins = Number(a?.minutes ?? 60);
+    const b = activityBuckets(all, mins, 40);
+    L.push("", `last ${mins}m |${sparkline(b.counts)}| ${b.counts.filter(c => c > 0).length}/40 buckets active`);
+    return L.join("\n");
+  }
 
   if (name === "relic_status") {
     const { root, rows } = await indexStatus(scope);

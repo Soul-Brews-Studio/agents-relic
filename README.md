@@ -213,6 +213,39 @@ three days are **24 real conversations**. `--all-tiers` turns grouping off.
 Filters on `started_at` — the session's own first timestamp — **not** file mtime, which
 moves on every append and would make an old session look new.
 
+### `now` — what is running, and which session am I in
+
+```bash
+relic now                       # this session: id, live agents, activity timeline
+relic now --all                 # every session written to recently, machine-wide
+relic now --all --window 900    # widen "recently" to 15 minutes
+relic now --plain               # just the current session id, for scripts
+```
+
+```
+7 sessions active in the last 15m
+
+   4s ago  04d1d650    0 live agents  Jsonl app in ralph-dig
+            /opt/Code/github.com/laris-co/neo-oracle/wt/neo-jsonl-big-boss-16sep-wed2026
+  23s ago  1f3db67f    0 live agents  Facebook reel frames
+            /opt/Code/github.com/laris-co/nexus-oracle/wt/nexus-kiosk-flutter-app-18sep-fri2026
+```
+
+**This is the one command that does not touch the index.** Liveness is file mtime: a
+transcript being appended to right now cannot be inside an index that already ran, so
+anything derived from LanceDB is stale by construction. An agent that is running is an
+agent whose transcript is growing.
+
+**Finding the current session is a lookup, not a search.** The project-directory
+encoding maps both `/` and `.` to `-`, so *decoding* it is lossy and relic never does —
+but *encoding* is deterministic. `relic now` computes the directory name from cwd and
+reads the newest file in it, walking up from a subdirectory to the directory the agent
+was actually started in. The result is verified against the transcript's own `cwd` field
+and flagged `(!)` rather than asserted when they disagree — the encoding is not
+injective, so two checkouts can collide.
+
+Machine-wide scan of 781 project directories: **0.63 s**.
+
 ### `session` — one session, by id **or by name**
 
 ```bash
@@ -336,10 +369,11 @@ claude mcp add relic -- bun /path/to/agents-relic/src/mcp.ts
 claude mcp add relic -- relic mcp
 ```
 
-Six tools, each one deterministic lookup with named parameters:
+Seven tools, each one deterministic lookup with named parameters:
 
 | tool | answers |
 |---|---|
+| `relic_now` | what is running right now; **how a model learns its own session id** |
 | `relic_status` | what is indexed — **call first**, the repo keys it lists are what `repo` accepts |
 | `relic_search` | full-text over transcripts; returns `file` + `seq` pointers |
 | `relic_sessions` | what was I working on, over a time range |

@@ -7,6 +7,7 @@ import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf } from "./query.js";
@@ -324,6 +325,73 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log("vectors: none yet — they land in the same `events` table, no migration.");
 }
 
+// ---- now (liveness, from mtime — never the index) ---------------------------
+async function cmdNow(f: Record<string, string | boolean>) {
+  const windowSec = Number(f.window ?? 300);
+  const mode = outFmt(f);
+
+  if (f.all) {
+    const live = await liveSessions(windowSec, Number(f.limit ?? 20));
+    if (mode === "json") { console.log(JSON.stringify({ windowSec, sessions: live }, null, 2)); return; }
+    if (mode === "plain") { for (const s of live) console.log([s.sessionUuid, s.ageSec, s.agents, s.cwd ?? ""].join("\t")); return; }
+    if (!live.length) { console.log(`nothing written in the last ${humanAge(windowSec)}`); return; }
+    console.log(`${live.length} session${live.length === 1 ? "" : "s"} active in the last ${humanAge(windowSec)}\n`);
+    for (const s of live) {
+      console.log(`${humanAge(s.ageSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
+        `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}`);
+      console.log(`            ${s.cwd ?? s.projectDir}`);
+    }
+    return;
+  }
+
+  const cur = await currentSession();
+  if (!cur) {
+    console.log(`no session transcript for this directory`);
+    console.log(`  ${process.cwd()}`);
+    console.log(`  relic now --all   to see every active session on this machine`);
+    return;
+  }
+
+  const all = treeFiles(cur.projectDir, cur.sessionUuid);
+  const liveFiles = all.filter(x => x.ageSec <= windowSec);
+
+  if (mode === "json") {
+    console.log(JSON.stringify({ current: cur, windowSec, transcripts: all.length, live: liveFiles }, null, 2));
+    return;
+  }
+  if (mode === "plain") { console.log(cur.sessionUuid); return; }
+
+  console.log(`${cur.title ?? "(untitled)"}\n`);
+  console.log(`${cur.sessionUuid}  ·  last write ${humanAge(cur.ageSec)} ago`);
+  console.log(`${cur.cwd}`);
+  // The encoding maps both "/" and "." to "-", so two checkouts CAN land in the same
+  // project directory. Say so rather than presenting a guess as a fact.
+  if (!cur.confident)
+    console.log(`(!) this transcript's own cwd is ${cur.cwd} — it may belong to another checkout`);
+  console.log(`${all.length} transcript${all.length === 1 ? "" : "s"} in the tree\n`);
+
+  const agents = liveFiles.filter(x => x.tier !== "session");
+  if (agents.length) {
+    console.log(`live agents (written in the last ${humanAge(windowSec)}):`);
+    for (const a of agents.slice(0, Number(f.limit ?? 15)))
+      console.log(`  ${humanAge(a.ageSec).padStart(5)} ago  ${a.tier.padEnd(14)} ${a.agentId ?? ""}` +
+                  (a.workflowRunId ? `  ${a.workflowRunId}` : ""));
+    if (agents.length > 15) console.log(`  ... and ${agents.length - 15} more`);
+  } else {
+    console.log(`no agents running (nothing but the session itself written in ${humanAge(windowSec)})`);
+  }
+
+  // Timeline: WHEN the tree was touched, bucketed. mtime is the last write per file, so
+  // this maps activity rather than volume.
+  const mins = Number(f.minutes ?? 60);
+  const b = activityBuckets(all, mins, 40);
+  const active = b.counts.filter(c => c > 0).length;
+  console.log(`\nlast ${mins}m  |${sparkline(b.counts)}|  ${active}/40 buckets active` +
+              ` (${b.perBucketMin.toFixed(1)}m each)`);
+  console.log(`         ${new Date(b.startMs).toTimeString().slice(0, 5)}` +
+              `${" ".repeat(34)}${new Date(b.endMs).toTimeString().slice(0, 5)}`);
+}
+
 // ---- main ------------------------------------------------------------------
 const { f, pos } = flags(process.argv.slice(2));
 const cmd = pos[0];
@@ -340,6 +408,7 @@ if (!cmd || f.help) {
   session <id|prefix>          resolve a session id to its transcript file(s)
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   mcp                          run the MCP server on stdio (same lookups, for a model)
+  now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
   sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
@@ -465,6 +534,7 @@ else if (cmd === "skipped") {
     }
   }
 }
+else if (cmd === "now" || cmd === "live") await cmdNow(f);
 else if (cmd === "mcp") {
   // exec rather than import: the server owns stdin/stdout for its whole lifetime.
   const { spawn } = await import("node:child_process");
