@@ -194,6 +194,41 @@ Filters stack:
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
 
+### Fan-out cost, and what it is not
+
+An unfiltered search asks all 345 shards. They are queried concurrently, capped at
+`min(16, cpus-2)` — unbounded would trade a latency problem for a file-descriptor one.
+
+Measured on `"peak concurrency"`, average of 3 runs each (single runs vary by ~2 s, so
+one-shot comparisons of this are worthless):
+
+| fan-out cap | |
+|---|---|
+| 1 (sequential) | 9,211 ms |
+| **16 (default)** | **6,206 ms** |
+| 32 | 6,762 ms |
+| 64 | 5,972 ms |
+
+Concurrency buys ~1.5x and nothing reliable above 16, because the cost is 345 real FTS
+queries. **`--repo` is still worth far more than any cap** — one shard answers in ~330 ms.
+`RELIC_FANOUT` overrides the cap for measurement.
+
+### Duplicate events across transcripts
+
+Resuming a session forks a NEW transcript and copies the history forward, so the same
+event lives in two files. relic's `uid` is `(source, filename, seq)`, so a copied event is
+two legitimate rows and both used to surface — **213 duplicate rows out of 2,403 hits
+(8.9%)** on one query.
+
+Results are deduped on `(ts, role, text)`: a millisecond timestamp plus identical content
+is the same event, not a coincidence. The sort runs first, so the copy that survives is
+the best-ranked one.
+
+What this deliberately does **not** collapse: a subagent's own turn (`user` / `subagent`)
+and the parent receiving it (`tool_result` / `session`) share text and timestamp but are
+two different events, and the role tells you which is which. Six such pairs remain in
+2,196 hits, correctly.
+
 ### Ranking across shards
 
 relic shards by repo, so a fan-out asks 345 indexes and each returns its own top-`limit`.

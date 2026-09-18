@@ -1,4 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
+import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { parseSince } from "./discover.js";
@@ -67,16 +68,48 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   let searched = 0;
   const t0 = performance.now();
 
-  for (const s of shards) {
-    try {
-      const store = await LanceStore.open(s.dir);
-      for (const h of await store.search(q, {
-        limit, tier: o.tier, source: o.source, worktree: o.worktree, path: o.path,
-        since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose,
-      })) hits.push({ ...h, repo: s.key });
-      searched++;
-    } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
-  }
+  /*
+   * Query shards CONCURRENTLY.
+   *
+   * Each shard is an independent LanceDB directory, so the fan-out was 345 sequential
+   * round-trips that shared nothing but the result array — measured at ~7 s unfiltered,
+   * against ~330 ms for a single `--repo`. The work is IO-bound, so it overlaps well.
+   *
+   * Bounded, not unbounded: opening 345 LanceDB connections at once trades a latency
+   * problem for a file-descriptor one. The cap tracks CPU count the same way the agent
+   * runner does, with a floor so a small machine still overlaps.
+   *
+   * Measured on 345 shards, "peak concurrency", average of 3 runs each — single runs
+   * vary by ~2 s here, so one-shot comparisons of this are worthless:
+   *
+   *   cap  1 (sequential)   9,211 ms
+   *   cap 16 (default)      6,206 ms     <- 1.5x, not the 2.4x a single run suggested
+   *   cap 32                6,762 ms
+   *   cap 64                5,972 ms     <- no reliable gain above 16
+   *
+   * Concurrency softens the fan-out; it does not remove it, because the cost is 345
+   * real FTS queries. Narrowing with `repo` is still worth an order of magnitude more
+   * than any cap. RELIC_FANOUT overrides for measurement.
+   */
+  const CAP = Number(process.env.RELIC_FANOUT) > 0
+    ? Number(process.env.RELIC_FANOUT)
+    : Math.max(4, Math.min(16, (os.cpus?.().length ?? 8) - 2));
+  const opts = { limit, tier: o.tier, source: o.source, worktree: o.worktree, path: o.path,
+                 since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
+
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(CAP, shards.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= shards.length) return;
+      const s = shards[i];
+      try {
+        const store = await LanceStore.open(s.dir);
+        for (const h of await store.search(q, opts)) hits.push({ ...h, repo: s.key });
+        searched++;
+      } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
+    }
+  }));
   /*
    * RANK ACROSS SHARDS BEFORE SLICING.
    *
@@ -93,6 +126,30 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    * is a ranking improvement, not a globally correct BM25.
    */
   hits.sort((a, b) => Number((b as any)._score ?? 0) - Number((a as any)._score ?? 0));
+
+  /*
+   * Drop events that exist in more than one transcript.
+   *
+   * Resuming a session forks a NEW transcript and copies the history forward, so the
+   * same event lives in two files. relic's uid is (source, filename, seq) — deliberately
+   * path-INdependent within a file but distinct across files — so a copied event is two
+   * legitimate rows, and both surface. Measured unfiltered: 213 duplicate rows out of
+   * 2,403 hits (8.9%) for one query, 85 of 1,235 for another.
+   *
+   * The key is (ts, role, text): a millisecond timestamp plus identical content is the
+   * same event, not a coincidence. Sorting by score happens FIRST, so the copy that is
+   * kept is the best-ranked one rather than whichever shard answered first.
+   */
+  const seen = new Set<string>();
+  const deduped: typeof hits = [];
+  for (const h of hits) {
+    const k = `${h.ts}\u001f${h.role}\u001f${h.text}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(h);
+  }
+  hits.length = 0;
+  hits.push(...deduped);
 
   return { hits, shards: searched, available: shards.length,
            ms: Math.round(performance.now() - t0), total: hits.length };
