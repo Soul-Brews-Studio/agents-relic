@@ -100,6 +100,18 @@ class LanceStore:
         return {r["file_path"]: {"mtime": r["mtime"], "size": r["size"]}
                 for r in tbl.to_pylist()}
 
+    def session_rows(self) -> list[dict]:
+        """Raw session dicts, for callers that join across shards.
+
+        Returned as dicts rather than SessionRow because the caller decorates them with
+        `repo` and `bank` — fields that belong to the SHARD, not the row, and that a
+        strict model would reject.
+        """
+        t = self._existing("sessions")
+        if t is None:
+            return []
+        return t.to_arrow().to_pylist()
+
     def sessions(self, limit: Optional[int] = None) -> list[SessionRow]:
         t = self._existing("sessions")
         if t is None:

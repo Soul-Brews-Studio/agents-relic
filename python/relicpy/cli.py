@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from datetime import datetime, timezone
 
 from .models import Scope
@@ -121,6 +123,273 @@ def cmd_banks(a: argparse.Namespace) -> int:
     return 0
 
 
+
+# ------------------------------------------------------------------ new commands
+
+def cmd_sessions(a) -> int:
+    from .query import list_sessions, name_of
+    r = list_sessions(_scope(a), since=a.since, until=a.until,
+                      worktree=a.worktree, limit=a.limit)
+    if a.count:
+        print(f"{r['total']} sessions · {r['events']:,} events")
+        return 0
+    if _json(a):
+        print(json.dumps({"total": r["total"], "events": r["events"], "rows": r["rows"]},
+                         indent=2, default=str))
+        return 0
+    if not r["total"]:
+        print("no sessions match those filters")
+        return 0
+    print(f"{r['total']:,} sessions · {r['events']:,} events\n")
+    for x in r["rows"]:
+        print(f"{_local(x.get('started_at') or '')}  {str(x.get('session_uuid'))[:8]}  "
+              f"{int(x.get('event_count') or 0):>6} ev  {x.get('repo', '')}"
+              f"{' [' + x['worktree'] + ']' if x.get('worktree') else ''}")
+        print(f"    {' '.join(name_of(x).split())[:110]}")
+    if r["total"] > len(r["rows"]):
+        print(f"\n... and {r['total'] - len(r['rows']):,} more (--limit N)")
+    return 0
+
+
+def cmd_session(a) -> int:
+    from .query import name_of, neighbours, resolve_session, stats_of
+    from .tree import build_tree, common_prefix, render_tree
+    res = resolve_session(a.id, _scope(a), no_index=a.no_index)
+    rows = res["rows"]
+    if not rows:
+        print(f"nothing matches {a.id} — tried it as an id, then as a name", file=sys.stderr)
+        return 1
+    uuids = {r.get("session_uuid") for r in rows}
+    if res["matched_by"] == "name" and len(uuids) > 1:
+        print(f"{len(uuids)} sessions named like \"{a.id}\" — call again with one id:\n")
+        for r in rows:
+            print(f"{_local(r.get('started_at') or '')}  {r.get('session_uuid')}  "
+                  f"{int(r.get('event_count') or 0):>6} ev  {name_of(r)[:50]}")
+        return 0
+
+    st = stats_of(rows)
+    parent = next((r for r in rows if r.get("tier") == "session"), rows[0])
+    if _json(a):
+        print(json.dumps({"stats": st, "rows": rows}, indent=2, default=str))
+        return 0
+
+    print(name_of(parent))
+    print(f"{parent.get('session_uuid')} · matched by {res['matched_by']}"
+          + (f" · {res['imported']} imported on demand" if res["imported"] else ""))
+    print(f"{st['repo']}{' [' + st['worktree'] + ']' if st['worktree'] else ''}"
+          + (f" · {st['model']}" if st["model"] else ""))
+    print(f"{_local(st['started_at'])} → {_local(st['ended_at'])} · "
+          f"{st['transcripts']:,} transcripts · {st['events']:,} events"
+          + (f" · {st['runs']} workflow runs" if st["runs"] else ""))
+    print("  " + " · ".join(f"{t} {n}" for t, n in st["tiers"]))
+
+    if not a.no_neighbours:
+        nb = neighbours(parent, _scope(a))
+        if nb["before"] or nb["after"]:
+            print("\nsame worktree, either side:")
+            for r in nb["before"]:
+                print(f"   {_local(r.get('started_at') or '')}  {str(r['session_uuid'])[:8]}  {name_of(r)[:60]}")
+            print(f">> {_local(parent.get('started_at') or '')}  {str(parent['session_uuid'])[:8]}  {name_of(parent)[:60]}")
+            for r in nb["after"]:
+                print(f"   {_local(r.get('started_at') or '')}  {str(r['session_uuid'])[:8]}  {name_of(r)[:60]}")
+
+    base = str(parent.get("file_path", "")).replace(".jsonl", "/")
+    if a.tree:
+        entries = [{
+            "path": os.path.basename(r["file_path"]) if r["file_path"] == parent["file_path"]
+                    else (r["file_path"][len(base):] if r["file_path"].startswith(base) else r["file_path"]),
+            "label": f"{_local(r.get('started_at') or '')[-5:]} {r.get('tier')} {int(r.get('event_count') or 0):,} ev",
+            "weight": int(r.get("event_count") or 0),
+        } for r in rows]
+        print(f"\n{base}")
+        render_tree(build_tree(entries), "", a.limit)
+        print(f"\n{len(rows):,} transcripts · {st['events']:,} events")
+        return 0
+
+    print(f"\ntranscripts (under {base}):")
+    for r in rows[:a.limit]:
+        p = r["file_path"] if r["file_path"] == parent["file_path"] else (
+            r["file_path"][len(base):] if r["file_path"].startswith(base) else r["file_path"])
+        print(f"  {_local(r.get('started_at') or '')[-5:]}  {str(r.get('tier')):<14} "
+              f"{int(r.get('event_count') or 0):>6} ev  {p}")
+    if len(rows) > a.limit:
+        print(f"  ... and {len(rows) - a.limit} more (--limit N)")
+    return 0
+
+
+def cmd_show(a) -> int:
+    from .query import read_around
+    lines = read_around(a.file, a.seq, a.before, a.after)
+    if not lines:
+        print(f"no events around seq {a.seq} in {a.file}", file=sys.stderr)
+        return 1
+    if _json(a):
+        print(json.dumps(lines, indent=2))
+        return 0
+    for l in lines:
+        marker = ">>" if l["target"] else "  "
+        print(f"{marker} #{l['seq']} {l['role']}: {' '.join(l['text'].split())[:1200]}")
+    return 0
+
+
+def cmd_pending(a) -> int:
+    from .query import pending_report
+    from .tree import build_tree, common_prefix, render_tree
+    r = pending_report(_scope(a), corpus=a.corpus.split(",") if a.corpus else None,
+                       since=a.since, list_n=a.list)
+    if _json(a):
+        print(json.dumps(r.model_dump(), indent=2, default=str))
+        return 0
+    print(f"found {r.found:,}  indexed {r.indexed:,}  missing {r.missing:,}  "
+          f"changed {r.changed:,}   {r.scan_ms} ms")
+    for g in r.groups:
+        print(f"  {g.source + '/' + g.tier:<30} found {g.found:>6}  "
+              f"missing {g.missing:>6}  changed {g.changed:>6}")
+    if r.files and a.tree:
+        root = common_prefix([x.path for x in r.files])
+        entries = [{"path": x.path[len(root):] if x.path.startswith(root) else x.path,
+                    "label": f"{x.state} {x.tier} {x.size:,}b", "weight": x.size}
+                   for x in r.files]
+        print(f"\n{root}")
+        render_tree(build_tree(entries), "", a.limit, print, "b")
+    elif r.files:
+        print("\nnot indexed yet — newest first:\n")
+        for x in r.files:
+            print(f"{_local_epoch(x.mtime)}  {x.state:<7} {x.tier:<15} {x.session_id or '(none)'}")
+            print(f"          {x.repo}  ·  bank {x.bank}  ·  {x.source}")
+            if a.paths:
+                print(f"          {x.path}")
+    if r.files_omitted:
+        print(f"\n... and {r.files_omitted:,} more pending (--list N)")
+    return 0
+
+
+def cmd_memory(a) -> int:
+    from .query import memory_report
+    m = memory_report(_scope(a), mem_type=a.mem_type, limit=a.limit)
+    if _json(a):
+        print(json.dumps(m, indent=2, default=str))
+        return 0
+    print(f"memories  {m['total']}")
+    print("  " + "  ".join(f"{k}={v}" for k, v in sorted(m["by_type"].items(), key=lambda kv: -kv[1])))
+    print(f"  with origin {m['with_origin']}   joined {m['joined']}   "
+          f"orphaned {m['orphaned']}   no origin {m['no_origin']}\n")
+    print(f"  {'repo':<42} {'mem':>5} {'transcripts':>12} {'producing':>10}")
+    for r in m["repos"]:
+        print(f"  {r['repo'].replace('github.com/', ''):<42} {r['mem']:>5} "
+              f"{r['transcripts']:>12} {r['producing']:>10}")
+    return 0
+
+
+def cmd_now(a) -> int:
+    from .live import current_session, human_age, live_sessions, tree_files
+    if a.all:
+        live = live_sessions(a.window, a.limit)
+        if _json(a):
+            print(json.dumps(live, indent=2, default=str))
+            return 0
+        if not live:
+            print(f"nothing written in the last {human_age(a.window)}")
+            return 0
+        print(f"{len(live)} session(s) active in the last {human_age(a.window)}\n")
+        for x in live:
+            print(f"{human_age(x['age_sec']):>5} ago  {x['session_uuid'][:8]}  "
+                  f"{x['agents']:>3} live agent(s)  {x['title'] or '(untitled)'}")
+            print(f"            {x['cwd'] or x['project_dir']}")
+        return 0
+
+    cur = current_session(a.cwd)
+    if not cur:
+        print(f"no session transcript for {a.cwd or 'this directory'}")
+        print("  relic-py now --all   to see every active session")
+        return 1
+    if _json(a):
+        print(json.dumps(cur, indent=2, default=str))
+        return 0
+    files = tree_files(cur["project_dir"], cur["session_uuid"])
+    agents = [f for f in files if f["tier"] != "session" and f["age_sec"] <= a.window]
+    print(cur["title"] or "(untitled)")
+    print(f"{cur['session_uuid']} · last write {human_age(cur['age_sec'])} ago")
+    print(cur["cwd"] or "")
+    print(f"{len(files)} transcripts in the tree\n")
+    if agents:
+        print(f"live agents (written in the last {human_age(a.window)}):")
+        for f in agents[:a.limit]:
+            print(f"  {human_age(f['age_sec']):>5} ago  {f['tier']:<14} {f['agent_id'] or ''}"
+                  + (f"  {f['workflow_run_id']}" if f["workflow_run_id"] else ""))
+    else:
+        print(f"no agents running in the last {human_age(a.window)}")
+    return 0
+
+
+def cmd_sources(a) -> int:
+    from .sources import bank_of, load_sources
+    srcs = load_sources()
+    if _json(a):
+        print(json.dumps([{"key": s.key, "path": s.path, "walk": s.walk, "bank": bank_of(s),
+                           "enabled": s.enabled, "present": os.path.exists(s.path),
+                           "note": s.note} for s in srcs], indent=2))
+        return 0
+    print("configured sources (~/.relic/sources.json overrides)\n")
+    banks = []
+    for s in srcs:
+        present = "present" if os.path.exists(s.path) else "MISSING"
+        print(f"  [{'on ' if s.enabled else 'off'}] {s.key:<16} {present:<8} "
+              f"bank={bank_of(s):<24} {s.path}")
+        print(f"         {s.note}")
+        if s.enabled and os.path.exists(s.path):
+            banks.append(bank_of(s))
+    print(f"\n  {len(set(banks))} banks would be written: " + " · ".join(dict.fromkeys(banks)))
+    return 0
+
+
+def cmd_index(a) -> int:
+    from .discover import discover, parse_since
+    from .importer import import_files
+    only = a.corpus.split(",") if a.corpus and a.corpus != "all" else None
+    since_ms = parse_since(a.since)
+    t0 = time.time()
+    print(f"🏺 relic indexing  ({only and '+'.join(only) or 'all enabled sources'} · "
+          f"{'since ' + a.since if a.since else 'full history'}"
+          f"{' · DRY RUN — no writes' if a.dry_run else ''})", file=sys.stderr)
+    found = discover(only, since_ms)
+    print(f"  scanned {len(found):,} files", file=sys.stderr)
+    if a.dry_run:
+        print("--dry-run: nothing written")
+        return 0
+    t = import_files(found, data_root=getattr(a, "data_root", None),
+                     in_repo=getattr(a, "in_repo", False),
+                     repo_filter=a.repo, progress=True, verbose=a.verbose)
+    print(f"  scanned:     {len(found):,} files")
+    print(f"  unchanged:   {t.skipped:,} (mtime+size match, never re-read)")
+    print(f"  imported:    {t.imported:,} files -> {t.added:,} events")
+    print(f"  shards:      {t.shards.size} (bank,repo) pairs, {t.fts_built} fts index "
+          f"built in {t.fts_ms/1000:.1f}s")
+    if t.failed:
+        print(f"  failed:      {t.failed:,}")
+    print(f"  wrote:       {getattr(a, 'data_root', None) or default_root()} "
+          f"in {time.time()-t0:.1f}s")
+    return 0
+
+
+def cmd_shards(a) -> int:
+    from .repo import list_shards
+    shards = list_shards(getattr(a, "data_root", None), getattr(a, "in_repo", False))
+    if a.bank:
+        shards = [s for s in shards if s.bank == a.bank]
+    if a.repo:
+        shards = [s for s in shards if a.repo in s.repo]
+    if a.count:
+        print(len(shards))
+        return 0
+    if _json(a):
+        print(json.dumps([s.model_dump() for s in shards], indent=2))
+        return 0
+    for s in shards:
+        print(f"{s.key}\t{s.dir}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # Global flags go on a PARENT parser that every subcommand inherits, not only on
     # the top-level one.
@@ -175,6 +444,69 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("banks", parents=[common],
                        help="the bank names on this machine")
     b.set_defaults(func=cmd_banks)
+
+    sh = sub.add_parser("shards", parents=[common], help="the index layout")
+    sh.add_argument("--bank"); sh.add_argument("--repo")
+    sh.add_argument("--count", action="store_true")
+    sh.set_defaults(func=cmd_shards)
+
+    ss = sub.add_parser("sessions", parents=[common],
+                        help="what was I working on, over a time range")
+    ss.add_argument("--bank"); ss.add_argument("--repo")
+    ss.add_argument("--since"); ss.add_argument("--until"); ss.add_argument("--worktree")
+    ss.add_argument("--count", action="store_true")
+    ss.add_argument("--limit", type=int, default=40)
+    ss.set_defaults(func=cmd_sessions)
+
+    so = sub.add_parser("session", parents=[common],
+                        help="one session by id OR name — its tree, stats, neighbours")
+    so.add_argument("id")
+    so.add_argument("--bank"); so.add_argument("--repo")
+    so.add_argument("--limit", type=int, default=10)
+    so.add_argument("--tree", action="store_true", help="render the tree, not a flat list")
+    so.add_argument("--no-neighbours", action="store_true")
+    so.add_argument("--no-index", action="store_true",
+                    help="answer strictly from the index; do not seek on disk")
+    so.set_defaults(func=cmd_session)
+
+    sw = sub.add_parser("show", parents=[common],
+                        help="the conversation around one event, from the source .jsonl")
+    sw.add_argument("file"); sw.add_argument("--seq", type=int, required=True)
+    sw.add_argument("--before", type=int, default=2)
+    sw.add_argument("--after", type=int, default=2)
+    sw.set_defaults(func=cmd_show)
+
+    pe = sub.add_parser("pending", parents=[common],
+                        help="on disk but NOT indexed — the only check that catches a partial index")
+    pe.add_argument("--bank"); pe.add_argument("--repo")
+    pe.add_argument("--corpus"); pe.add_argument("--since")
+    pe.add_argument("--list", type=int, default=0, metavar="N")
+    pe.add_argument("--paths", action="store_true")
+    pe.add_argument("--tree", action="store_true")
+    pe.add_argument("--limit", type=int, default=8)
+    pe.set_defaults(func=cmd_pending)
+
+    me = sub.add_parser("memory", parents=[common],
+                        help="Claude's own memory, joined to the sessions that made it")
+    me.add_argument("--bank"); me.add_argument("--repo")
+    me.add_argument("--mem-type"); me.add_argument("--limit", type=int, default=20)
+    me.set_defaults(func=cmd_memory)
+
+    nw = sub.add_parser("now", parents=[common], help="what is running RIGHT NOW")
+    nw.add_argument("--all", action="store_true")
+    nw.add_argument("--cwd"); nw.add_argument("--window", type=int, default=300)
+    nw.add_argument("--limit", type=int, default=15)
+    nw.set_defaults(func=cmd_now)
+
+    sr = sub.add_parser("sources", parents=[common],
+                        help="what this machine has, and what is on/off")
+    sr.set_defaults(func=cmd_sources)
+
+    ix = sub.add_parser("index", parents=[common], help="build or update the index")
+    ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")
+    ix.add_argument("--dry-run", action="store_true")
+    ix.add_argument("--verbose", action="store_true")
+    ix.set_defaults(func=cmd_index)
 
     a = p.parse_args(argv)
     return a.func(a)
