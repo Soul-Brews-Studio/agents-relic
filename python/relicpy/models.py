@@ -122,6 +122,45 @@ class FileRow(LanceModel):
     imported_at: str
 
 
+def vector_row_model(dim: int):
+    """The `vectors` row, as a model — BUILT PER DIM, because it has to be.
+
+    `Vector(n)` bakes the width into the Arrow type (FixedSizeList<Float32, n>), so
+    unlike the other three rows this schema cannot be a module-level class: 384 and
+    1024 are different schemas, and the model is chosen by what the provider actually
+    returned rather than by what the flag asked for.
+
+    `dim: float` is not a typo — see the module docstring. The TypeScript reference
+    writes every number as Float64, and this table already exists on disk that way.
+
+    THE TABLE IS SEPARATE FROM `events` ON PURPOSE. A vector column cannot be added to
+    an existing table by widening: `add_columns` backfills a scalar default only, so
+    the column lands as Utf8 in both implementations. What happens next does NOT match,
+    and the split is client-side rather than in the shared Rust core — measured on
+    0.39.0, pinned by tests/test_embed.py:
+
+        TypeScript  writes [0.1, 0.2] into that column as the string "0.1,0.2",
+                    with no error at write or read.
+        Python      raises ArrowNotImplementedError on the cast.
+
+    So the silent half is TypeScript's, which is exactly where it mattered: `widen()`
+    and `EventRow` live there. The rest of the case for a side table is language-
+    independent — a column forces a value for every row on the next write, and
+    3,394,951 events x 384 dims x 4 B is 4.86 GiB, 1.5x the whole current index.
+    """
+    from lancedb.pydantic import Vector
+
+    class VectorRow(LanceModel):
+        uid: str
+        embedding: Vector(dim)  # type: ignore[valid-type]
+        model: str
+        dim: float   # float64 on the wire — see module docstring
+        norm: str
+        embedded_at: str
+
+    return VectorRow
+
+
 # ------------------------------------------------------------------- domain types
 
 

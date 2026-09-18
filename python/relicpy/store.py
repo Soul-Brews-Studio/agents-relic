@@ -13,7 +13,7 @@ from typing import Iterable, Optional
 
 import lancedb
 
-from .models import EventRow, FileRow, SessionRow
+from .models import EventRow, FileRow, SessionRow, vector_row_model
 
 
 class LanceStore:
@@ -143,6 +143,104 @@ class LanceStore:
                 clause = f"({clause}) AND ({where})"
             return t.search().where(clause).limit(limit).to_list()
 
+    def main_tiers_filter(self) -> str:
+        """The "main" predicate: the human's own thread, plus documents.
+
+        ONE definition, used by search AND by embed. If they drift, a backfill embeds a
+        different population than the one search reads back, and the symptom is recall
+        — not an error.
+
+        THE COLUMN IS ABSENT ON OLD SHARDS, NOT EMPTY. `kind` arrived by widening, which
+        adds a column on WRITE, so shards that predate it have no such field. A filter
+        that NAMES the column is invalid SQL there, every shard throws, the per-shard
+        catch swallows it, and the search returns zero hits while reporting a healthy
+        shard count. So the schema picks the filter before any SQL is built.
+        """
+        t = self._existing("events")
+        if t is None:
+            return "(tier = 'session' OR tier = 'note')"
+        try:
+            names = set(t.schema.names)
+        except Exception:
+            names = set()
+        if "kind" not in names:
+            return "(tier = 'session' OR tier = 'note')"
+        return ("((kind = 'transcript' AND tier = 'session')"
+                # note and message are whole-kind includes: a vault note has no tier
+                # worth filtering on, and a hermes message is a human conversation.
+                " OR kind = 'note' OR kind = 'message'"
+                # rows written by an older build into a shard that HAS the column
+                " OR (kind = '' AND (tier = 'session' OR tier = 'note')))")
+
+    # -------------------------------------------------------------- vectors (read)
+
+    def vector_stats(self) -> Optional[dict]:
+        """What is embedded here, and with what. None when never embedded — the normal
+        state, since `index` never writes vectors.
+
+        Read off row 0 rather than trusted from a flag: the table outlives whatever the
+        caller thinks it asked for.
+        """
+        t = self._existing("vectors")
+        if t is None:
+            return None
+        n = t.count_rows()
+        if not n:
+            return {"rows": 0, "model": "", "dim": 0, "norm": ""}
+        r = t.search().limit(1).to_list()[0]
+        return {"rows": n, "model": str(r.get("model") or ""),
+                "dim": int(r.get("dim") or 0), "norm": str(r.get("norm") or "")}
+
+    def embedded_uids(self) -> set[str]:
+        """Every uid that already has a vector — the anti-join key for a resumable run."""
+        t = self._existing("vectors")
+        if t is None:
+            return set()
+        return {str(u) for u in t.to_arrow().column("uid").to_pylist()}
+
+    def unembedded(self, limit: Optional[int] = None, main_tiers: bool = True,
+                   min_chars: int = 24) -> list[dict]:
+        """Events with no vector yet.
+
+        LanceDB has no join, so the anti-join is in memory — affordable BECAUSE this is
+        per shard: the largest shard in the live index holds well under a million uids,
+        not the 3.4 M of the whole corpus.
+
+        `min_chars` is not tidiness. A two-character event embeds to a vector close to
+        everything, so it pollutes every result list while carrying no meaning, and it
+        costs the same to compute as a real one.
+        """
+        t = self._existing("events")
+        if t is None:
+            return []
+        done = self.embedded_uids()
+        q = t.search().select(["uid", "text"])
+        if main_tiers:
+            q = q.where(self.main_tiers_filter())
+        out: list[dict] = []
+        for r in q.limit(0).to_list():
+            uid = str(r.get("uid") or "")
+            if uid in done:
+                continue
+            text = str(r.get("text") or "")
+            if len(text) < min_chars:
+                continue
+            out.append({"uid": uid, "text": text})
+            if limit and len(out) >= limit:
+                break
+        return out
+
+    def embeddable_count(self, main_tiers: bool = True, min_chars: int = 24) -> int:
+        """The denominator: eligible events, ignoring what is already done."""
+        t = self._existing("events")
+        if t is None:
+            return 0
+        q = t.search().select(["text"])
+        if main_tiers:
+            q = q.where(self.main_tiers_filter())
+        return sum(1 for r in q.limit(0).to_list()
+                   if len(str(r.get("text") or "")) >= min_chars)
+
     # ---------------------------------------------------------------- write side
 
     def put_events(self, rows: Iterable[EventRow]) -> None:
@@ -153,6 +251,33 @@ class LanceStore:
 
     def put_files(self, rows: Iterable[FileRow]) -> None:
         self._merge("files", FileRow, "file_path", rows)
+
+    def put_vectors(self, rows: list[dict], dim: int) -> None:
+        """Upsert embeddings. `dim` chooses the schema, so it comes from the provider's
+        actual output, never from a flag — see vector_row_model()."""
+        if not rows:
+            return
+        model = vector_row_model(dim)
+        data = {r["uid"]: r for r in rows}      # same last-wins dedupe as _merge
+        t = self._existing("vectors")
+        if t is None:
+            self.db.create_table("vectors", data=list(data.values()),
+                                 schema=model.to_arrow_schema())
+            return
+        (t.merge_insert("uid").when_matched_update_all()
+          .when_not_matched_insert_all().execute(list(data.values())))
+
+    def drop_vectors(self) -> bool:
+        """Drop `vectors`. The ONLY way to change model or dim on a shard: a
+        FixedSizeList has one width, so there is no in-place widening.
+
+        Scoped to `vectors`, so the worst case is re-running a backfill — never an
+        index.
+        """
+        if "vectors" not in self.db.list_tables().tables:
+            return False
+        self.db.drop_table("vectors")
+        return True
 
     def _merge(self, name: str, model, key: str, rows: Iterable) -> None:
         data = [r.model_dump() for r in rows]

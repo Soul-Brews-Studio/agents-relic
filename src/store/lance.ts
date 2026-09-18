@@ -80,6 +80,39 @@ export interface FileRow {
   file_path: string; repo_key: string; mtime: number; size: number; imported_at: string;
 }
 
+/**
+ * One embedding. A SEPARATE TABLE, not a column on `events`.
+ *
+ * The obvious design is `embedding: number[]` on EventRow. It does not survive contact
+ * with the 817 shards already on disk, and in THIS implementation it fails SILENTLY —
+ * measured against @lancedb/lancedb 0.39.0, not feared:
+ *
+ *   widen() sees a missing column and calls addColumns({valueSql: "''"}) -> Utf8
+ *   a later write of [0.1, 0.2, 0.3, 0.4]                               -> "0.1,0.2,0.3,0.4"
+ *
+ * No error at either step. Every vector computed afterwards lands as text, and the
+ * vector index can never build. (The Python client raises ArrowNotImplementedError on
+ * that same write — same Rust core, different client-side conversion — so the silent
+ * half is ours alone. Both are pinned by tests.) widen() now refuses a non-scalar
+ * column outright so that path is closed, but the deeper reason stands: a column forces a value for
+ * EVERY row on the next write, and 3,394,951 events x 384 dims x 4 B is 4.86 GiB —
+ * 1.5x the entire current index — to embed a corpus whose search already answers
+ * better without it.
+ *
+ * A side table keyed on `uid` makes "index first, embed later" the natural shape: the
+ * table starts absent, a backfill resumes by anti-joining uids, and embedding a
+ * SUBSET needs no sentinel for "not embedded yet". The cost is one extra query —
+ * vector search returns uids, then `events` is read by uid.
+ */
+export interface VectorRow {
+  uid: string;            // the join key; events.uid is already its primary key
+  embedding: number[];    // FixedSizeList<Float32, dim> — inferred from the first batch
+  model: string;          // provider-qualified, e.g. "ollama:all-minilm"
+  dim: number;
+  norm: string;           // "l2" when written normalised, "" when raw — see embedShard()
+  embedded_at: string;
+}
+
 export interface Hit extends EventRow { }
 
 /** Lance filters are SQL strings. Quote by doubling; never concatenate raw input. */
@@ -129,6 +162,23 @@ export class LanceStore {
     const have = new Set((await t.schema()).fields.map(f => f.name));
     const missing = Object.keys(row).filter(k => !have.has(k));
     if (!missing.length) return;
+    /*
+     * REFUSE A NON-SCALAR. addColumns can only backfill a scalar `valueSql`, and the
+     * failure mode is silence: a missing `embedding` column gets `''`, becomes Utf8,
+     * and then accepts [0.1,0.2] by storing the string "0.1,0.2". Verified against
+     * lancedb 0.39.0 — no error on the widen, no error on the write, and the column
+     * reads back as a string forever. Better to stop here and make the caller create
+     * a properly typed table than to let hours of embedding compute land as text.
+     */
+    for (const k of missing) {
+      const v = row[k];
+      if (typeof v === "string" || typeof v === "number") continue;
+      const kind = Array.isArray(v) ? `array[${v.length}]` : typeof v;
+      throw new Error(
+        `lance: refusing to widen ${name} with non-scalar column "${k}" (${kind}). ` +
+        `addColumns backfills a scalar default only, so this column would become Utf8 ` +
+        `and silently store the value as text. Create a new table with the right schema.`);
+    }
     await t.addColumns(missing.map(k => ({
       name: k,
       // The default must match the column's type or the backfill writes nulls that
@@ -145,6 +195,28 @@ export class LanceStore {
   putEvents   = (rows: EventRow[])   => this.upsert("events",   "uid",       rows as unknown as Record<string, unknown>[]);
   putSessions = (rows: SessionRow[]) => this.upsert("sessions", "file_path", rows as unknown as Record<string, unknown>[]);
   putFiles    = (rows: FileRow[])    => this.upsert("files",    "file_path", rows as unknown as Record<string, unknown>[]);
+  /**
+   * Upsert embeddings. Re-embedding a uid REPLACES its vector, so a model switch is a
+   * re-run, not a duplicate — but see embedShard(), which refuses to mix dims in one
+   * table because a FixedSizeList has one width and mergeInsert would reject the batch
+   * halfway through a long backfill.
+   */
+  putVectors  = (rows: VectorRow[])  => this.upsert("vectors",  "uid",       rows as unknown as Record<string, unknown>[]);
+
+  /**
+   * Drop the whole `vectors` table. The ONLY way to change model or dim on a shard —
+   * a FixedSizeList has one width, so there is no in-place widening, and telling the
+   * caller "drop it first" without giving them a way to do so is advice, not a tool.
+   *
+   * Scoped to `vectors` on purpose: it can never touch `events`, `sessions` or `files`,
+   * so the worst case is re-running a backfill, never re-running an index.
+   */
+  async dropVectors(): Promise<boolean> {
+    if (!(await this.db.tableNames()).includes("vectors")) return false;
+    await this.db.dropTable("vectors");
+    this.cache.delete("vectors");
+    return true;
+  }
 
   /** Single-row conveniences — prefer the array forms in any loop. */
   putSession = (row: SessionRow) => this.putSessions([row]);
@@ -233,17 +305,7 @@ export class LanceStore {
      * tier-only branch only once every shard has been rewritten, and check it with a
      * count rather than by reasoning about it.
      */
-    else if (opts.mainTiers) {
-      const hasKind = (await t.schema()).fields.some(f => f.name === "kind");
-      filters.push(hasKind
-        ? `((kind = 'transcript' AND tier = 'session')` +
-          // note and message are whole-kind includes: a vault note has no tier worth
-          // filtering on, and a hermes message is a human conversation, not chatter.
-          ` OR kind = 'note' OR kind = 'message'` +
-          // rows written by an older build into a shard that HAS the column
-          ` OR (kind = '' AND (tier = 'session' OR tier = 'note')))`
-        : `(tier = 'session' OR tier = 'note')`);
-    }
+    else if (opts.mainTiers) filters.push(await this.mainTiersFilter(t));
     if (opts.source) filters.push(`source = ${sqlStr(opts.source)}`);
     // worktree is context, not noise: "which worktree was this said in" is usually
     // the same question as "what was I working on".
@@ -359,6 +421,96 @@ export class LanceStore {
       .toArray() as unknown as SessionRow[];
     rows.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
     return rows;
+  }
+
+  /**
+   * The "main" predicate, in ONE place. `search` and `embed` must agree on what the
+   * human's own thread is, or a backfill embeds a different population than the one
+   * search reads back — a disagreement that shows up as recall, not as an error.
+   *
+   * See the comment that used to live inline in search(): the column is ABSENT on old
+   * shards, not empty, so naming it in a filter makes the whole query invalid there.
+   * The schema decides the filter before any SQL is built.
+   */
+  private async mainTiersFilter(t: lancedb.Table): Promise<string> {
+    const hasKind = (await t.schema()).fields.some(f => f.name === "kind");
+    return hasKind
+      ? `((kind = 'transcript' AND tier = 'session')` +
+        // note and message are whole-kind includes: a vault note has no tier worth
+        // filtering on, and a hermes message is a human conversation, not chatter.
+        ` OR kind = 'note' OR kind = 'message'` +
+        // rows written by an older build into a shard that HAS the column
+        ` OR (kind = '' AND (tier = 'session' OR tier = 'note')))`
+      : `(tier = 'session' OR tier = 'note')`;
+  }
+
+  /**
+   * What is embedded here, and with what. `null` when the table has never been created
+   * — which is the normal state, since `index` never writes vectors.
+   *
+   * `dim` and `model` are read off row 0 rather than trusted from a flag: the table is
+   * on disk and outlives whatever the caller thinks it asked for. A shard embedded last
+   * week with all-minilm answers honestly after someone changes the default.
+   */
+  async vectorStats(): Promise<{ rows: number; model: string; dim: number; norm: string } | null> {
+    const t = await this.existing("vectors");
+    if (!t) return null;
+    const rows = await t.countRows();
+    if (!rows) return { rows: 0, model: "", dim: 0, norm: "" };
+    const [r] = await t.query().select(["model", "dim", "norm"]).limit(1).toArray();
+    return { rows, model: String(r?.model ?? ""), dim: Number(r?.dim ?? 0), norm: String(r?.norm ?? "") };
+  }
+
+  /** Every uid that already has a vector. The anti-join key for a resumable backfill. */
+  async embeddedUids(): Promise<Set<string>> {
+    const t = await this.existing("vectors");
+    if (!t) return new Set();
+    const out = new Set<string>();
+    for (const r of await t.query().select(["uid"]).toArray()) out.add(String(r.uid));
+    return out;
+  }
+
+  /**
+   * Events with no vector yet, oldest-slot first.
+   *
+   * LanceDB has no join, so the anti-join is done in memory against `embeddedUids()`.
+   * That is affordable BECAUSE this runs per shard: the biggest shard in the live index
+   * holds well under a million uids, not the 3.4 M of the whole corpus.
+   *
+   * `minChars` is not tidiness. A two-character event embeds to a vector that is close
+   * to everything, so it pollutes every result list while carrying no meaning — and it
+   * costs the same to compute as a real one.
+   */
+  async unembedded(opts: { limit?: number; mainTiers?: boolean; minChars?: number } = {}): Promise<{ uid: string; text: string }[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const done = await this.embeddedUids();
+    const minChars = opts.minChars ?? 24;
+    let q = t.query().select(["uid", "text", "seq"]);
+    if (opts.mainTiers) q = q.where(await this.mainTiersFilter(t));
+    const out: { uid: string; text: string }[] = [];
+    const limit = opts.limit ?? Infinity;
+    for (const r of await q.toArray()) {
+      const uid = String(r.uid);
+      if (done.has(uid)) continue;
+      const text = String(r.text ?? "");
+      if (text.length < minChars) continue;
+      out.push({ uid, text });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /** How many events are eligible, ignoring what is already done — the denominator. */
+  async embeddableCount(opts: { mainTiers?: boolean; minChars?: number } = {}): Promise<number> {
+    const t = await this.existing("events");
+    if (!t) return 0;
+    const minChars = opts.minChars ?? 24;
+    let q = t.query().select(["text"]);
+    if (opts.mainTiers) q = q.where(await this.mainTiersFilter(t));
+    let n = 0;
+    for (const r of await q.toArray()) if (String(r.text ?? "").length >= minChars) n++;
+    return n;
   }
 
   async counts(): Promise<{ events: number; sessions: number; files: number }> {
