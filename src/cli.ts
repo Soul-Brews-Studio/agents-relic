@@ -2,7 +2,7 @@
 import { createReadStream, existsSync, readdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { LanceStore, type EventRow } from "./store/lance.js";
+import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince, type Found } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
 import { trace, readTrace, tracePath } from "./trace.js";
@@ -177,6 +177,19 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const limit = Number(f.limit ?? 20);
+  // --since accepts 7d / 12h / 30m / 2026-09-01; --until the same. Both normalise to
+  // an ISO prefix so they compare against the stored ts directly.
+  const toISO = (v: unknown, endOfDay = false): string | undefined => {
+    if (!v) return undefined;
+    const raw = String(v);
+    const rel = parseSince(raw);
+    if (rel && /^\d+[mhd]$/.test(raw)) return new Date(rel).toISOString();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw + (endOfDay ? "T23:59:59Z" : "T00:00:00Z");
+    return raw;
+  };
+  const sinceISO = toISO(f.since);
+  const untilISO = toISO(f.until, true);
+
   let shards = listShards(dataRoot, Boolean(f["in-repo"]));
   if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
   if (!shards.length) {
@@ -193,7 +206,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   for (const s of shards) {
     try {
       const store = await LanceStore.open(s.dir);
-      for (const h of await store.search(q, { limit, tier: f.tier as string, source: f.source as string, worktree: f.worktree as string, path: f.path as string }))
+      for (const h of await store.search(q, { limit, tier: f.tier as string, source: f.source as string,
+        worktree: f.worktree as string, path: f.path as string, since: sinceISO, until: untilISO }))
         hits.push({ ...h, repo: s.key });
       searched++;
     } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
@@ -268,6 +282,52 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
   }
 }
 
+// ---- sessions ----
+async function cmdSessions(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const toISO = (v: unknown, end = false): string | undefined => {
+    if (!v) return undefined;
+    const raw = String(v);
+    const rel = parseSince(raw);
+    if (rel && /^\d+[mhd]$/.test(raw)) return new Date(rel).toISOString();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw + (end ? "T23:59:59Z" : "T00:00:00Z");
+    return raw;
+  };
+  const since = toISO(f.since), until = toISO(f.until, true);
+
+  let shards = listShards(dataRoot, Boolean(f["in-repo"]));
+  if (f.repo) shards = shards.filter(s => s.key.includes(String(f.repo)));
+  if (!shards.length) { console.log("no shards match"); return; }
+
+  const rows: (SessionRow & { repo: string })[] = [];
+  for (const sh of shards) {
+    try {
+      const store = await LanceStore.open(sh.dir);
+      for (const r of await store.sessions({ since, until, worktree: f.worktree as string }))
+        rows.push({ ...r, repo: sh.key });
+    } catch { /* skip unreadable shard */ }
+  }
+  rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+  const limit = Number(f.limit ?? 40);
+  const top = rows.slice(0, limit);
+
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify({ total: rows.length, sessions: top }, null, 2)); return; }
+  if (mode === "jsonl") { for (const r of top) console.log(JSON.stringify(r)); return; }
+  if (mode === "plain") { for (const r of top) console.log([r.session_uuid, r.started_at, r.repo, r.worktree, r.event_count].join("\t")); return; }
+
+  if (f.count) { console.log(`${rows.length} sessions`); return; }
+  const events = rows.reduce((a, r) => a + Number(r.event_count ?? 0), 0);
+  console.log(`${fmt(rows.length)} sessions · ${fmt(events)} events` +
+    (since ? ` · since ${since.slice(0, 16)}` : "") + (f.repo ? ` · repo~${f.repo}` : "") + "\n");
+  for (const r of top) {
+    const wt = r.worktree ? `  [${r.worktree}]` : "";
+    console.log(`${String(r.started_at).slice(0, 16)}  ${r.session_uuid.slice(0, 8)}  ${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
+    if (r.description) console.log(`    ${r.description.replace(/\s+/g, " ").slice(0, 96)}`);
+  }
+  if (rows.length > top.length) console.log(`\n... and ${rows.length - top.length} more (--limit N)`);
+}
+
 // ---- status ----------------------------------------------------------------
 async function cmdStatus(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
@@ -317,8 +377,10 @@ if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--dry-run]
-  search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...] [--limit N]
+  search  <query> [--repo S] [--worktree S] [--path S] [--tier ...] [--source ...]
+                  [--since 7d|2026-09-01] [--until DATE] [--limit N]
   show    <file> --seq N [--before 2] [--after 2]
+  sessions [--repo S] [--since 24h] [--worktree S] [--count] [--limit 40]
   status  [--limit 15]
   sources                      what this machine has, and what is on/off
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
@@ -332,8 +394,9 @@ if (!cmd || f.help) {
 Sharded per repo, ghq-style, under $HOME by default:
   ${defaultRoot()}/github.com/<org>/<repo>/
 
-LanceDB only. Substring search, so Thai and sub-3-character needles work with no
-tokenizer. Vectors land in the same table later.`);
+LanceDB only, with an ICU full-text index: real Thai word segmentation, and
+2-character queries work (trigram cannot do either). Vectors land in the same
+table later, no migration.`);
   process.exit(0);
 }
 
@@ -410,5 +473,6 @@ else if (cmd === "trace") {
         t.neverTop.slice(0, 12).map(s2 => s2.replace("github.com/", "")).join("\n  "));
   }
 }
+else if (cmd === "sessions") await cmdSessions(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

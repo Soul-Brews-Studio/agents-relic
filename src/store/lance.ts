@@ -150,7 +150,7 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; source?: string; worktree?: string; path?: string } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const limit = opts.limit ?? 20;
@@ -161,6 +161,12 @@ export class LanceStore {
     // the same question as "what was I working on".
     if (opts.worktree) filters.push(`worktree LIKE '%${opts.worktree.replace(/'/g, "''")}%'`);
     if (opts.path)     filters.push(`cwd LIKE '%${opts.path.replace(/'/g, "''")}%'`);
+    // ts is ISO-8601 with a Z suffix, so lexicographic comparison IS chronological —
+    // no parsing, and it pushes down into the scan. Verified on a 20k-row sample that
+    // every indexed event carries a ts: relic only indexes user/assistant/system
+    // records, not the UI/state types where the field is often absent.
+    if (opts.since)    filters.push(`ts >= ${sqlStr(opts.since)}`);
+    if (opts.until)    filters.push(`ts <= ${sqlStr(opts.until)}`);
 
     try {
       let s = t.search(q, "fts").limit(limit);
@@ -170,6 +176,25 @@ export class LanceStore {
       const where = [`text LIKE '%${q.replace(/'/g, "''")}%'`, ...filters];
       return await t.query().where(where.join(" AND ")).limit(limit).toArray() as unknown as Hit[];
     }
+  }
+
+  /**
+   * List sessions, newest first. Filtered on started_at, which is the session's own
+   * first timestamp — NOT file mtime, which moves every time a transcript is appended
+   * to and would make an old session look new.
+   */
+  async sessions(opts: { since?: string; until?: string; worktree?: string; limit?: number } = {}): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const where: string[] = [];
+    if (opts.since)    where.push(`started_at >= ${sqlStr(opts.since)}`);
+    if (opts.until)    where.push(`started_at <= ${sqlStr(opts.until)}`);
+    if (opts.worktree) where.push(`worktree LIKE '%${opts.worktree.replace(/'/g, "''")}%'`);
+    let q = t.query();
+    if (where.length) q = q.where(where.join(" AND "));
+    const rows = await q.toArray() as unknown as SessionRow[];
+    rows.sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+    return opts.limit ? rows.slice(0, opts.limit) : rows;
   }
 
   async counts(): Promise<{ events: number; sessions: number; files: number }> {
