@@ -326,6 +326,32 @@ export class LanceStore {
     return { events: await n("events"), sessions: await n("sessions"), files: await n("files") };
   }
 
+  /**
+   * Two different "when", and conflating them is the trap.
+   *
+   * `lastIndexed` is max(files.imported_at) — when the INDEXER last wrote here. It answers
+   * "did my index run land". `newestSession` is max(sessions.started_at) — when the newest
+   * transcript in this shard BEGAN. It answers "how recent is the material".
+   *
+   * They diverge in the case that matters: reindexing an old corpus moves lastIndexed to
+   * now and leaves newestSession months back, and a stale index that has not run since
+   * Tuesday shows a fresh newestSession only because a session started before it ran.
+   */
+  async freshness(): Promise<{ lastIndexed: string; newestSession: string }> {
+    const max = async (table: string, col: string) => {
+      const t = await this.existing(table);
+      if (!t) return "";
+      try {
+        const rows = await t.query().select([col]).toArray() as any[];
+        let best = "";
+        for (const r of rows) { const v = String(r[col] ?? ""); if (v > best) best = v; }
+        return best;
+      } catch { return ""; }
+    };
+    return { lastIndexed: await max("files", "imported_at"),
+             newestSession: await max("sessions", "started_at") };
+  }
+
   async sessionStats(): Promise<{ tier: string; source: string; events: number }[]> {
     const t = await this.existing("sessions");
     if (!t) return [];

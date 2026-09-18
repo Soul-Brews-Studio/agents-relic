@@ -1,6 +1,6 @@
 {
   "name": "agents-relic",
-  "version": "0.1.0",
+  "version": "26.9.18",
   "type": "module",
   "description": "Per-repo LanceDB index of AI coding-agent session transcripts (Claude Code + Codex). Keyword search, no embeddings.",
   "bin": {

@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
+import { readFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO,
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
@@ -37,16 +38,19 @@ const scopeOf = (a: any) => ({ dataRoot: DATA_ROOT, inRepo: IN_REPO,
  * shards, against ~200 ms for one. `repo` is therefore named in every description that
  * accepts it, so the model narrows by default instead of paying for the sweep.
  */
-const BANK_DESC = "One bank — a whole source root, e.g. 'projects', 'projects-archive', " +
-  "'projects-1sep-tue2026', 'codex', 'omp', 'memory'. The three Claude banks are " +
-  "overlapping snapshots of the same machine, so the SAME session can appear in two of " +
-  "them. relic_search collapses duplicated events; relic_sessions does NOT — there a " +
-  "cross-bank copy shows up as an extra transcript in the same tree. Scoping to one bank " +
-  "is the cheapest filter there is.";
+const BANK_DESC = "One bank — a whole source root, matched EXACTLY (not a substring). " +
+  "Call relic_status for the banks on this machine; it prints them as headings. The " +
+  "list is per-machine and changes when a source is added, so do not assume names. " +
+  "Several banks are usually overlapping snapshots of the same machine, so the SAME " +
+  "session can appear in two of them: relic_search collapses duplicated events, " +
+  "relic_sessions does NOT — there a cross-bank copy shows up as an extra transcript " +
+  "in the same tree. Scoping to one bank is the cheapest filter there is.";
 
-const REPO_DESC = "Substring of the repo key, e.g. 'neo-oracle'. STRONGLY RECOMMENDED: " +
-  "without it the query fans out over every indexed repo (seconds, not milliseconds). " +
-  "Call relic_status to see which repos exist.";
+const REPO_DESC = "Substring of the REPO portion only, e.g. 'neo-oracle'. NOT the shard " +
+  "key: relic_status groups its rows under a bank heading, and only the indented repo " +
+  "column is what this accepts — passing 'projects/github.com/org/repo' matches nothing. " +
+  "STRONGLY RECOMMENDED: without it the query fans out over every indexed repo (seconds, " +
+  "not milliseconds).";
 const SINCE_DESC = "Relative span (7d, 12h, 30m), a date (2026-09-01), or a full ISO timestamp.";
 
 const str = (d: string) => ({ type: "string" as const, description: d });
@@ -126,6 +130,7 @@ const TOOLS = [
                 "case-insensitive substring, e.g. 'ralph-dig'."),
         repo: str("Repo filter. Unnecessary for an id; RECOMMENDED for a name, which " +
                   "otherwise searches every indexed repo."),
+        bank: str(BANK_DESC),
         limit: num("Max transcripts listed (default 10). Stats always cover all of them."),
         neighbours: { type: "boolean" as const, description:
           "Include the sessions before and after this one in the same worktree (default true)." },
@@ -146,6 +151,8 @@ const TOOLS = [
       type: "object",
       properties: {
         id: str("Session uuid or prefix."),
+        repo: str(REPO_DESC),
+        bank: str(BANK_DESC),
         limit: num("Max rows shown per group (default 8)."),
         width: num("Axis width in characters (default 40)."),
       },
@@ -195,12 +202,43 @@ const TOOLS = [
   {
     name: "relic_status",
     description:
-      "What is indexed: one row per repo with session and event counts, biggest first. " +
-      "Call this FIRST when you do not know which repo names are valid — the keys listed " +
-      "here are exactly what the `repo` filter accepts.",
+      "What is indexed, grouped BANK first then repo, biggest first. Call this FIRST " +
+      "when you do not know what to filter on — it is the only place both filter " +
+      "vocabularies are discoverable. A bank HEADING is what `bank` accepts (exact); " +
+      "an indented repo row is what `repo` accepts (substring). The same repo appears " +
+      "under several banks when those banks are overlapping snapshots of one machine.",
     inputSchema: {
       type: "object",
-      properties: { limit: num("Max repo rows (default 25).") },
+      properties: {
+        bank: str(BANK_DESC),
+        limit: num("Max repo rows PER BANK (default 15)."),
+      },
+    },
+  },
+  {
+    name: "relic_pending",
+    description:
+      "What is on disk but NOT in the index, and WHICH sessions those are. " +
+      "relic_status can look completely healthy while a whole tier is unindexed — it " +
+      "reports what was imported, never what was missed — so this is the tool that " +
+      "answers 'is the index actually complete'. Separates the two reasons a file is " +
+      "pending: never seen (missing) versus seen and since modified (changed, the normal " +
+      "state of any live session). With list>0 it names them, newest first, each with its " +
+      "session id and the repo read from that transcript's own cwd.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        list: num("Name this many pending sessions instead of only counting them " +
+                  "(default 0 = counts only). Capped deliberately: the counts are a stat() " +
+                  "sweep, but naming a file means opening it to read its cwd."),
+        bank: str(BANK_DESC),
+        repo: str(REPO_DESC),
+        since: str("Only consider files modified within this span, e.g. '24h'. Omit for " +
+                   "the WHOLE corpus — and omit it when the question is 'is anything " +
+                   "missing', because a --since scan cannot see a file older than the span."),
+        corpus: str("Comma-separated source keys to restrict the scan to. Default: every " +
+                    "enabled source."),
+      },
     },
   },
 ];
@@ -260,14 +298,39 @@ async function run(name: string, a: any): Promise<string> {
 
   if (name === "relic_status") {
     const { root, rows } = await indexStatus(scope);
-    if (!rows.length) return `no shards indexed under ${root}\nrun: relic index --since 7d`;
-    const limit = Number(a?.limit ?? 25);
-    const L = [`index ${root} · LanceDB + ICU full-text (BM25) · ${rows.length} repos`, ""];
-    for (const r of rows.slice(0, limit))
-      L.push(`${r.key.padEnd(46)} ${String(r.sessions).padStart(6)} sess ${fmt(r.events).padStart(11)} ev`);
-    if (rows.length > limit) L.push(`... and ${rows.length - limit} more`);
-    L.push("", `total ${fmt(rows.reduce((x, r) => x + r.events, 0))} events · ` +
-               `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} sessions`);
+    if (!rows.length)
+      return `no shards indexed under ${root}` +
+             (a?.bank ? ` for bank=${a.bank} — call relic_status with no bank to see which banks exist` : "") +
+             `\nrun: relic index --since 7d`;
+    const limit = Number(a?.limit ?? 15);
+    const banks = groupByBank(rows);
+    const when = (iso: string) => iso ? localDateTime(iso) : "never";
+    const L = [
+      `index ${root} · LanceDB + ICU full-text (BM25)`,
+      `${banks.length} bank(s) · ${rows.length} shards`,
+      // Two clocks. "last indexed" is when the INDEXER last wrote; "newest session" is
+      // when the newest transcript BEGAN. A reindex of old material moves the first and
+      // not the second; an index that has not run since Tuesday can still show a recent
+      // second. Answer "is this current" from the first.
+      `last indexed ${when(maxISO(rows.map(r => r.lastIndexed)))} · ` +
+      `newest session ${when(maxISO(rows.map(r => r.newestSession)))}`,
+      "",
+      // The legend, not a decoration: this is the only place a model can learn that the
+      // two filters read two DIFFERENT columns of what follows.
+      `bank = the heading (exact) · repo = the indented column (substring)`,
+      "",
+    ];
+    for (const b of banks) {
+      L.push(`${b.bank}   ${fmt(b.sessions)} sessions · ${fmt(b.events)} events · ${b.shards} shards`);
+      L.push(`${" ".repeat(b.bank.length)}   indexed ${when(b.lastIndexed)} · newest session ${when(b.newestSession)}`);
+      for (const r of b.rows.slice(0, limit))
+        L.push(`  ${r.repo.replace("github.com/", "").padEnd(46)} ` +
+               `${String(r.sessions).padStart(6)} sess ${fmt(r.events).padStart(11)} ev`);
+      if (b.rows.length > limit) L.push(`  ... and ${b.rows.length - limit} more (raise limit)`);
+      L.push("");
+    }
+    L.push(`total ${fmt(rows.reduce((x, r) => x + r.events, 0))} events · ` +
+           `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} sessions · ${rows.length} shards`);
     return L.join("\n");
   }
 
@@ -387,6 +450,37 @@ async function run(name: string, a: any): Promise<string> {
     return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) });
   }
 
+  if (name === "relic_pending") {
+    const r = await pendingReport({
+      ...scope,
+      corpus: a?.corpus ? String(a.corpus).split(",") : null,
+      since: a?.since ? String(a.since) : undefined,
+      list: Number(a?.list ?? 0),
+    });
+    const L = [
+      `found ${fmt(r.found)} · indexed ${fmt(r.indexed)} · missing ${fmt(r.missing)} · ` +
+      `changed ${fmt(r.changed)} · ${r.scanMs} ms`,
+    ];
+    if (!r.missing && !r.changed) L.push("", "nothing pending — every discovered file is in the index.");
+    L.push("");
+    for (const g of r.groups)
+      L.push(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +
+             `  missing ${String(g.missing).padStart(6)}  changed ${String(g.changed).padStart(6)}`);
+    if (r.files.length) {
+      L.push("", "not indexed yet — newest first:", "");
+      for (const x of r.files) {
+        L.push(`${localDateTime(new Date(x.mtime * 1000).toISOString())}  ` +
+               `${(x.sessionId || "(no session id)").padEnd(38)} ${x.state}`);
+        L.push(`    ${x.repo}  ·  bank ${x.bank}  ·  ${x.source}/${x.tier}`);
+        L.push(`    ${x.path}`);
+      }
+      if (r.filesOmitted) L.push("", `... and ${fmt(r.filesOmitted)} more pending (raise list)`);
+    } else if (Number(a?.list ?? 0) > 0 && (r.missing || r.changed)) {
+      L.push("", "(pending files exist but none could be listed)");
+    }
+    return L.join("\n");
+  }
+
   if (name === "relic_show") {
     const lines = await readAround(String(a.file), Number(a.seq), Number(a?.before ?? 2), Number(a?.after ?? 2));
     if (!lines.length) return `no events around seq ${a.seq} in ${a.file}`;
@@ -396,7 +490,15 @@ async function run(name: string, a: any): Promise<string> {
   return `unknown tool ${name}`;
 }
 
-const server = new Server({ name: "relic", version: "0.1.0" }, { capabilities: { tools: {} } });
+// Read, not hardcoded: a literal here disagreed with package.json the moment either
+// moved, and the version a client reports is the one from this handshake.
+const VERSION = (() => {
+  try {
+    return String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "0.0.0");
+  } catch { return "0.0.0"; }
+})();
+
+const server = new Server({ name: "relic", version: VERSION }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 

@@ -3,7 +3,8 @@ import { localDateTime, localTime, localDate } from "../src/time.js";
 import { encodeProjectDir, encodeOmpDir } from "../src/live.js";
 import { locationOf, shardDirFor, DEFAULT_BANK } from "../src/repo.js";
 import { classify } from "../src/noise.js";
-import { nameOf, looksLikeId, toISO, dedupeHits } from "../src/query.js";
+import { nameOf, looksLikeId, toISO, dedupeHits, groupByBank, maxISO,
+         sessionIdOfPath } from "../src/query.js";
 
 /**
  * Pure-function tests — no LanceDB, no filesystem, no fixtures.
@@ -235,5 +236,79 @@ describe("shardDirFor — the bank is the top segment", () => {
   test("in-repo puts the bank INSIDE .relic, so one checkout can hold several", () => {
     const d = shardDirFor("github.com/acme/repo", null, true, "projects-archive");
     expect(d.endsWith("github.com/acme/repo/.relic/banks/projects-archive")).toBe(true);
+  });
+});
+
+describe("sessionIdOfPath — the uuid is at a different depth in every shape", () => {
+  // The basename IS the uuid for exactly one of the four claude/codex layouts. Parsing
+  // the basename instead of the path made a subagent file report its AGENT NAME where a
+  // session id belongs, which reads as a valid answer and is not one.
+  test("claude session: uuid is the basename", () => {
+    expect(sessionIdOfPath("/r/-opt-Code-x/04d1d650-031a-44f6-9c22-3e400e68390f.jsonl"))
+      .toBe("04d1d650-031a-44f6-9c22-3e400e68390f");
+  });
+  test("claude subagent: uuid is two directories up, NOT the basename", () => {
+    expect(sessionIdOfPath("/r/-opt-x/04d1d650-031a-44f6-9c22-3e400e68390f/subagents/fable-uid.jsonl"))
+      .toBe("04d1d650-031a-44f6-9c22-3e400e68390f");
+  });
+  test("claude workflow_agent: uuid is four directories up", () => {
+    expect(sessionIdOfPath(
+      "/r/-opt-x/04d1d650-031a-44f6-9c22-3e400e68390f/subagents/workflows/wf_abc/agent-7.jsonl"))
+      .toBe("04d1d650-031a-44f6-9c22-3e400e68390f");
+  });
+  test("codex rollout: uuid sits after a timestamp in the basename", () => {
+    expect(sessionIdOfPath("/c/sessions/2026/09/18/rollout-2026-09-18T10-00-00-04d1d650-031a-44f6-9c22-3e400e68390f.jsonl"))
+      .toBe("04d1d650-031a-44f6-9c22-3e400e68390f");
+  });
+  test("omp has no uuid — the id is what follows the underscore", () => {
+    expect(sessionIdOfPath("/o/--opt-x--/20260918T100000_abc123.jsonl", "omp")).toBe("abc123");
+  });
+  test("a vault note has no session at all", () => {
+    expect(sessionIdOfPath("/repo/psi/memory/learnings/2026-09-18_thing.md")).toBe("");
+  });
+  test("uppercase uuid normalises to lowercase", () => {
+    expect(sessionIdOfPath("/r/p/04D1D650-031A-44F6-9C22-3E400E68390F.jsonl"))
+      .toBe("04d1d650-031a-44f6-9c22-3e400e68390f");
+  });
+});
+
+describe("groupByBank — bank first, because a flat list hides why a repo repeats", () => {
+  const rows = [
+    { bank: "projects",        repo: "github.com/a/x", events: 10, sessions: 1, lastIndexed: "2026-09-18T10:00:00Z", newestSession: "2026-09-01T00:00:00Z" },
+    { bank: "projects-archive",repo: "github.com/a/x", events:  9, sessions: 9, lastIndexed: "2026-09-17T10:00:00Z", newestSession: "2026-09-16T00:00:00Z" },
+    { bank: "projects",        repo: "github.com/a/y", events: 50, sessions: 5, lastIndexed: "2026-09-18T12:00:00Z", newestSession: "2026-09-18T00:00:00Z" },
+  ];
+  test("groups by bank, biggest bank first", () => {
+    const g = groupByBank(rows);
+    expect(g.map(b => b.bank)).toEqual(["projects", "projects-archive"]);
+    expect(g[0].events).toBe(60);
+    expect(g[0].sessions).toBe(6);
+    expect(g[0].shards).toBe(2);
+  });
+  test("the SAME repo in two banks stays two rows — it is two shards", () => {
+    const g = groupByBank(rows);
+    const repos = g.flatMap(b => b.rows.map(r => r.repo));
+    expect(repos.filter(r => r === "github.com/a/x").length).toBe(2);
+  });
+  test("rows inside a bank are biggest first", () => {
+    expect(groupByBank(rows)[0].rows.map(r => r.repo)).toEqual(["github.com/a/y", "github.com/a/x"]);
+  });
+  test("a bank folds to the NEWEST timestamp in it, not the first seen", () => {
+    const g = groupByBank(rows);
+    expect(g[0].lastIndexed).toBe("2026-09-18T12:00:00Z");
+    expect(g[0].newestSession).toBe("2026-09-18T00:00:00Z");
+  });
+});
+
+describe("maxISO — an absent timestamp must not win", () => {
+  test("picks the newest", () => {
+    expect(maxISO(["2026-09-01T00:00:00Z", "2026-09-18T00:00:00Z"])).toBe("2026-09-18T00:00:00Z");
+  });
+  test("empty and undefined lose to any real value", () => {
+    expect(maxISO(["", undefined, "2026-01-01T00:00:00Z"])).toBe("2026-01-01T00:00:00Z");
+  });
+  test("all-empty is empty, NOT undefined — callers render it as 'never'", () => {
+    expect(maxISO(["", undefined])).toBe("");
+    expect(maxISO([])).toBe("");
   });
 });
