@@ -29,13 +29,21 @@ import { trace } from "./trace.js";
 
 const DATA_ROOT = process.env.RELIC_DATA_ROOT || null;
 const IN_REPO = process.env.RELIC_IN_REPO === "1";
-const scopeOf = (a: any) => ({ dataRoot: DATA_ROOT, inRepo: IN_REPO, repo: a?.repo || undefined });
+const scopeOf = (a: any) => ({ dataRoot: DATA_ROOT, inRepo: IN_REPO,
+                               repo: a?.repo || undefined, bank: a?.bank || undefined });
 
 /**
  * A fan-out over every shard is the expensive case — measured at 10.7 s across 345
  * shards, against ~200 ms for one. `repo` is therefore named in every description that
  * accepts it, so the model narrows by default instead of paying for the sweep.
  */
+const BANK_DESC = "One bank — a whole source root, e.g. 'projects', 'projects-archive', " +
+  "'projects-1sep-tue2026', 'codex', 'omp', 'memory'. The three Claude banks are " +
+  "overlapping snapshots of the same machine, so the SAME session can appear in two of " +
+  "them. relic_search collapses duplicated events; relic_sessions does NOT — there a " +
+  "cross-bank copy shows up as an extra transcript in the same tree. Scoping to one bank " +
+  "is the cheapest filter there is.";
+
 const REPO_DESC = "Substring of the repo key, e.g. 'neo-oracle'. STRONGLY RECOMMENDED: " +
   "without it the query fans out over every indexed repo (seconds, not milliseconds). " +
   "Call relic_status to see which repos exist.";
@@ -57,6 +65,7 @@ const TOOLS = [
       properties: {
         query: str("Words to find. Not a regex and not SQL — plain terms."),
         repo: str(REPO_DESC),
+        bank: str(BANK_DESC),
         limit: num("Max hits (default 20)."),
         role: str("user | assistant | thinking | tool_use | tool_result | system. " +
                   "'user' and 'assistant' are what a human and the model actually said."),
@@ -91,6 +100,7 @@ const TOOLS = [
       type: "object",
       properties: {
         repo: str(REPO_DESC),
+        bank: str(BANK_DESC),
         since: str(SINCE_DESC),
         until: str(SINCE_DESC),
         worktree: str("Worktree name."),
@@ -278,7 +288,8 @@ async function run(name: string, a: any): Promise<string> {
     // every query a model made.
     trace({ ts: new Date().toISOString(), q, chars: [...q].length,
             filters: a?.repo ? { repo: String(a.repo) } : {},
-            shards, hits: hits.length, ms, top_repo: hits[0]?.repo ?? "", fts: true }, DATA_ROOT);
+            shards, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
+            top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true }, DATA_ROOT);
 
     if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)`;
     const narrowed = !a.all_tiers && !a.tier;

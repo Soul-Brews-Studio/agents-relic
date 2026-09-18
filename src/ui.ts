@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { LanceStore } from "./store/lance.js";
 import { listShards, defaultRoot } from "./repo.js";
+import { dedupeHits } from "./query.js";
 
 /**
  * A local viewer. One file, no build step, no client framework.
@@ -189,8 +190,13 @@ export async function serve(opts: { port: number; dataRoot: string | null; inRep
             searched++;
           } catch { /* a shard mid-write can throw; skip it */ }
         }
+        // Same dedup rule as searchEvents, which this path does NOT go through: with a
+        // bank per source root, one event indexed under three roots returns three
+        // identical rows and the viewer shows it three times.
+        hits.sort((a, b) => Number(b._score ?? 0) - Number(a._score ?? 0));
+        const deduped = dedupeHits(hits);
         return Response.json({
-          hits: hits.slice(0, limit), total: hits.length, shards: searched,
+          hits: deduped.slice(0, limit), total: deduped.length, shards: searched,
           ms: Math.round(performance.now() - t0),
         });
       }
