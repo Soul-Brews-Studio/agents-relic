@@ -122,6 +122,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
+    org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
     allTiers: Boolean(f["all-tiers"] || f.tier),
   });
@@ -410,13 +411,14 @@ if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
-  search  <query> [--repo S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
+  search  <query> [--repo S] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix>          resolve a session id to its transcript file(s)
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
+  read    <file> [--prose]     whole transcript as readable conversation, any format
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
@@ -557,6 +559,30 @@ else if (cmd === "dig") {
     noCache: Boolean(f["no-cache"]),
   });
   console.log(JSON.stringify(rows, null, 2));
+}
+else if (cmd === "read") {
+  if (!pos[1]) { console.error("read needs a file path"); process.exit(1); }
+  const { parserFor } = await import("./sources.js");
+  const parsed = await parserFor(pos[1])(pos[1]);
+  const wantRole = f.role as string | undefined;
+  const prose = Boolean(f.prose);
+  const rows = parsed.events.filter(e =>
+    (!wantRole || e.role === wantRole) &&
+    (!prose || e.role === "user" || e.role === "assistant" || e.role === "thinking" || e.role === "note"));
+
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify({ file: pos[1], title: parsed.title, events: rows }, null, 2)); }
+  else if (mode === "jsonl") { for (const e of rows) console.log(JSON.stringify(e)); }
+  else if (mode === "plain") { for (const e of rows) console.log(`${e.seq}\t${e.role}\t${e.text.replace(/\s+/g, " ")}`); }
+  else {
+    if (parsed.title) console.log(`${parsed.title}\n`);
+    for (const e of rows) {
+      console.log(`#${String(e.seq).padStart(4)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}`);
+      console.log(e.text.replace(/^/gm, "  "));
+      console.log();
+    }
+    console.log(`${rows.length} of ${parsed.events.length} events · ${pos[1]}`);
+  }
 }
 else if (cmd === "now" || cmd === "live") await cmdNow(f);
 else if (cmd === "mcp") {

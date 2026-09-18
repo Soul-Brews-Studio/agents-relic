@@ -27,6 +27,7 @@ export interface Scope {
 export interface SearchOpts extends Scope {
   limit?: number;
   tier?: string; source?: string; worktree?: string; path?: string; role?: string;
+  org?: string; project?: string; dir?: string;
   /**
    * Include subagent and workflow_agent transcripts. Default FALSE — see searchEvents.
    */
@@ -112,8 +113,22 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    * and cutting the work the fan-out does. `allTiers` gets it all back, and the CLI and
    * MCP both SAY SO on every result rather than silently narrowing.
    */
-  const tier = o.tier ?? (o.allTiers ? undefined : "session");
-  const opts = { limit, tier, source: o.source, worktree: o.worktree, path: o.path,
+  /*
+   * The default narrows to session AND note — not session alone.
+   *
+   * Vault notes are the OPPOSITE of the noise the tier default exists to cut: hand
+   * written, one per idea, no near-duplicates. Excluding them would make `relic
+   * search` silently miss the most deliberate writing in the corpus.
+   *
+   * `tier` must stay UNDEFINED when defaulting, or the store's `if (opts.tier)`
+   * branch pins it to a single value and the multi-tier filter below is dead code.
+   * That was the bug: default returned {session:30, note:0} while --all-tiers found
+   * notes fine, so the vault indexed correctly and was invisible anyway.
+   */
+  const mainOnly = !o.tier && !o.allTiers;
+  const tier = o.tier;
+  const opts = { limit, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
+                 org: o.org, project: o.project, dir: o.dir,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
 
   let next = 0;
