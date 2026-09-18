@@ -106,7 +106,16 @@ export const parseVault: Parser = async (filePath) => {
   // also stored separately.
   const chunks = chunk(body.trim(), 15_000);
   const events: ParsedEvent[] = chunks.map((c, i) => ({
-    uid: uidOf("vault", fileKey, i),
+    // FULL PATH, not basename. Transcripts key on basename deliberately, so the same
+    // session found under two roots dedups. Vault notes are the opposite: basenames
+    // collide constantly (generated inbox messages repeat across inbox/outbox/memory),
+    // and the path IS the document's identity — sessionUuid is already the path.
+    //
+    // With per-file writes a collision was invisible: one row per commit, nothing to
+    // conflict with. Batching put the duplicates in ONE mergeInsert and LanceDB
+    // rejected the entire batch with "Ambiguous merge inserts are prohibited", so
+    // 4,439 notes silently failed to index.
+    uid: uidOf("vault", filePath, i),
     seq: i,
     role: "note",
     ts,
@@ -117,7 +126,7 @@ export const parseVault: Parser = async (filePath) => {
   // (a placeholder someone made and never filled), and dropping it makes the index
   // disagree with the filesystem about what exists.
   if (!events.length) {
-    events.push({ uid: uidOf("vault", fileKey, 0), seq: 0, role: "note", ts, text: raw });
+    events.push({ uid: uidOf("vault", filePath, 0), seq: 0, role: "note", ts, text: raw });
   }
 
   return {

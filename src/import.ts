@@ -90,7 +90,18 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       // One commit per TABLE per batch — not per row. Looping putSession/putFile here
       // was the original bug in this fix: it batched events and left the other two
       // committing per row, so a 250-file batch still cost 500 commits.
-      if (b.events.length)   await store.putEvents(b.events);
+      // Defensive dedup by uid, keeping the LAST occurrence.
+      //
+      // mergeInsert rejects a batch outright if two source rows target the same key
+      // ("Ambiguous merge inserts are prohibited") — and it fails the WHOLE batch, not
+      // the offending row. Per-file writes could never hit this; batching can, for any
+      // source whose uid scheme is not unique within a batch. One bad pair must not
+      // discard 250 files' work.
+      if (b.events.length) {
+        const byUid = new Map<string, EventRow>();
+        for (const e of b.events) byUid.set(e.uid, e);
+        await store.putEvents([...byUid.values()]);
+      }
       if (b.sessions.length) await store.putSessions(b.sessions);
       if (b.files.length)    await store.putFiles(b.files);
       b.events = []; b.sessions = []; b.files = []; b.deletes = [];
