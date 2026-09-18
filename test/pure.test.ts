@@ -6,6 +6,7 @@ import { classify } from "../src/noise.js";
 import { nameOf, looksLikeId, toISO, dedupeHits, groupByBank, maxISO,
          sessionIdOfPath } from "../src/query.js";
 import { buildTree, renderTree, commonPrefix } from "../src/tree.js";
+import { kindOf } from "../src/discover.js";
 
 /**
  * Pure-function tests — no LanceDB, no filesystem, no fixtures.
@@ -369,5 +370,35 @@ describe("session tree — the shape a flat listing hides", () => {
     expect(commonPrefix(["/a/b/c/x.jsonl", "/a/b/d/y.jsonl"])).toBe("/a/b/");
     expect(commonPrefix(["/only/one.jsonl"])).toBe("/only/");
     expect(commonPrefix([])).toBe("");
+  });
+});
+
+describe("kind vs tier — one column was holding two axes", () => {
+  // `tier` answered "where in the hierarchy" AND "what kind of thing", so the default
+  // filter (tier = 'session' OR tier = 'note') read as "the main tiers" while actually
+  // meaning "one tier plus one kind". A tier default of "session" once hid 10,000
+  // freshly indexed vault notes while the result count looked perfectly healthy.
+  test("every transcript position is the same KIND", () => {
+    expect(kindOf("session", "claude-live")).toBe("transcript");
+    expect(kindOf("subagent", "claude-live")).toBe("transcript");
+    expect(kindOf("workflow_agent", "claude-live")).toBe("transcript");
+  });
+
+  test("a document is not a tier", () => {
+    expect(kindOf("note", "oracle-vault")).toBe("note");
+    expect(kindOf("memory", "claude-memory")).toBe("memory");
+  });
+
+  test("source decides before tier, or hermes is filed as a transcript", () => {
+    // hermes rows carry tier "session" while being chat messages. Reading tier first
+    // would make every one of them a transcript, which is the bug in miniature.
+    expect(kindOf("session", "hermes")).toBe("message");
+  });
+
+  test("an unknown tier degrades to transcript, not to an empty string", () => {
+    // "" is reserved to mean "this row predates the column" — a new value must never
+    // collide with that, or old-shard fallback logic starts firing on new rows.
+    expect(kindOf("something-new", "claude-live")).toBe("transcript");
+    expect(kindOf("session", "claude-live")).not.toBe("");
   });
 });

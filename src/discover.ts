@@ -9,6 +9,31 @@ import type { Parser } from "./types.js";
 // enum so the whole query surface (search/show/sessions/MCP) stays one code path.
 export type Tier = "session" | "subagent" | "workflow_agent" | "note" | "memory";
 
+/**
+ * The OTHER axis: what a row is, as opposed to where it sits.
+ *
+ * `note` and `memory` were never tiers — a document has no position in a transcript
+ * hierarchy. Keeping both axes in one column made the default search filter
+ * `(tier = 'session' OR tier = 'note')`, which reads as "the main tiers" and is really
+ * "one tier plus one kind"; a tier default of "session" once hid 10,000 freshly
+ * indexed vault notes while the result count looked perfectly healthy.
+ */
+export type Kind = "transcript" | "note" | "memory" | "message";
+
+/**
+ * Derived, never stored twice.
+ *
+ * `source` decides before `tier` does, because hermes rows carry tier "session" while
+ * being chat messages rather than an agent transcript — tier alone cannot tell them
+ * apart, and reading tier first would file every hermes message as a transcript.
+ */
+export function kindOf(tier: Tier | string, source: string): Kind {
+  if (source.startsWith("hermes")) return "message";
+  if (tier === "note") return "note";
+  if (tier === "memory") return "memory";
+  return "transcript";
+}
+
 export interface Found {
   path: string;
   projectDir: string;      // raw encoded dir name (display only — the encoding is lossy)

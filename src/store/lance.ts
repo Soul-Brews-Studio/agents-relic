@@ -31,7 +31,24 @@ export interface EventRow {
   ts: string;             // "" when absent
   text: string;
   source: string;         // claude | codex
+  /**
+   * WHERE this sits in a transcript hierarchy. Nothing else.
+   *
+   * It used to also carry `note` and `memory`, which are not positions in a hierarchy
+   * at all — they are different KINDS of thing. One column holding two axes is why the
+   * default filter read as "main tiers" while actually meaning "one tier plus one
+   * kind", and why a tier default of "session" once made 10,000 freshly-indexed vault
+   * notes invisible while the result count looked healthy.
+   */
   tier: string;           // session | subagent | workflow_agent
+  /**
+   * WHAT this is. The second axis, split out of `tier`.
+   *
+   * "" on rows written before this column existed — `widen()` backfills the default
+   * rather than reindexing 509 shards, so every READ must fall back to `tier` until a
+   * full rebuild lands. See kindOf() and the search filter.
+   */
+  kind: string;           // transcript | note | memory | message
   worktree: string;       // which worktree/agent/lab the session ran in — "" = main checkout
   cwd: string;            // full working dir, so a path substring is searchable too
   // The location hierarchy: org / repo / project / worktree / dir. repo_key fuses the
@@ -200,9 +217,33 @@ export class LanceStore {
     const limit = opts.limit ?? 20;
     const filters: string[] = [];
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
-    // The "main" default: the human's own thread plus vault notes, excluding the
-    // subagent/workflow chatter that is 73% of the corpus by file count.
-    else if (opts.mainTiers) filters.push(`(tier = 'session' OR tier = 'note')`);
+    /*
+     * The "main" default: the human's own thread plus documents, excluding the
+     * subagent/workflow chatter that is 73% of the corpus by file count.
+     *
+     * THE COLUMN IS ABSENT ON OLD SHARDS, NOT EMPTY — and that distinction is the
+     * whole trap. `widen()` adds a column on WRITE, so the 509 shards that predate
+     * `kind` have no such field at all. A filter guarding with `kind = ''` still
+     * NAMES the column, so the query is invalid SQL there, every shard throws, the
+     * per-shard catch swallows it, and the search returns zero matches while
+     * reporting a healthy-looking shard count. Measured while building this: 2 of 509
+     * shards answered and the result read as "no matches", not as an error.
+     *
+     * So the schema decides which filter to emit, before any SQL is built. Drop the
+     * tier-only branch only once every shard has been rewritten, and check it with a
+     * count rather than by reasoning about it.
+     */
+    else if (opts.mainTiers) {
+      const hasKind = (await t.schema()).fields.some(f => f.name === "kind");
+      filters.push(hasKind
+        ? `((kind = 'transcript' AND tier = 'session')` +
+          // note and message are whole-kind includes: a vault note has no tier worth
+          // filtering on, and a hermes message is a human conversation, not chatter.
+          ` OR kind = 'note' OR kind = 'message'` +
+          // rows written by an older build into a shard that HAS the column
+          ` OR (kind = '' AND (tier = 'session' OR tier = 'note')))`
+        : `(tier = 'session' OR tier = 'note')`);
+    }
     if (opts.source) filters.push(`source = ${sqlStr(opts.source)}`);
     // worktree is context, not noise: "which worktree was this said in" is usually
     // the same question as "what was I working on".

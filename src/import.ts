@@ -1,6 +1,7 @@
 import { LanceStore, type EventRow, type SessionRow, type FileRow } from "./store/lance.js";
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
+import { kindOf } from "./discover.js";
 import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
 
 /**
@@ -159,7 +160,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       const events: EventRow[] = kept.map(e => ({
         uid: e.uid, session_uuid: p.sessionUuid, file_path: file.path, repo_key: repoCol,
         seq: e.seq, role: e.role, ts: e.ts ?? "", text: e.text,
-        source: file.source, tier: file.tier,
+        source: file.source, tier: file.tier, kind: kindOf(file.tier, file.source),
         worktree: ctx.worktree, cwd: p.cwd ?? "",
         org: loc.org, project: loc.project, dir: loc.dir,
         mem_type: String((p as any).memType ?? ""),
