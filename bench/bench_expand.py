@@ -4,15 +4,20 @@ Thai models are not installed, so the honest test of the MECHANISM uses an insta
 pair. en->fr->search-both measures the plumbing and the cost; it cannot measure the
 Thai recall win, and this reports it as such rather than implying otherwise.
 """
+import os
 import json, pickle, subprocess, time
 import lancedb
 
-BIN = "/opt/Code/github.com/Soul-Brews-Studio/agents-relic/wt/agents-relic-kind-vs-tier-18sep-fri2026/tools/bin/apple-translate"
-docs = json.load(open("/tmp/bench_docs.json"))
+# Resolved from THIS file, not pinned to one worktree — the absolute path that used
+# to be here benchmarked another checkout's binary, and broke outright once that
+# worktree was removed. Same bug as build_pool.py's sys.path.
+BIN = os.environ.get("APPLE_TRANSLATE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools", "bin", "apple-translate")
+docs = json.load(open(os.environ.get("BENCH_DOCS", "/tmp/bench_docs.json")))
 uids, texts = docs["uids"], docs["texts"]
-queries = json.load(open("/tmp/queries.json"))
+queries = json.load(open(os.environ.get("BENCH_QUERIES", "/tmp/queries.json")))
 K = 20
-results = pickle.load(open("/tmp/bench_all.pkl", "rb"))
+results = pickle.load(open(os.environ.get("BENCH_ALL", "/tmp/bench_all.pkl"), "rb"))
 
 db = lancedb.connect("/tmp/bench_fts")
 t = db.open_table("d")
@@ -69,5 +74,5 @@ for q, f in zip(queries, fr or en_qs):
     b = [u for u in (fts(f) if f else []) if u not in a]
     rr2.append((score(a + b, q["uid"]), q["thai"]))
 results["FTS + expand(fr) append"] = (rr2, ms_q, "original ranks preserved")
-pickle.dump(results, open("/tmp/bench_all.pkl", "wb"))
+pickle.dump(results, open(os.environ.get("BENCH_ALL", "/tmp/bench_all.pkl"), "wb"))
 print("  expansion arms done")

@@ -4,11 +4,11 @@ MRR (mean reciprocal rank): 1.0 means the right document was always first, 0.5 m
 typically second. Reported alongside recall@1/@10 because MRR alone hides whether a
 method is "usually first" or "occasionally first, often twentieth".
 """
-import json, shutil, time
+import json, os, shutil, time
 import lancedb, numpy as np
 
-pool = json.load(open("/tmp/pool.json"))
-queries = json.load(open("/tmp/queries.json"))
+pool = json.load(open(os.environ.get("BENCH_POOL", "/tmp/pool.json")))
+queries = json.load(open(os.environ.get("BENCH_QUERIES", "/tmp/queries.json")))
 K = 20
 uids = [r["uid"] for r in pool]
 texts = [" ".join(r["text"].split()) for r in pool]
@@ -45,4 +45,4 @@ results["FTS (ICU)"] = (rr, fts_ms, "—")
 print(f"  FTS done  {fts_ms:.0f} ms/query")
 json.dump({"uids": uids, "texts": texts}, open("/tmp/bench_docs.json", "w"))
 import pickle
-pickle.dump(results, open("/tmp/bench_fts.pkl", "wb"))
+pickle.dump(results, open(os.environ.get("BENCH_FTS", "/tmp/bench_fts.pkl"), "wb"))

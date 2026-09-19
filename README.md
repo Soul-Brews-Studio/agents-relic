@@ -883,11 +883,35 @@ is doing work no 384-dim multilingual model matched. And **RRF fusion made retri
 worse**, 0.890 → 0.822: k=60 weights both lists equally, so blending a weak one into a
 strong one drags the strong one down.
 
-The caveat that keeps this honest: this measures **known-item** retrieval, which is
-what lexical search is best at. It says nothing about paraphrase queries, where vectors
-should win and FTS structurally cannot help. So `embed` writes real vectors and
-`search` does not read them — if a semantic path ships, it ships as an explicit mode
-with its own paraphrase benchmark, never as a default and never RRF-blended.
+That set measures **known-item** retrieval, which is what lexical search is best at. The
+paraphrase set — same pool, **same 200 target documents**, queries rewritten by a local
+model told not to reuse the target's terms — is the other half, and **the ordering flips**:
+
+```
+                        known-item   paraphrase    delta
+FTS (ICU)                    0.890        0.046   -0.844
+multilingual-e5-small        0.600        0.140   -0.461
+```
+
+So the two methods fail in opposite regimes. What they do **not** do is fail on different
+queries *within* a regime — which is the measurement that decides whether to build anything:
+
+```
+KNOWN-ITEM           e5 HIT  e5 MISS       PARAPHRASE     e5 HIT  e5 MISS
+   FTS HIT             154       41          FTS HIT          18        5
+   FTS MISS              1        4          FTS MISS        50      127
+```
+
+Asymmetric containment. e5 adds **1** query in 200 to FTS on known-item; FTS adds **5** to
+e5 on paraphrase. Oracle bounds are +0.5% and +2.5% over the better single method, and RRF
+lost at every k in **both** directions — so no fusion and no router. The prize is the
+regime switch itself (paraphrase recall@20 **11.5% → 34%**), which no blend reaches.
+
+`search` still does not read vectors, and that is now a measured decision rather than an
+untested one: a `--semantic` mode is justified in principle — the user knows their query
+style better than a classifier would — but not by quality. 0.140 MRR, 34% recall@20,
+median target rank 68 of 3,000 is a different failure from FTS's, not a better one.
+`relic embed` ships as the infrastructure that makes this measurable.
 
 ### `attach` — index someone else's LanceDB
 

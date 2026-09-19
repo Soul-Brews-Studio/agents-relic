@@ -466,7 +466,27 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   // over fresh material, and only one of those is a problem to act on.
   console.log(`last indexed  ${when(maxISO(rows.map(r => r.lastIndexed)))}` +
               `   ·   newest session  ${when(maxISO(rows.map(r => r.newestSession)))}`);
-  console.log("vectors: none yet — they land in the same `events` table, no migration.");
+  /*
+   * VECTORS, MEASURED — this line used to be a hardcoded claim that vectors "land in
+   * the same `events` table, no migration". Both halves were wrong: they land in a
+   * separate `vectors` table, because a vector column cannot be added to `events` by
+   * widening without silently becoming text. A status line that states a design
+   * intention instead of reading the disk is how a wrong plan survives being disproved.
+   */
+  let vRows = 0, vShards = 0;
+  const models = new Set<string>();
+  for (const sh of shards) {
+    try {
+      const st = await (await LanceStore.open(sh.dir)).vectorStats();
+      if (!st || !st.rows) continue;
+      vShards++; vRows += st.rows;
+      if (st.model) models.add(`${st.model}/${st.dim}d`);
+    } catch { /* an unreadable shard is not a vector report */ }
+  }
+  console.log(vRows
+    ? `vectors ${fmt(vRows)} in ${vShards} of ${shards.length} shards` +
+      `  ·  ${[...models].join(", ")}  ·  written by \`relic embed\`, not read by \`search\` yet`
+    : "vectors none — `relic index` never writes them; see `relic embed --dry-run`");
 }
 
 // ---- banks / shards (layout, no engine) ------------------------------------

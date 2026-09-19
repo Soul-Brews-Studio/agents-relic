@@ -1,14 +1,14 @@
 """Embed the same pool with each candidate model, measure MRR and throughput."""
-import json, pickle, time, warnings
+import json, os, pickle, time, warnings
 warnings.filterwarnings("ignore")
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-docs = json.load(open("/tmp/bench_docs.json"))
+docs = json.load(open(os.environ.get("BENCH_DOCS", "/tmp/bench_docs.json")))
 uids, texts = docs["uids"], docs["texts"]
-queries = json.load(open("/tmp/queries.json"))
+queries = json.load(open(os.environ.get("BENCH_QUERIES", "/tmp/queries.json")))
 K = 20
-results = pickle.load(open("/tmp/bench_fts.pkl", "rb"))
+results = pickle.load(open(os.environ.get("BENCH_FTS", "/tmp/bench_fts.pkl"), "rb"))
 
 MODELS = [
     ("multilingual-MiniLM-L12", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "", ""),
@@ -48,4 +48,4 @@ for label, name, qpre, dpre in MODELS:
     results[label] = (rr, q_ms, f"{thru:.0f} docs/s, dim={D.shape[1]}")
     print(f"  {label:<26} encoded {len(texts)} docs in {enc_s:.1f}s ({thru:.0f}/s)")
 
-pickle.dump(results, open("/tmp/bench_all.pkl", "wb"))
+pickle.dump(results, open(os.environ.get("BENCH_ALL", "/tmp/bench_all.pkl"), "wb"))
