@@ -141,6 +141,10 @@ async function peek(path: string, maxLines = 400): Promise<{ cwd: string | null;
       try {
         const r = JSON.parse(line);
         if (!cwd && typeof r.cwd === "string") cwd = r.cwd;
+        // Codex nests it: {type:"session_meta", payload:{cwd, session_id, ...}}. Reading
+        // only the top level made `now` report the CALLER's directory as the session's,
+        // with nothing to indicate it was a fallback.
+        if (!cwd && typeof r.payload?.cwd === "string") cwd = r.payload.cwd;
         // Claude writes {type:"ai-title", aiTitle}; omp writes {type:"title"|"title_change", title}.
         if (r.type === "ai-title" && typeof r.aiTitle === "string") title = r.aiTitle;
         if ((r.type === "title" || r.type === "title_change") && typeof r.title === "string") title = r.title;
@@ -160,7 +164,51 @@ async function peek(path: string, maxLines = 400): Promise<{ cwd: string | null;
  * `confident: false` rather than lying when they disagree — two checkouts can encode to
  * the same directory name, since the encoding is not injective.
  */
+/**
+ * The host's OWN answer to "which session am I", taken from the environment.
+ *
+ * Both hosts publish it and relic read neither, so `now` was inferring by mtime an
+ * answer that was sitting in a variable:
+ *
+ *   Claude Code   CLAUDE_CODE_SESSION_ID
+ *   Codex         CODEX_THREAD_ID   (also CODEX_COMPANION_SESSION_ID when companioned)
+ *
+ * This matters most for Codex, which the scan below CANNOT find at all: codex is the
+ * only source with `walk: "flat"`, and sessionIn() skips those outright because there
+ * is no project-dir layout to encode a cwd into. Observed on white.local inside a live
+ * Codex session: `relic now` reported "no session transcript for this directory" while
+ * $CODEX_THREAD_ID held the id and `relic session <id>` resolved 7 transcripts from it.
+ *
+ * Authoritative where the mtime scan is a guess: the newest transcript under a cwd is
+ * whichever agent wrote last, and on a machine running several agents in one worktree
+ * that is regularly somebody else. The same class of bug is already documented in
+ * sessionIn() — an omp agent got the lead Claude session back, every time, silently.
+ */
+export function sessionIdFromEnv(env = process.env): { id: string; via: string } | null {
+  for (const key of ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_COMPANION_SESSION_ID"]) {
+    const v = (env[key] ?? "").trim();
+    // Shape-check rather than trust: an empty or placeholder value must not beat a
+    // working filesystem scan, and these vars are inherited by every child process.
+    if (/^[0-9a-fA-F][0-9a-fA-F-]{7,}$/.test(v)) return { id: v, via: key };
+  }
+  return null;
+}
+
 export async function currentSession(cwd = process.cwd()): Promise<CurrentSession | null> {
+  /*
+   * ASK THE HOST FIRST, scan second.
+   *
+   * Only trusted when the id resolves to a transcript on disk — an env var is proof of
+   * intent, not of a file, and `now` reports paths. If it resolves to nothing (a brand
+   * new session that has not flushed, or a host whose root is not a configured source)
+   * the scan still runs and its answer stands.
+   */
+  const fromEnv = sessionIdFromEnv();
+  if (fromEnv) {
+    const hit = await sessionByUuid(fromEnv.id, cwd);
+    if (hit) return hit;
+  }
+
   // Walk UP from cwd. A session's project directory is keyed on the directory the agent
   // was started in — usually a repo root — so running this from a subdirectory would
   // otherwise report "no session" while sitting inside one. Nearest match wins.
@@ -175,6 +223,49 @@ export async function currentSession(cwd = process.cwd()): Promise<CurrentSessio
   for (const cand of candidates) {
     const hit = await sessionIn(cand, cwd);
     if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Find the transcript for a KNOWN uuid, across every source — flat ones included.
+ *
+ * Deliberately not cwd-scoped: the id came from the host, so it is already the right
+ * session, and Codex rollouts live in a date tree (`sessions/YYYY/MM/DD/`) that no cwd
+ * encoding can address. Searched newest-day-first so a live session is found in a few
+ * readdir calls rather than a full sweep.
+ */
+async function sessionByUuid(uuid: string, cwd: string): Promise<CurrentSession | null> {
+  for (const src of loadSources()) {
+    const roots: string[] = [];
+    if (src.walk === "flat") {
+      // Codex: sessions/<year>/<month>/<day>/rollout-<ts>-<uuid>.jsonl
+      // SORTED then reversed — readdir order is not chronological on any filesystem,
+      // and "newest day first" is the whole reason this terminates quickly.
+      const desc = (d: string) => subdirs(d).sort().reverse();
+      for (const y of desc(src.path))
+        for (const m of desc(join(src.path, y)))
+          for (const d of desc(join(src.path, y, m)))
+            roots.push(join(src.path, y, m, d));
+    } else {
+      for (const proj of subdirs(src.path)) roots.push(join(src.path, proj));
+    }
+    for (const dir of roots) {
+      for (const f of jsonlIn(dir)) {
+        if (!f.includes(uuid)) continue;
+        const path = join(dir, f);
+        const st = statOf(path);
+        if (!st) continue;
+        const { cwd: own, title } = await peek(path);
+        // The ID is authoritative — the host handed it over. `confident` is NOT about
+        // the id, it is about the cwd claim, so it stays false when the transcript did
+        // not record one and this falls back to the caller's directory. Reporting
+        // certainty for a value that was substituted is the failure this flag exists
+        // to prevent.
+        return { sessionUuid: uuid, projectDir: dir, path, cwd: own ?? cwd, title,
+                 ageSec: age(st.mtimeMs), confident: own !== null };
+      }
+    }
   }
   return null;
 }
