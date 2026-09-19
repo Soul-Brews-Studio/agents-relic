@@ -115,3 +115,35 @@ export function flattenContent(content: unknown): string {
   }
   return out.join("\n");
 }
+
+/**
+ * Text a HOST injected as the first "user" message, which is never a session's name.
+ *
+ * Both hosts do this and only Claude's shapes were recognised, so 64% of Codex sessions
+ * were listed by their own boot directive. Measured over 1,750 codex sessions:
+ *
+ *   391  <recommended_plugins> Here is a list of plugins that are a...
+ *   365  # AGENTS.md instructions <INSTRUCTIONS> <!-- AUTONOMY DIRE...
+ *   358  <codex_internal_context source="goal"> Continue working to...
+ *    12  # AGENTS.md instructions for /opt/Code/github.com/...
+ *
+ * The AGENTS.md blob alone is 27,708 characters, stored truncated to 200 — so every one
+ * of those sessions was named by the same cut-off sentence, differing only in a path.
+ *
+ * ANCHORED AT THE START, deliberately. A human quoting `<recommended_plugins>` while
+ * debugging is a real message and must keep its name; only a message that BEGINS as the
+ * directive is the directive.
+ */
+const HOST_PREAMBLE = [
+  /^#\s*AGENTS\.md instructions\b/i,
+  /^<recommended_plugins>/i,
+  /^<codex_internal_context\b/i,
+  /^You have oh-my-codex installed\b/i,
+  /^<INSTRUCTIONS>/i,
+  /^<environment_context>/i,
+];
+
+export function isHostPreamble(text: unknown): boolean {
+  const t = String(text ?? "").trimStart();
+  return HOST_PREAMBLE.some(rx => rx.test(t));
+}

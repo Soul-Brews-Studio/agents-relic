@@ -95,6 +95,39 @@ export const BUILTIN: SourceDef[] = [
     note: "Claude Code snapshot 1sep-tue2026 — the largest root",
   },
   {
+    /*
+     * ANOTHER ACCOUNT'S CLAUDE ROOT, on a machine several humans-worth of agents share.
+     *
+     * Same shape as the three roots above — `claude-tiers`, `parseClaude` — and it is a
+     * separate SOURCE rather than a path tweak because it is a separate bank: a bank is
+     * one whole source root, and two accounts' `projects/` directories are exactly that.
+     * Merging them into one bank would make `--bank projects` mean "whichever account
+     * indexed last", and the uid scheme dedups by content, so the overlap is resolved at
+     * read time rather than by keeping the roots apart.
+     *
+     * DISABLED, with a placeholder path, for the same reason as oracle-vault: there is
+     * no correct machine-wide default for "the other account", and reading another
+     * user's transcripts is a deliberate act. Set the path in ~/.relic/sources.json,
+     * which enables it implicitly.
+     *
+     * Reachable without ssh or a copy when the owner has granted an ACL — measured on
+     * m5, 2026-09-19, where /Users/nat/.claude/projects is mode drwx------ and still
+     * fully readable by user beta:
+     *
+     *   0: user:beta allow list,search,readattr,file_inherit,directory_inherit
+     *   1: user:beta allow list,search,readattr,readextattr,readsecurity
+     *
+     *   30,203 .jsonl visible to beta   ==   30,203 visible to nat
+     *
+     * CHECK THAT EQUALITY BEFORE INDEXING a peer root. A partially-readable tree indexes
+     * without error and reports success over whatever it happened to be allowed to see,
+     * which is the same silent-incompleteness this tool exists to make visible.
+     */
+    key: "claude-peer", path: join(HOME, ".relic-peer-unset"),
+    walk: "claude-tiers", parser: parseClaude, enabled: false, bank: "peer-projects",
+    note: "another account's Claude root on a shared machine — set its path in ~/.relic/sources.json",
+  },
+  {
     key: "codex", path: join(HOME, ".codex", "sessions"),
     walk: "flat", parser: parseCodex, enabled: true,
     note: "Codex CLI rollouts",

@@ -34,6 +34,87 @@ export function repoKeyOf(cwd: string | null): string | null {
 }
 
 /**
+ * Every `github.com/<org>/<repo>` under the ghq root, built once.
+ *
+ * The lookup the two fallbacks below need, and the reason they cannot live inside
+ * repoKeyOf(): that function is PURE — a path in, a key out, no filesystem — which is
+ * what makes it host-independent and trivially testable. Resolving a bare repo NAME to
+ * its org requires knowing what exists on this machine, so it belongs out here, called
+ * only from the import path where the filesystem is already in play.
+ */
+let repoIndexCache: Map<string, string[]> | null = null;
+export function repoIndex(): Map<string, string[]> {
+  if (repoIndexCache) return repoIndexCache;
+  const out = new Map<string, string[]>();
+  const host = join(ghqRoot(), "github.com");
+  try {
+    for (const org of readdirSync(host, { withFileTypes: true })) {
+      if (!org.isDirectory()) continue;
+      for (const repo of readdirSync(join(host, org.name), { withFileTypes: true })) {
+        if (!repo.isDirectory()) continue;
+        const name = normalizeRepo(repo.name);
+        const key = `github.com/${org.name}/${name}`;
+        const prior = out.get(name) ?? [];
+        if (!prior.includes(key)) prior.push(key);
+        out.set(name, prior);
+      }
+    }
+  } catch { /* no ghq root here — the fallbacks simply never fire */ }
+  repoIndexCache = out;
+  return out;
+}
+
+/** Exactly one repo of this name, or null. AMBIGUITY IS NOT RESOLVED BY GUESSING. */
+function uniqueRepo(name: string): string | null {
+  const hits = repoIndex().get(normalizeRepo(name));
+  // Two orgs owning a repo of the same name is real (forks, `-oracle` suffixes), and
+  // picking one would silently file a session under the wrong org. `_unresolved` is
+  // the honest answer and `cwd` is still searchable.
+  return hits && hits.length === 1 ? hits[0] : null;
+}
+
+/**
+ * repoKeyOf, plus the shapes that need to know what exists on this machine.
+ *
+ * Measured over 1,905 codex sessions on two machines, 189 resolved to `_unresolved`:
+ *
+ *   149  /Users/beta/psi-memory, sandboxes, /tmp        genuinely not a repo — CORRECT
+ *    20  ~/.herdr/worktrees/<repo>/<space>/...          recoverable
+ *    16  /private/tmp/claude-<uid>/-<encoded-path>/...  recoverable
+ *
+ * So most of `_unresolved` is right and stays. These two are checkouts OF a repo whose
+ * identity is in the path, just not as a `github.com/<org>/<repo>` triple.
+ */
+export function resolveRepoKey(cwd: string | null): string | null {
+  const direct = repoKeyOf(cwd);
+  if (direct || !cwd) return direct;
+  const parts = cwd.split("/").filter(Boolean);
+
+  // herdr's GLOBAL worktree root: ~/.herdr/worktrees/<repo>/<space>/...
+  // Unlike `<repo>/wt/<slug>`, this carries no org — herdr keys its worktrees by repo
+  // name alone — so the org has to come from the ghq index.
+  const hw = parts.indexOf("worktrees");
+  if (hw > 0 && parts[hw - 1] === ".herdr" && parts.length >= hw + 2) {
+    const hit = uniqueRepo(parts[hw + 1]);
+    if (hit) return hit;
+  }
+
+  // A Claude scratchpad: /tmp/claude-<uid>/<encoded-project-dir>/<session>/scratchpad/...
+  // The encoding maps BOTH "/" and "." to "-", so the segment cannot be split back into
+  // org and repo — `github-com-laris-co-haos-oracle` is equally `laris`/`co-haos-oracle`.
+  // Encoding each known repo the same way and comparing is exact where decoding is not.
+  const enc = parts.find(x => x.startsWith("-") && x.includes("github-com-"));
+  if (enc) {
+    for (const keys of repoIndex().values())
+      for (const key of keys) {
+        const asDir = "-" + join(ghqRoot(), key).slice(1).replace(/[/.]/g, "-");
+        if (enc === asDir || enc.startsWith(asDir + "-")) return key;
+      }
+  }
+  return null;
+}
+
+/**
  * Collapse SIBLING worktrees back into their repo — for SHARDING ONLY.
  *
  * Two conventions exist in this fleet. The current one nests worktrees inside the

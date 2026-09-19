@@ -109,6 +109,90 @@ PROJECT_CONTAINERS = {"lab", "soul-brews-studio", "learn", "demos"}
 _SIBLING = re.compile(r"^.*?\.(wt-.*|omx-worktrees|worktrees)$")
 
 
+_repo_index_cache: Optional[dict] = None
+
+
+def repo_index() -> dict:
+    """Every github.com/<org>/<repo> under the ghq root, built once.
+
+    The lookup resolve_repo_key()'s fallbacks need, and the reason they cannot live
+    inside repo_key_of(): that function is PURE — a path in, a key out, no filesystem —
+    which is what makes it host-independent and trivially testable. Resolving a bare
+    repo NAME to its org requires knowing what exists on this machine.
+    """
+    global _repo_index_cache
+    if _repo_index_cache is not None:
+        return _repo_index_cache
+    out: dict = {}
+    host = os.path.join(ghq_root(), "github.com")
+    try:
+        # scandir(follow_symlinks=False), NOT os.path.isdir: isdir FOLLOWS symlinks
+        # while Node's Dirent.isDirectory() does not, so the two implementations would
+        # build different indexes from the same tree. That exact asymmetry already cost
+        # this project once — the vault walker crossed a symlink and found 68,719 notes
+        # where the reference found 10,129. A symlinked repo would also appear under two
+        # names, making both ambiguous and resolving to "_unresolved".
+        for org in sorted(e.name for e in os.scandir(host) if e.is_dir(follow_symlinks=False)):
+            odir = os.path.join(host, org)
+            for repo in sorted(e.name for e in os.scandir(odir) if e.is_dir(follow_symlinks=False)):
+                name = _normalize_repo(repo)
+                key = f"github.com/{org}/{name}"
+                out.setdefault(name, [])
+                if key not in out[name]:
+                    out[name].append(key)
+    except OSError:
+        pass          # no ghq root here — the fallbacks simply never fire
+    _repo_index_cache = out
+    return out
+
+
+def _unique_repo(name: str) -> Optional[str]:
+    """Exactly one repo of this name, or None. AMBIGUITY IS NOT RESOLVED BY GUESSING.
+
+    Two orgs owning a repo of the same name is real (forks, -oracle suffixes); picking
+    one would silently file a session under the wrong org.
+    """
+    hits = repo_index().get(_normalize_repo(name))
+    return hits[0] if hits and len(hits) == 1 else None
+
+
+def resolve_repo_key(cwd: Optional[str]) -> Optional[str]:
+    """repo_key_of, plus the shapes that need to know what exists on this machine.
+
+    Measured over 1,905 codex sessions on two machines, 189 were "_unresolved":
+
+      149  ~/psi-memory, sandboxes, /tmp        genuinely not a repo — CORRECT, stays
+       20  ~/.herdr/worktrees/<repo>/<space>    recoverable
+       16  /tmp/claude-<uid>/-<encoded>/...     recoverable
+    """
+    direct = repo_key_of(cwd)
+    if direct or not cwd:
+        return direct
+    parts = [x for x in cwd.split("/") if x]
+
+    # herdr's GLOBAL worktree root: ~/.herdr/worktrees/<repo>/<space>/...
+    # Carries no org — herdr keys worktrees by repo name alone.
+    if "worktrees" in parts:
+        hw = parts.index("worktrees")
+        if hw > 0 and parts[hw - 1] == ".herdr" and len(parts) >= hw + 2:
+            hit = _unique_repo(parts[hw + 1])
+            if hit:
+                return hit
+
+    # A Claude scratchpad: /tmp/claude-<uid>/<encoded-project-dir>/...
+    # The encoding maps BOTH "/" and "." to "-", so the segment cannot be split back
+    # into org and repo. Encoding each KNOWN repo the same way and comparing is exact
+    # where decoding is not.
+    enc = next((x for x in parts if x.startswith("-") and "github-com-" in x), None)
+    if enc:
+        for keys in repo_index().values():
+            for key in keys:
+                as_dir = "-" + re.sub(r"[/.]", "-", os.path.join(ghq_root(), key)[1:])
+                if enc == as_dir or enc.startswith(as_dir + "-"):
+                    return key
+    return None
+
+
 def context_of(cwd: Optional[str]) -> dict[str, str]:
     """The context a session ran in, WITHIN its repo.
 

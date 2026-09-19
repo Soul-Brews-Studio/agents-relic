@@ -1,9 +1,12 @@
 import { createReadStream, statSync } from "node:fs";
+import { isHostPreamble } from "./types.js";
+export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
+import { queryProviderFor } from "./embed.js";
 import { discover, parseSince } from "./discover.js";
-import { listShards, repoKeyOf } from "./repo.js";
+import { resolveRepoKey, listShards, repoKeyOf } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
 import { importFiles } from "./import.js";
 import { buildChain, type Chain, type ChainRow } from "./chain.js";
@@ -212,6 +215,130 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
 
   return { hits, shards: searched, available: shards.length,
            ms: Math.round(performance.now() - t0), total: hits.length };
+}
+
+export interface SemanticOpts extends Scope {
+  limit?: number; overfetch?: number; allTiers?: boolean;
+  tier?: string; role?: string; source?: string; since?: string; until?: string;
+  device?: string;
+}
+
+export interface SemanticResult extends SearchResult {
+  model: string;            // what the SHARDS say made their vectors
+  embedded: number;         // shards that actually held vectors
+  unembedded: number;       // scoped shards with none — the silent-zero guard
+  queryMs: number;          // cost of embedding the query, separately from the search
+}
+
+/**
+ * Nearest-neighbour search over the `vectors` table.
+ *
+ * NOT the default, and not blended into `search`. Measured on this corpus: on
+ * known-item queries FTS scores 0.890 MRR@20 against 0.600, and it adds one query in
+ * 200 to what FTS already finds; on paraphrase queries the order flips to 0.140 against
+ * 0.046. RRF fusion lost at every k in BOTH directions, so this is a separate mode the
+ * caller chooses, never a re-ranking of the lexical one.
+ *
+ * THE MODEL COMES FROM THE SHARDS, never from a flag. Every vector was written with a
+ * recorded model id, and embedding a query with a different model produces confident
+ * nonsense rather than an error — both sides are floats of the same width and the
+ * distance computes fine. So the scoped shards are asked what they hold, a disagreement
+ * is refused rather than averaged, and the query is embedded once with that model.
+ */
+export async function semanticSearch(q: string, o: SemanticOpts = {}): Promise<SemanticResult> {
+  const t0 = performance.now();
+  const limit = o.limit ?? 20;
+  const shards = pickShards(o);
+
+  // Which shards actually carry vectors, and made by what.
+  const models = new Map<string, number>();
+  const withVectors: typeof shards = [];
+  for (const s of shards) {
+    try {
+      const st = await (await LanceStore.open(s.dir)).vectorStats();
+      if (!st?.rows || !st.model) continue;
+      withVectors.push(s);
+      models.set(st.model, (models.get(st.model) ?? 0) + st.rows);
+    } catch { /* unreadable shard holds no vectors as far as this is concerned */ }
+  }
+  if (!withVectors.length)
+    throw new Error(
+      `no vectors in the ${shards.length} scoped shard(s). \`relic index\` never writes them — ` +
+      `run \`relic embed --dry-run\` to see what embedding would cost, or narrow with --bank.`);
+  if (models.size > 1)
+    throw new Error(
+      `scoped shards hold vectors from ${models.size} different models and their distances are ` +
+      `not comparable: ${[...models].map(([m, n]) => `${m} (${n.toLocaleString()} vectors)`).join(", ")}. ` +
+      `Narrow with --bank/--repo, or re-embed one of them with --reset.`);
+
+  const model = [...models.keys()][0];
+  const provider = queryProviderFor(model, o.device);
+  const q0 = performance.now();
+  let vec: number[];
+  try {
+    [vec] = await provider.embed([q]);
+  } finally {
+    provider.close?.();      // an st sidecar holds a model until told otherwise
+  }
+  const queryMs = Math.round(performance.now() - q0);
+
+  const opts = { limit, overfetch: o.overfetch,
+                 mainTiers: !o.allTiers && !o.tier, tier: o.tier, role: o.role,
+                 source: o.source, since: toISO(o.since), until: toISO(o.until, true) };
+
+  const hits: (EventRow & { repo: string })[] = [];
+  let searched = 0;
+  const CAP = Number(process.env.RELIC_FANOUT) > 0
+    ? Number(process.env.RELIC_FANOUT)
+    : Math.max(4, Math.min(16, (os.cpus?.().length ?? 8) - 2));
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(CAP, withVectors.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= withVectors.length) return;
+      const s = withVectors[i];
+      try {
+        const store = await LanceStore.open(s.dir);
+        for (const h of await store.vectorSearch(vec, opts)) hits.push({ ...h, repo: s.key });
+        searched++;
+      } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
+    }
+  }));
+
+  // Rank across shards before slicing, same as the lexical path — and unlike BM25, a
+  // cosine IS commensurable between shards: the same model, the same unit sphere, no
+  // per-index IDF. This is the one place the semantic path has a cleaner claim.
+  hits.sort((a, b) => Number((b as any)._score ?? 0) - Number((a as any)._score ?? 0));
+
+  /*
+   * COLLAPSE BY CONTENT, on top of the shared dedupe — semantic only.
+   *
+   * dedupeHits keys on (ts, role, text), which is right for transcripts: a resumed
+   * session rewrites the same line slot with a different event, so identical text at a
+   * different timestamp is a different event. It is wrong for documents. One lesson
+   * file copied into three oracle vaults carries three different dates and identical
+   * prose, and a nearest-neighbour query returns all three at the same distance —
+   * measured: the top THREE hits of the first semantic search ever run here were one
+   * note, filling a four-result page.
+   *
+   * Only the semantic path collapses them. Lexical search is unchanged, deliberately:
+   * BM25 ranks by term statistics, so duplicates rarely stack at the top the way an
+   * exact-duplicate vector does, and quietly changing what `search` returns to fix a
+   * problem it does not have is how a narrow fix becomes a regression.
+   */
+  const byText = new Map<string, EventRow & { repo: string; _dupes?: number }>();
+  for (const h of dedupeHits(hits)) {
+    const k = String(h.text ?? "").replace(/\s+/g, " ").trim();
+    const prior = byText.get(k);
+    if (!prior) { byText.set(k, { ...h, _dupes: 0 }); continue; }
+    prior._dupes = (prior._dupes ?? 0) + 1;   // keep the best-scoring copy, count the rest
+  }
+  const deduped = [...byText.values()].slice(0, limit);
+
+  return { hits: deduped, shards: searched, available: shards.length,
+           ms: Math.round(performance.now() - t0), total: deduped.length,
+           model, embedded: withVectors.length,
+           unembedded: shards.length - withVectors.length, queryMs };
 }
 
 export interface SessionsOpts extends Scope {
@@ -625,8 +752,15 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   // description is truncated at 200 chars, so a caveat block often has no closing tag
   // to match against. Drop from the opening tag to the end rather than leaving the
   // boilerplate as the session's name.
+  // A host's own boot directive is not a name. Claude's two shapes were already
+  // handled below; Codex's three were not, and they account for 64% of its sessions.
+  if (isHostPreamble(d)) return "(untitled)";
+
   d = d.replace(/<local-command-caveat>[\s\S]*$/, "")
        .replace(/^\s*Caveat: The messages below were generated[\s\S]*$/, "")
+       // A pasted image carries a long tag the {1,40} scrubber below cannot reach, and
+       // a message is often JUST the tag. Whatever the human typed after it is the name.
+       .replace(/<image\b[^>]*>/gi, " ")
        .replace(/<[^>]{1,40}>/g, " ")
        .replace(/\s+/g, " ").trim();
   return d ? d.slice(0, 70) : "(untitled)";
@@ -906,7 +1040,7 @@ export async function pendingReport(
     try {
       const parsed = await f.parser(f.path);
       cwd = parsed.cwd ?? "";
-      repo = repoKeyOf(parsed.cwd) ?? "_unresolved";
+      repo = resolveRepoKey(parsed.cwd) ?? "_unresolved";
       name = nameOf(parsed as { title?: unknown; description?: unknown });
     } catch { /* an unparseable file is exactly why it is still pending — say _unresolved */ }
     files.push({ path: f.path, bank: f.bank, source: f.source, tier: f.tier, state,

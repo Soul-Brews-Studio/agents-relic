@@ -85,11 +85,11 @@ export function ollamaProvider(model: string, host = DEFAULT_OLLAMA): EmbedProvi
  * `uv run --with sentence-transformers` is the launcher, so nothing is installed into
  * the repo's own environment — the dependency exists for the life of the process.
  */
-export function stProvider(model: string, opts: { device?: string; pythonRoot?: string } = {}): EmbedProvider {
+export function stProvider(model: string, opts: { device?: string; pythonRoot?: string; prefix?: string } = {}): EmbedProvider {
   // e5 models want asymmetric prefixes ("passage: " on documents, "query: " on queries).
   // Getting it wrong costs recall silently, so it is inferred here AND recorded in the
   // provider id, which lands on disk beside every vector.
-  const docPrefix = /e5/i.test(model) ? "passage: " : "";
+  const docPrefix = opts.prefix ?? (/e5/i.test(model) ? "passage: " : "");
   const root = opts.pythonRoot
     ?? join(dirname(fileURLToPath(import.meta.url)), "..", "python");
   const args = ["run", "--with", "sentence-transformers", "python", "-m",
@@ -148,6 +148,34 @@ export function stProvider(model: string, opts: { device?: string; pythonRoot?: 
     },
     close() { try { proc?.stdin.end(); proc?.kill(); } catch { /* already gone */ } },
   };
+}
+
+/**
+ * Rebuild a provider from the id a shard STORED, for embedding a query.
+ *
+ * The writer's id is on disk beside every vector (`ollama:all-minilm`,
+ * `st:intfloat/multilingual-e5-small+passage:`) and it is the only trustworthy record
+ * of how those vectors were made. Re-deriving the model from a flag would let a query
+ * be embedded by a different model than the documents, which produces confident
+ * nonsense rather than an error: both sides are 384-dim floats and the distance
+ * computes fine.
+ *
+ * ASYMMETRIC PREFIXES ARE THE TRAP. e5 wants "passage: " on documents and "query: " on
+ * queries; using the document prefix for a query costs recall silently. So the stored
+ * `+passage:` suffix is read as "this family is asymmetric" and the QUERY side is built
+ * with "query: " instead.
+ */
+export function queryProviderFor(storedId: string, device?: string): EmbedProvider {
+  const m = /^([^:]+):(.*)$/.exec(storedId);
+  if (!m) throw new Error(`unreadable stored model id: ${JSON.stringify(storedId)}`);
+  const [, kind, rest] = m;
+  const plus = rest.lastIndexOf("+");
+  const model = plus >= 0 ? rest.slice(0, plus) : rest;
+  const docPrefix = plus >= 0 ? rest.slice(plus + 1) : "";
+  if (kind === "ollama") return ollamaProvider(model);
+  if (kind === "st")
+    return stProvider(model, { device, prefix: docPrefix === "passage:" ? "query: " : "" });
+  throw new Error(`unknown stored provider "${kind}" in ${JSON.stringify(storedId)}`);
 }
 
 export function providerFor(name: string, model: string, host?: string,

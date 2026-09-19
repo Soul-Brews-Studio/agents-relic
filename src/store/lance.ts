@@ -461,6 +461,64 @@ export class LanceStore {
     return { rows, model: String(r?.model ?? ""), dim: Number(r?.dim ?? 0), norm: String(r?.norm ?? "") };
   }
 
+  /**
+   * Nearest neighbours in the `vectors` table, resolved back to their events.
+   *
+   * TWO QUERIES, because LanceDB has no join. The vector table holds only (uid, embedding,
+   * model, dim, norm, embedded_at) — deliberately, so `events` never grew a 4.86 GiB
+   * column — so a semantic hit is a uid, and the row it names is fetched after.
+   *
+   * The scalar filter is applied on the SECOND query, which costs recall: asking for the
+   * 20 nearest vectors and then dropping the ones whose events fail the filter can return
+   * fewer than 20. `overfetch` is the answer, not a pre-filter, because the vectors table
+   * has no tier/kind/repo columns to pre-filter ON. Copying them there would duplicate
+   * every scalar column into a second table and re-create the coupling the split removed.
+   *
+   * `_distance` is L2 and the vectors are written L2-normalised (VectorRow.norm), so
+   * cosine = 1 - d^2/2 exactly. Reported as `_score` in [0,1] so the number means the
+   * same thing as a human expects and sorts the same direction as BM25's.
+   */
+  async vectorSearch(vec: number[], opts: { limit?: number; overfetch?: number;
+                     mainTiers?: boolean; tier?: string; since?: string; until?: string;
+                     role?: string; source?: string } = {}): Promise<Hit[]> {
+    const vt = await this.existing("vectors");
+    const et = await this.existing("events");
+    if (!vt || !et) return [];
+    const limit = opts.limit ?? 20;
+    // Overfetch so a post-filter cannot starve the result. 4x is what it took for the
+    // main-tiers default to still fill a page on the vault bank; it is a knob, not a law.
+    const k = Math.min(2000, Math.max(limit, limit * (opts.overfetch ?? 4)));
+
+    const near = await vt.query().nearestTo(vec).limit(k).toArray();
+    if (!near.length) return [];
+    const dist = new Map<string, number>();
+    for (const r of near) dist.set(String(r.uid), Number((r as any)._distance ?? 0));
+
+    const filters: string[] = [];
+    if (opts.tier) filters.push(`tier = ${sqlStr(opts.tier)}`);
+    else if (opts.mainTiers) filters.push(await this.mainTiersFilter(et));
+    if (opts.role)   filters.push(`role = ${sqlStr(opts.role)}`);
+    if (opts.source) filters.push(`source = ${sqlStr(opts.source)}`);
+    if (opts.since)  filters.push(`ts >= ${sqlStr(opts.since)}`);
+    if (opts.until)  filters.push(`ts <= ${sqlStr(opts.until)}`);
+
+    // uid IN (...) rather than k round-trips. Quoted through sqlStr: a uid is a hex
+    // digest today, and building SQL by concatenation is how that stops being true.
+    const inList = [...dist.keys()].map(sqlStr).join(", ");
+    filters.push(`uid IN (${inList})`);
+    const rows = await et.query().where(filters.join(" AND ")).limit(k).toArray();
+
+    const out = rows.map(r => {
+      const d = dist.get(String(r.uid)) ?? 0;
+      // L2 on unit vectors: d^2 = 2 - 2cos. Clamped because float error puts a perfect
+      // match a hair below 0, and a score of -1e-9 sorts fine but reads as a bug.
+      const cos = Math.max(0, Math.min(1, 1 - (d * d) / 2));
+      return { ...(r as unknown as Hit), _score: cos } as Hit;
+    });
+    out.sort((a, b) => Number((b as any)._score) - Number((a as any)._score));
+    return out.slice(0, limit);
+  }
+
   /** Every uid that already has a vector. The anti-join key for a resumable backfill. */
   async embeddedUids(): Promise<Set<string>> {
     const t = await this.existing("vectors");

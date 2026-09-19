@@ -15,7 +15,7 @@ from typing import Optional
 
 from .discover import Found
 from .models import DEFAULT_BANK, EventRow, FileRow, SessionRow
-from .repo import context_of, location_of, repo_key_of, shard_dir_for
+from .repo import context_of, location_of, repo_key_of, shard_dir_for, resolve_repo_key
 from .store import LanceStore
 
 
@@ -123,7 +123,7 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
     for f in found:
         try:
             p = f.parser(f.path)
-            repo_key = repo_key_of(p.cwd)
+            repo_key = resolve_repo_key(p.cwd)
             if repo_filter and repo_filter not in (repo_key or ""):
                 t.filtered += 1
                 continue

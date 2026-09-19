@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Optional
 
@@ -140,9 +141,67 @@ def live_sessions(window_sec: int = 300, limit: int = 20) -> list[dict]:
     return found[:limit]
 
 
+_ENV_SESSION_KEYS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                     "CODEX_COMPANION_SESSION_ID")
+_UUIDISH = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,}$")
+
+
+def session_id_from_env(env=None) -> Optional[tuple[str, str]]:
+    """The host's OWN answer to "which session am I", as (id, which-variable).
+
+    Both hosts publish it and relic read neither, so `now` inferred by mtime an answer
+    that was sitting in a variable. It matters most for Codex, which the cwd scan below
+    CANNOT find at all — codex is the only source with no project-dir layout, so no
+    encoding of a cwd addresses it. Observed on white.local inside a live Codex session:
+    `relic now` said "no session transcript for this directory" while $CODEX_THREAD_ID
+    held the id and `relic session <id>` resolved seven transcripts from it.
+
+    Shape-checked rather than trusted: these variables are inherited by every child
+    process, and an empty or placeholder value must not beat a working scan.
+    """
+    env = os.environ if env is None else env
+    for key in _ENV_SESSION_KEYS:
+        v = (env.get(key) or "").strip()
+        if _UUIDISH.match(v):
+            return v, key
+    return None
+
+
+def session_by_uuid(uuid: str, cwd: str) -> Optional[dict]:
+    """Locate a KNOWN uuid across every source, flat ones included.
+
+    Not cwd-scoped: the id came from the host, so it is already the right session, and
+    Codex rollouts live in a date tree that no cwd encoding can address.
+    """
+    for root in live_roots():
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for f in filenames:
+                if not f.endswith(".jsonl") or uuid not in f:
+                    continue
+                path = os.path.join(dirpath, f)
+                st = _stat(path)
+                if not st:
+                    continue
+                meta = _peek(path)
+                return {"session_uuid": uuid, "project_dir": dirpath,
+                        "cwd": meta["cwd"] or cwd, "title": meta["title"],
+                        "mtime": st[0], "age_sec": age(st[0]),
+                        # about the CWD claim, not the id: false when the transcript
+                        # recorded none and the caller's directory was substituted
+                        "confident": meta["cwd"] is not None}
+    return None
+
+
 def current_session(cwd: Optional[str] = None) -> Optional[dict]:
-    """Which session am I in — resolved from the cwd, newest transcript wins."""
+    """Which session am I in — the host's env first, then the cwd scan."""
     cwd = cwd or os.getcwd()
+    # Ask the host first. Only trusted when the id resolves to a transcript on disk: an
+    # env var is proof of intent, not of a file, and this reports paths.
+    env = session_id_from_env()
+    if env:
+        hit = session_by_uuid(env[0], cwd)
+        if hit:
+            return hit
     best = None
     for root in live_roots():
         for project in _dirs(root):

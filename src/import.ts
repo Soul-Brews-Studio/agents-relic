@@ -2,7 +2,7 @@ import { LanceStore, type EventRow, type SessionRow, type FileRow } from "./stor
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
 import { kindOf } from "./discover.js";
-import { repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
+import { resolveRepoKey, repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
 
 /**
  * Writing into the index.
@@ -127,7 +127,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   for (const file of found) {
     try {
       const p = await file.parser(file.path);
-      const repoKey = repoKeyOf(p.cwd);
+      const repoKey = resolveRepoKey(p.cwd);
       if (o.repoFilter && !(repoKey ?? "").includes(o.repoFilter)) { filtered++; continue; }
 
       // `repoCol` is what goes in the rows; `shardKey` is (bank, repo) and only ever
