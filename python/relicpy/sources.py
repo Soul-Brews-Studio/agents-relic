@@ -59,6 +59,18 @@ def _builtin() -> list[SourceDef]:
                   "claude-tiers", shape_claude.parse, True,
                   "Claude Code snapshot 1sep-tue2026 — the largest root",
                   "projects-1sep-tue2026"),
+        # ANOTHER ACCOUNT'S CLAUDE ROOT — see the long comment in src/sources.ts.
+        # A separate SOURCE because it is a separate bank: a bank is one whole source
+        # root, and two accounts' projects/ directories are exactly that. Disabled with
+        # a placeholder path like oracle-vault; set the real one in
+        # ~/.relic/sources.json, which enables it implicitly. Reachable with no ssh and
+        # no copy when the owner has granted an ACL — but verify that the file count
+        # visible to YOUR user equals the count visible to theirs first, because a
+        # partially-readable tree indexes without error and reports success.
+        SourceDef("claude-peer", os.path.join(HOME, ".relic-peer-unset"),
+                  "claude-tiers", shape_claude.parse, False,
+                  "another account's Claude root on a shared machine — "
+                  "set its path in ~/.relic/sources.json", "peer-projects"),
         SourceDef("codex", os.path.join(HOME, ".codex", "sessions"),
                   "flat", shape_codex.parse, True, "Codex CLI rollouts"),
         SourceDef("omp", os.path.join(HOME, ".omp", "agent", "sessions"),

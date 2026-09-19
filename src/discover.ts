@@ -78,6 +78,40 @@ function files(p: string, ext = ".jsonl"): string[] {
  * exactly the bug in /dig --deep: it silently drops ~73% of the corpus by file count.
  * Measured on this machine: 7,327 session / 7,801 subagent / 21,305 workflow_agent.
  */
+/** One `subagents/` directory: its agent transcripts, and the workflow tier beneath it. */
+function walkSubagents(subagents: string, project: string, sinceMs: number | null,
+                       out: Found[], srcKey: string, parser: Parser) {
+  if (!existsSync(subagents)) return;
+  for (const f of files(subagents)) {
+    const p = join(subagents, f);
+    const st = statOf(p);
+    if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
+    out.push({ path: p, projectDir: project, tier: "subagent", source: srcKey,
+      workflowRunId: null, agentId: basename(f, ".jsonl"), ...st, parser });
+  }
+
+  // --- the tier everyone forgets ------------------------------------------
+  const workflows = join(subagents, "workflows");
+  if (!existsSync(workflows)) return;
+  for (const run of dirs(workflows)) {
+    if (!run.startsWith("wf_")) continue;
+    for (const f of files(join(workflows, run))) {
+      // journal.jsonl is the RUNNER's event log — launched/started/result records
+      // describing the workflow, not a transcript of anything an agent said. It sits
+      // in the same directory as the agent transcripts, so taking every .jsonl
+      // indexed runner metadata as if it were conversation: searchable text with a
+      // role and a session id attached, and no cwd, so it landed in `_unresolved`.
+      // Same reason walkMemory skips MEMORY.md.
+      if (f === "journal.jsonl") continue;
+      const p = join(workflows, run, f);
+      const st = statOf(p);
+      if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
+      out.push({ path: p, projectDir: project, tier: "workflow_agent", source: srcKey,
+        workflowRunId: run, agentId: basename(f, ".jsonl"), ...st, parser });
+    }
+  }
+}
+
 function walkClaude(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
   for (const project of dirs(root)) {
     const projectPath = join(root, project);
@@ -90,38 +124,28 @@ function walkClaude(root: string, sinceMs: number | null, out: Found[], srcKey: 
         workflowRunId: null, agentId: null, ...st, parser });
     }
 
+    /*
+     * A `subagents/` DIRECTLY under the project dir, with no session-uuid directory
+     * between. Found on 2026-09-19 while indexing a second account's corpus: 14 real
+     * subagent transcripts across two roots that no relic run had ever seen, because
+     * the walk below only ever looks one level deeper.
+     *
+     * `subagents` is itself returned by dirs(projectPath), so the loop below treats it
+     * as a session dir and looks for `<project>/subagents/subagents` — which does not
+     * exist, so it is skipped in silence rather than reported. Discovery that misses a
+     * shape reports success with a smaller number, and the number looks fine.
+     *
+     * Same walker as the per-session case, called with a different base, so the two
+     * cannot drift about what a subagent directory contains.
+     */
+    walkSubagents(join(projectPath, "subagents"), project, sinceMs, out, srcKey, parser);
+
     for (const sessionDir of dirs(projectPath)) {
+      if (sessionDir === "subagents") continue;   // handled above, do not walk twice
       const subagents = join(projectPath, sessionDir, "subagents");
       if (!existsSync(subagents)) continue;
 
-      for (const f of files(subagents)) {
-        const p = join(subagents, f);
-        const st = statOf(p);
-        if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
-        out.push({ path: p, projectDir: project, tier: "subagent", source: srcKey,
-          workflowRunId: null, agentId: basename(f, ".jsonl"), ...st, parser });
-      }
-
-      // --- the tier everyone forgets ------------------------------------------
-      const workflows = join(subagents, "workflows");
-      if (!existsSync(workflows)) continue;
-      for (const run of dirs(workflows)) {
-        if (!run.startsWith("wf_")) continue;
-        for (const f of files(join(workflows, run))) {
-          // journal.jsonl is the RUNNER's event log — launched/started/result records
-          // describing the workflow, not a transcript of anything an agent said. It
-          // sits in the same directory as the agent transcripts, so taking every
-          // .jsonl indexed runner metadata as if it were conversation: searchable
-          // text with a role and a session id attached, and no cwd, so it landed in
-          // `_unresolved`. Same reason walkMemory skips MEMORY.md.
-          if (f === "journal.jsonl") continue;
-          const p = join(workflows, run, f);
-          const st = statOf(p);
-          if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
-          out.push({ path: p, projectDir: project, tier: "workflow_agent", source: srcKey,
-            workflowRunId: run, agentId: basename(f, ".jsonl"), ...st, parser });
-        }
-      }
+      walkSubagents(subagents, project, sinceMs, out, srcKey, parser);
     }
   }
 }

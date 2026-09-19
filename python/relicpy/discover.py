@@ -74,6 +74,42 @@ def _files(p: str, ext: str = ".jsonl") -> list[str]:
         return []
 
 
+def _walk_subagents(subagents, project, since_ms, out, key, parser):
+    """One `subagents/` directory: its agent transcripts, and the workflow tier beneath.
+
+    Called with two different bases — the project-level one and the per-session one — so
+    the two cannot drift about what a subagent directory contains.
+    """
+    if not os.path.isdir(subagents):
+        return
+    for f in _files(subagents):
+        p = os.path.join(subagents, f)
+        st = _stat(p)
+        if not st or (since_ms and st[0] * 1000 < since_ms):
+            continue
+        out.append(Found(p, project, "subagent", key, "", None,
+                         f[:-6] if f.endswith(".jsonl") else f, st[0], st[1], parser))
+
+    # --- the tier everyone forgets -----------------------------------
+    workflows = os.path.join(subagents, "workflows")
+    if not os.path.isdir(workflows):
+        return
+    for run in _dirs(workflows):
+        if not run.startswith("wf_"):
+            continue
+        for f in _files(os.path.join(workflows, run)):
+            # journal.jsonl is the RUNNER's event log, not a transcript.
+            if f == "journal.jsonl":
+                continue
+            p = os.path.join(workflows, run, f)
+            st = _stat(p)
+            if not st or (since_ms and st[0] * 1000 < since_ms):
+                continue
+            out.append(Found(p, project, "workflow_agent", key, "", run,
+                             f[:-6] if f.endswith(".jsonl") else f,
+                             st[0], st[1], parser))
+
+
 def _walk_claude(root, since_ms, out, key, parser):
     for project in _dirs(root):
         pdir = os.path.join(root, project)
@@ -85,36 +121,20 @@ def _walk_claude(root, since_ms, out, key, parser):
                 continue
             out.append(Found(p, project, "session", key, "", None, None, st[0], st[1], parser))
 
-        for session_dir in _dirs(pdir):
-            subagents = os.path.join(pdir, session_dir, "subagents")
-            if not os.path.isdir(subagents):
-                continue
-            for f in _files(subagents):
-                p = os.path.join(subagents, f)
-                st = _stat(p)
-                if not st or (since_ms and st[0] * 1000 < since_ms):
-                    continue
-                out.append(Found(p, project, "subagent", key, "", None,
-                                 f[:-6] if f.endswith(".jsonl") else f, st[0], st[1], parser))
+        # A `subagents/` DIRECTLY under the project dir, with no session-uuid directory
+        # between. Found 2026-09-19 while indexing a second account's corpus: 14 real
+        # subagent transcripts across two roots that no relic run had ever seen, because
+        # the loop below only ever looks one level deeper. `subagents` is itself returned
+        # by _dirs(pdir), so that loop treats it as a session dir and looks for
+        # <project>/subagents/subagents — which does not exist, so it is skipped in
+        # silence. Discovery that misses a shape reports success with a smaller number.
+        _walk_subagents(os.path.join(pdir, "subagents"), project, since_ms, out, key, parser)
 
-            # --- the tier everyone forgets -----------------------------------
-            workflows = os.path.join(subagents, "workflows")
-            if not os.path.isdir(workflows):
-                continue
-            for run in _dirs(workflows):
-                if not run.startswith("wf_"):
-                    continue
-                for f in _files(os.path.join(workflows, run)):
-                    # journal.jsonl is the RUNNER's event log, not a transcript.
-                    if f == "journal.jsonl":
-                        continue
-                    p = os.path.join(workflows, run, f)
-                    st = _stat(p)
-                    if not st or (since_ms and st[0] * 1000 < since_ms):
-                        continue
-                    out.append(Found(p, project, "workflow_agent", key, "", run,
-                                     f[:-6] if f.endswith(".jsonl") else f,
-                                     st[0], st[1], parser))
+        for session_dir in _dirs(pdir):
+            if session_dir == "subagents":
+                continue          # handled above, do not walk it twice
+            _walk_subagents(os.path.join(pdir, session_dir, "subagents"),
+                            project, since_ms, out, key, parser)
 
 
 def _walk_flat(root, since_ms, out, key, parser, depth=0):
