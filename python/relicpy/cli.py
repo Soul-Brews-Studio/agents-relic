@@ -333,6 +333,23 @@ def cmd_show(a) -> int:
     return 0
 
 
+def _local_epoch(sec: float) -> str:
+    """Epoch seconds -> local "YYYY-MM-DD HH:MM", matching the TypeScript CLI.
+
+    This function did not exist while two call sites used it, so `relic-py pending
+    --list N` raised NameError on its first pending file — for every release. The
+    command "ran" (exit 0, counts printed) whenever nothing was pending, which is the
+    state a parity check that only compares summaries would find.
+    """
+    return datetime.fromtimestamp(sec).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _tilde_home(p: str) -> str:
+    """`/Users/x/...` -> `~/...`. A cwd is long and its prefix is the least useful part."""
+    h = os.path.expanduser("~")
+    return "~" + p[len(h):] if p and p.startswith(h + "/") else p
+
+
 def cmd_pending(a) -> int:
     from .query import pending_report
     from .tree import build_tree, common_prefix, render_tree
@@ -343,6 +360,10 @@ def cmd_pending(a) -> int:
         return 0
     print(f"found {r.found:,}  indexed {r.indexed:,}  missing {r.missing:,}  "
           f"changed {r.changed:,}   {r.scan_ms} ms")
+    # "is anything pending, and how recent" is one question; the TypeScript CLI has
+    # always answered the second half and this one silently dropped it.
+    if r.newest_pending_ms:
+        print(f"newest pending file: {_local_epoch(r.newest_pending_ms / 1000)}")
     for g in r.groups:
         print(f"  {g.source + '/' + g.tier:<30} found {g.found:>6}  "
               f"missing {g.missing:>6}  changed {g.changed:>6}")
@@ -354,14 +375,27 @@ def cmd_pending(a) -> int:
         print(f"\n{root}")
         render_tree(build_tree(entries), "", a.limit, print, "b")
     elif r.files:
-        print("\nnot indexed yet — newest first:\n")
+        # Same columns and same second line as the TypeScript CLI. Two readers of one
+        # index that format the same report differently is a parity gap a user hits
+        # before any test does.
+        print("\nnot indexed yet — newest first (name, cwd and repo read from each transcript):\n")
+        print(f"  {'when':<17} {'session':<10} {'state':<8} {'source/tier':<26} repo")
         for x in r.files:
-            print(f"{_local_epoch(x.mtime)}  {x.state:<7} {x.tier:<15} {x.session_id or '(none)'}")
-            print(f"          {x.repo}  ·  bank {x.bank}  ·  {x.source}")
+            sid = x.session_id[:8] if x.session_id else "-"
+            print(f"  {_local_epoch(x.mtime):<17} {sid:<10} {x.state:<8} "
+                  f"{x.source + '/' + x.tier:<26} {x.repo}")
+            # name_of returns "(untitled)" when a transcript wrote no title and no
+            # usable description; printing that in quotes reads as a real name.
+            named = f'"{x.name[:60]}"' if x.name and x.name != "(untitled)" else ""
+            bits = [b for b in (named, _tilde_home(x.cwd)) if b]
+            if bits:
+                print(f"  {'':<17} {'   '.join(bits)}")
             if a.paths:
-                print(f"          {x.path}")
+                print(f"  {'':<17} {x.path}")
+    elif r.missing + r.changed == 0:
+        print("\nnothing pending — every discovered file is in the index.")
     if r.files_omitted:
-        print(f"\n... and {r.files_omitted:,} more pending (--list N)")
+        print(f"\n  ... and {r.files_omitted:,} more pending (--list N)")
     return 0
 
 
@@ -720,7 +754,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="on disk but NOT indexed — the only check that catches a partial index")
     pe.add_argument("--bank"); pe.add_argument("--repo")
     pe.add_argument("--corpus"); pe.add_argument("--since")
-    pe.add_argument("--list", type=int, default=0, metavar="N")
+    # default None, NOT 0: absent means "decide for me", which pending_report
+    # answers by listing a small pending set and capping a large one. 0 still
+    # means "list nothing", and the two are different requests.
+    pe.add_argument("--list", type=int, default=None, metavar="N")
     pe.add_argument("--paths", action="store_true")
     pe.add_argument("--tree", action="store_true")
     pe.add_argument("--limit", type=int, default=8)
