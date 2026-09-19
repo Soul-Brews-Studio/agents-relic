@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { queryProviderFor } from "./embed.js";
 import { discover, parseSince } from "./discover.js";
-import { listShards, repoKeyOf } from "./repo.js";
+import { resolveRepoKey, listShards, repoKeyOf } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
 import { importFiles } from "./import.js";
 import { buildChain, type Chain, type ChainRow } from "./chain.js";
@@ -1040,7 +1040,7 @@ export async function pendingReport(
     try {
       const parsed = await f.parser(f.path);
       cwd = parsed.cwd ?? "";
-      repo = repoKeyOf(parsed.cwd) ?? "_unresolved";
+      repo = resolveRepoKey(parsed.cwd) ?? "_unresolved";
       name = nameOf(parsed as { title?: unknown; description?: unknown });
     } catch { /* an unparseable file is exactly why it is still pending — say _unresolved */ }
     files.push({ path: f.path, bank: f.bank, source: f.source, tier: f.tier, state,

@@ -16,7 +16,7 @@ from typing import Iterable, Optional, Sequence, TypeVar
 
 from .models import (BankGroup, Hit, PendingFile, PendingGroup, PendingReport,
                      Scope, Shard, ShardStat)
-from .repo import default_root, list_shards, repo_key_of
+from .repo import default_root, list_shards, repo_key_of, resolve_repo_key
 from .store import LanceStore
 from .types import block_role, flatten_content
 from .types import is_host_preamble
@@ -527,7 +527,7 @@ def pending_report(scope: Scope, corpus: Optional[list[str]] = None,
         try:
             parsed = f.parser(f.path)
             cwd = parsed.cwd or ""
-            repo = repo_key_of(parsed.cwd) or "_unresolved"
+            repo = resolve_repo_key(parsed.cwd) or "_unresolved"
             name = name_of({"title": getattr(parsed, "title", ""),
                             "description": getattr(parsed, "description", "")})
         except Exception:

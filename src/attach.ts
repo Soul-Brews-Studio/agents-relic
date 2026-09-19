@@ -1,6 +1,6 @@
 import * as lancedb from "@lancedb/lancedb";
 import { Index } from "@lancedb/lancedb";
-import { repoKeyOf, contextOf, cwdOfFile } from "./repo.js";
+import { resolveRepoKey, repoKeyOf, contextOf, cwdOfFile } from "./repo.js";
 
 /**
  * Attach to a LanceDB someone else owns — today that means lanceglass — and add the
@@ -85,7 +85,7 @@ export async function attach(dir: string, opts: { rebuild?: boolean } = {}): Pro
       if (seen.has(eid)) continue;          // one facet row per canonical event
       const cwd = await cwdOfFile(String(r.file_path ?? ""));
       if (!cwd) { skippedNoPath++; continue; }
-      const repo_key = repoKeyOf(cwd) ?? "_unresolved";
+      const repo_key = resolveRepoKey(cwd) ?? "_unresolved";
       const { worktree } = contextOf(cwd);
       seen.add(eid);
       repos.add(repo_key);

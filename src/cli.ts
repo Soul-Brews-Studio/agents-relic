@@ -17,7 +17,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
-import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
+import { resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
   const f: Record<string, string | boolean> = {};
@@ -237,7 +237,7 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
   trace({
     ts: new Date().toISOString(), q: "", chars: 0, filters: {},
     shards: 0, hits: 0, ms: 0, fts: true,
-    top_repo: repoKeyOf(await cwdOfFile(path)) ?? "",
+    top_repo: resolveRepoKey(await cwdOfFile(path)) ?? "",
     opened: path,
   }, (f["data-root"] as string) ?? null);
 

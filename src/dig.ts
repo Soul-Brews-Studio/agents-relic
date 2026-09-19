@@ -1,7 +1,7 @@
 import { existsSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { parseClaude } from "./shapes/claude.js";
-import { repoKeyOf } from "./repo.js";
+import { resolveRepoKey, repoKeyOf } from "./repo.js";
 import { loadSources } from "./sources.js";
 import { localDateTime } from "./time.js";
 import { defaultRoot } from "./repo.js";
@@ -108,7 +108,7 @@ function repoNameOf(cwd: string | null, dir: string): string {
   // The session's own cwd, never the encoded directory name — that encoding maps both
   // "/" and "." to "-", so reversing it is guesswork. dig.py reverses it and then
   // repairs the result with a `ghq list -p` subprocess on every invocation.
-  const key = repoKeyOf(cwd);
+  const key = resolveRepoKey(cwd);
   if (key) return key.split("/").pop()!;
   return basename(dir).replace(/-(wt|agents)-.*$/, "").split("-").pop() || basename(dir);
 }
