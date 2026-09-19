@@ -337,6 +337,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     provider: f.provider ? String(f.provider) : "ollama",
     model: f.model ? String(f.model) : "all-minilm",
     host: f.host ? String(f.host) : DEFAULT_OLLAMA,
+    device: f.device ? String(f.device) : undefined,
     batch: f.batch ? Number(f.batch) : 64,
     limit: f.limit ? Number(f.limit) : undefined,
     // --all-tiers matches search's flag of the same name, so the population embedded
@@ -778,7 +779,7 @@ if (!cmd || f.help) {
                                names them — session id, repo, bank, newest first.
                                --paths adds the full session id and absolute path.
                                --tree groups them by directory — which RUN is missing.
-  embed   [--model all-minilm] [--provider ollama] [--host URL] [--repo S] [--bank B]
+  embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.

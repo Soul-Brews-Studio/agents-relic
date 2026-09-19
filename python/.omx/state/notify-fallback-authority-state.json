@@ -1,0 +1,13 @@
+{
+  "owner": "hud",
+  "pid": 2219,
+  "cwd": "/opt/Code/github.com/Soul-Brews-Studio/agents-relic/wt/agents-relic-embed-18sep-fri2026/python",
+  "heartbeat_at": "2026-09-19T00:50:23.186Z",
+  "cooldown_ms": 5000,
+  "jitter_ms": 227,
+  "skip_count": 0,
+  "last_status": "spawned",
+  "last_reason": "spawned",
+  "last_spawn_at": "2026-09-19T00:50:23.186Z",
+  "next_allowed_at": "2026-09-19T00:50:28.413Z"
+}

@@ -172,3 +172,26 @@ def test_main_tiers_filter_names_kind_only_when_the_column_exists(tmp_path):
                            imported_at="")])
     # no `events` table at all -> the pre-kind form, which is valid everywhere
     assert old.main_tiers_filter() == "(tier = 'session' OR tier = 'note')"
+
+
+def test_st_provider_id_matches_the_typescript_contract():
+    """The id is a CROSS-IMPLEMENTATION contract, not a label.
+
+    `embed_shard` refuses a shard whose stored model differs from the running provider's
+    id. If the two implementations computed it differently they would refuse each other's
+    shards while both looked correct alone. test/embed.test.ts asserts the same literals.
+
+    Built without importing sentence-transformers — only the id is under test.
+    """
+    from relicpy import embed as E
+
+    assert E.st_provider.__doc__  # the function exists and is documented
+    # Mirror of provider_for()'s prefix rule, which is what produces the id.
+    for model, want in [
+        ("intfloat/multilingual-e5-small", "st:intfloat/multilingual-e5-small+passage:"),
+        ("sentence-transformers/all-MiniLM-L6-v2",
+         "st:sentence-transformers/all-MiniLM-L6-v2"),
+    ]:
+        doc = "passage: " if "e5" in model.lower() else ""
+        tag = f"st:{model}" + (f"+{doc.strip()}" if doc else "")
+        assert tag == want

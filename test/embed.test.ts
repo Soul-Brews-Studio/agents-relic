@@ -65,8 +65,11 @@ describe("providers", () => {
   test("ollama id is provider-qualified", () => {
     expect(providerFor("ollama", "all-minilm").id).toBe("ollama:all-minilm");
   });
-  test("an unknown provider names the Python escape hatch", () => {
-    expect(() => providerFor("st", "x")).toThrow(/relic-py embed --provider st/);
+  test("an unknown provider names the two that exist", () => {
+    // "st" used to throw here and point at relic-py. It no longer does: TypeScript
+    // reaches the same models through the Python sidecar, so the two front ends offer
+    // the same providers. See the st-provider describe block below.
+    expect(() => providerFor("nope", "x")).toThrow(/expected "ollama" or "st"/);
   });
 });
 
@@ -169,5 +172,36 @@ describe("embedShard", () => {
     expect(r.embedded).toBe(2);
     // and the failed uids are simply pending again
     expect((await embedShard(s, fake(8, "flaky"), { batch: 2 })).pending).toBe(2);
+  });
+});
+
+describe("the st provider — TypeScript reaches the Python models", () => {
+  /*
+   * NO SPAWN HERE. The sidecar needs uv plus a torch-sized download, so a live test
+   * would be slow and environment-dependent. What these assert is the part that breaks
+   * silently: the provider ID.
+   *
+   * `embedShard` refuses a shard whose stored model differs from the running provider's
+   * id. If TypeScript and Python computed that string differently, each would refuse the
+   * other's shards — while both looked correct in isolation. The literal below is the
+   * contract, and python/relicpy/embed.py asserts the same one.
+   */
+  test("the e5 prefix is inferred and recorded in the id", () => {
+    expect(providerFor("st", "intfloat/multilingual-e5-small").id)
+      .toBe("st:intfloat/multilingual-e5-small+passage:");
+  });
+  test("a non-e5 model carries no prefix", () => {
+    expect(providerFor("st", "sentence-transformers/all-MiniLM-L6-v2").id)
+      .toBe("st:sentence-transformers/all-MiniLM-L6-v2");
+  });
+  test("both providers are named, and nothing else is", () => {
+    expect(providerFor("ollama", "all-minilm").id).toBe("ollama:all-minilm");
+    expect(() => providerFor("nope", "x")).toThrow(/expected "ollama" or "st"/);
+  });
+  test("a long-lived provider exposes close(), a stateless one does not", () => {
+    // embedShards calls close?.() unconditionally; an orphaned python holding a model
+    // is ~500 MB of RSS that never comes back.
+    expect(typeof providerFor("st", "x").close).toBe("function");
+    expect(providerFor("ollama", "x").close).toBeUndefined();
   });
 });

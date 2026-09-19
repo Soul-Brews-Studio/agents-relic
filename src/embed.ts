@@ -1,5 +1,7 @@
 import { LanceStore, type VectorRow } from "./store/lance.js";
 import { pickShards, type Scope } from "./query.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Embedding the index — the WRITE half only.
@@ -20,6 +22,8 @@ export interface EmbedProvider {
   /** Provider-qualified, and this string is what goes on disk in VectorRow.model. */
   id: string;
   embed(texts: string[]): Promise<number[][]>;
+  /** Release a long-lived child process. Absent for providers that hold nothing. */
+  close?(): void;
 }
 
 export const DEFAULT_OLLAMA = "http://localhost:11434";
@@ -66,13 +70,91 @@ export function ollamaProvider(model: string, host = DEFAULT_OLLAMA): EmbedProvi
   };
 }
 
-export function providerFor(name: string, model: string, host?: string): EmbedProvider {
+/**
+ * sentence-transformers, reached through the Python sidecar rather than a port.
+ *
+ * TypeScript has no model runtime and adding one means a torch-sized dependency in a
+ * three-dependency tool. But refusing the provider outright made `relic embed` and
+ * `relic-py embed` two different commands, which is the thing this codebase spends the
+ * most effort not being. So the model stays in Python, where it already is, and the
+ * TypeScript side spawns `relicpy.embed_server` and talks JSON-lines to it.
+ *
+ * One PERSISTENT process, not one per batch: loading e5-small costs ~10 s and a backfill
+ * is thousands of batches.
+ *
+ * `uv run --with sentence-transformers` is the launcher, so nothing is installed into
+ * the repo's own environment — the dependency exists for the life of the process.
+ */
+export function stProvider(model: string, opts: { device?: string; pythonRoot?: string } = {}): EmbedProvider {
+  // e5 models want asymmetric prefixes ("passage: " on documents, "query: " on queries).
+  // Getting it wrong costs recall silently, so it is inferred here AND recorded in the
+  // provider id, which lands on disk beside every vector.
+  const docPrefix = /e5/i.test(model) ? "passage: " : "";
+  const root = opts.pythonRoot
+    ?? join(dirname(fileURLToPath(import.meta.url)), "..", "python");
+  const args = ["run", "--with", "sentence-transformers", "python", "-m",
+                "relicpy.embed_server", "--model", model];
+  if (opts.device) args.push("--device", opts.device);
+  if (docPrefix) args.push("--doc-prefix", docPrefix);
+
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let buf = "";
+
+  /** Read exactly one protocol line, buffering whatever else arrives with it. */
+  async function line(): Promise<Record<string, unknown>> {
+    for (;;) {
+      const nl = buf.indexOf("\n");
+      if (nl >= 0) {
+        const raw = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (raw.trim()) return JSON.parse(raw);
+        continue;
+      }
+      const { done, value } = await reader!.read();
+      // EOF mid-protocol means the child died — usually the model failed to load. The
+      // child's stderr is inherited, so the real reason is already on the terminal.
+      if (done) throw new Error("embed_server exited before answering (see stderr above)");
+      buf += new TextDecoder().decode(value);
+    }
+  }
+
+  async function start(): Promise<void> {
+    if (proc) return;
+    proc = Bun.spawn(["uv", ...args], {
+      cwd: root, stdin: "pipe", stdout: "pipe",
+      stderr: "inherit",   // progress bars and HF warnings must NEVER reach the protocol
+    });
+    reader = proc.stdout.getReader();
+    const hello = await line();
+    if (hello.error) throw new Error(String(hello.error));
+    if (!hello.ready) throw new Error(`embed_server sent no handshake: ${JSON.stringify(hello).slice(0, 160)}`);
+  }
+
+  return {
+    id: `st:${model}` + (docPrefix ? `+${docPrefix.trim()}` : ""),
+    async embed(texts) {
+      await start();
+      proc!.stdin.write(JSON.stringify({ texts }) + "\n");
+      await proc!.stdin.flush();
+      const r = await line();
+      if (r.error) throw new Error(String(r.error));
+      const vecs = r.embeddings as number[][];
+      if (!vecs?.length) throw new Error("embed_server returned no embeddings");
+      // Same guard as the HTTP provider: a short batch would pair rows to the wrong uids.
+      if (vecs.length !== texts.length)
+        throw new Error(`embed_server returned ${vecs.length} vectors for ${texts.length} inputs`);
+      return vecs;
+    },
+    close() { try { proc?.stdin.end(); proc?.kill(); } catch { /* already gone */ } },
+  };
+}
+
+export function providerFor(name: string, model: string, host?: string,
+                            device?: string): EmbedProvider {
   if (name === "ollama") return ollamaProvider(model, host);
-  throw new Error(
-    `unknown provider "${name}". TypeScript speaks "ollama" only — it has no model runtime ` +
-    `and adding one would mean a torch-sized dependency in a 3-dependency tool. For ` +
-    `sentence-transformers (e.g. intfloat/multilingual-e5-small, 384 dims, multilingual), ` +
-    `use the Python implementation: relic-py embed --provider st --model <name>`);
+  if (name === "st") return stProvider(model, { device });
+  throw new Error(`unknown provider "${name}" — expected "ollama" or "st"`);
 }
 
 // ----------------------------------------------------------------------- helpers
@@ -96,6 +178,7 @@ export interface EmbedOpts extends Scope {
   provider?: string;      // "ollama"
   model?: string;
   host?: string;
+  device?: string;       // st only: cpu | mps | cuda
   batch?: number;
   limit?: number;         // cap per shard, not total — makes a smoke test cheap
   mainTiers?: boolean;
@@ -191,7 +274,7 @@ export async function embedShard(
 
 export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
   const t0 = Date.now();
-  const p = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host);
+  const p = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device);
   const shards = pickShards(o);
   const out: ShardEmbedStat[] = [];
   let embedded = 0, failed = 0, pending = 0;
@@ -210,6 +293,9 @@ export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
                  skipped: String(err).slice(0, 160) });
     }
   }
+  // A sidecar outlives the loop unless it is told not to — an orphaned python holding a
+  // model is 500 MB of RSS that never comes back.
+  p.close?.();
   return { shards: out, embedded, failed, pending, ms: Date.now() - t0,
            dryRun: Boolean(o.dryRun), providerId: p.id };
 }

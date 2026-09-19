@@ -82,12 +82,14 @@ def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
 
 def st_provider(model: str, device: Optional[str] = None,
                 query_prefix: str = "", doc_prefix: str = "") -> Provider:
-    """sentence-transformers — PYTHON ONLY, and deliberately not mirrored in TypeScript.
+    """sentence-transformers, in-process. TypeScript reaches the SAME models through
+    `relicpy.embed_server`, which wraps this library behind a JSON-lines pipe rather
+    than porting it — adding a model runtime to the TypeScript side would mean a
+    torch-sized dependency in a tool that has three.
 
-    This is the one place the two implementations differ, and the reason is where the
-    libraries live: adding a model runtime to the TypeScript side means a torch-sized
-    dependency in a tool that has three. The default path (ollama) is identical in both;
-    this is additive.
+    So both implementations offer `--provider st` and both produce the same provider id,
+    which is load-bearing: the model-mismatch guard compares ids, so a divergence would
+    make each implementation refuse the other's shards.
 
     It exists because it reaches models ollama does not serve — notably
     `intfloat/multilingual-e5-small`: 384 dims AND multilingual, which is exactly the

@@ -856,10 +856,21 @@ That cosine is a **smoke test, not a benchmark**: one English string against its
 translation, which says whether a model puts the two languages in one space at all and
 nothing about ranking quality. `all-minilm` at +0.187 is what "English-only" looks like.
 
-`--provider st` (sentence-transformers) is **Python only**, and that asymmetry is
-deliberate: a model runtime in the TypeScript path means a torch-sized dependency. It
-exists to reach `intfloat/multilingual-e5-small` — 384 dims **and** multilingual, the
-combination the local ollama catalogue does not have.
+`--provider st` (sentence-transformers) reaches the models ollama does not serve —
+notably `intfloat/multilingual-e5-small`, 384 dims **and** multilingual, the combination
+the local catalogue lacks. **Both implementations have it**, and neither takes a
+torch-sized dependency to do so: the model runtime stays in Python, and the TypeScript
+side spawns `relicpy.embed_server` and talks JSON-lines to one persistent process. A
+subprocess per batch would spend its life loading a model that costs ~10 s to load.
+
+The sidecar's launcher is `uv run --with sentence-transformers`, so nothing is installed
+into the repo's environment — the dependency lives for the life of the process. Verified
+the same way as everything else here: both front ends embedded one 66-event shard into
+separate `--data-root`s and produced **bit-identical vectors** (`max |ts − py| =
+0.000e+00` over 25,344 components) under the same provider id,
+`st:intfloat/multilingual-e5-small+passage:`. The id matching matters — the model-mismatch
+guard compares it, so a divergence there would make each implementation refuse the
+other's shards.
 
 **Parity.** Both implementations embedded the same 66-event shard into separate
 `--data-root`s with the same model. Every component of all 25,344 floats matched
