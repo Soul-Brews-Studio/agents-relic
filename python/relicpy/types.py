@@ -7,6 +7,8 @@ so a different digest means the same event lands twice instead of merging.
 
 from __future__ import annotations
 
+import re
+
 import hashlib
 import json
 from typing import Any, Optional
@@ -140,3 +142,34 @@ def flatten_content(content: Any) -> str:
             if th:
                 out.append(th)
     return "\n".join(out)
+
+
+# Text a HOST injected as the first "user" message, which is never a session's name.
+#
+# Both hosts do this and only Claude's shapes were recognised, so 64% of Codex sessions
+# were listed by their own boot directive. Measured over 1,750 codex sessions:
+#
+#   391  <recommended_plugins> Here is a list of plugins that are a...
+#   365  # AGENTS.md instructions <INSTRUCTIONS> <!-- AUTONOMY DIRE...
+#   358  <codex_internal_context source="goal"> Continue working to...
+#    12  # AGENTS.md instructions for /opt/Code/github.com/...
+#
+# The AGENTS.md blob alone is 27,708 characters, stored truncated to 200 — so every one
+# of those sessions was named by the same cut-off sentence, differing only in a path.
+#
+# ANCHORED AT THE START, deliberately: a human quoting <recommended_plugins> while
+# debugging is a real message and keeps its name. Only a message that BEGINS as the
+# directive is the directive.
+_HOST_PREAMBLE = [
+    re.compile(r"^#\s*AGENTS\.md instructions\b", re.I),
+    re.compile(r"^<recommended_plugins>", re.I),
+    re.compile(r"^<codex_internal_context\b", re.I),
+    re.compile(r"^You have oh-my-codex installed\b", re.I),
+    re.compile(r"^<INSTRUCTIONS>", re.I),
+    re.compile(r"^<environment_context>", re.I),
+]
+
+
+def is_host_preamble(text) -> bool:
+    t = str(text or "").lstrip()
+    return any(rx.match(t) for rx in _HOST_PREAMBLE)

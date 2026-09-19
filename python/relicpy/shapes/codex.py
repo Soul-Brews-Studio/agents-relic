@@ -11,7 +11,7 @@ import os
 import re
 
 from ..models import ParsedEvent, ParsedFile
-from ..types import as_obj, s, truncate, uid_of
+from ..types import as_obj, s, truncate, uid_of, is_host_preamble
 
 
 def parse(file_path: str) -> ParsedFile:
@@ -29,7 +29,11 @@ def parse(file_path: str) -> ParsedFile:
         t = (text or "").strip()
         if not t:
             return
-        if not description and role == "user":
+        # The first user message is usually the HOST's, not the human's: oh-my-codex
+        # injects a 27 KB AGENTS.md directive, a <recommended_plugins> list, or a
+        # <codex_internal_context> resume block before anything a person typed.
+        # Taking the first one made 64% of codex sessions share a name.
+        if not description and role == "user" and not is_host_preamble(t):
             description = truncate(t, 200)
         # seq * 1000 + partIdx: one line can carry several content parts, and each
         # needs its own uid. The multiplier is the ceiling on parts per line.

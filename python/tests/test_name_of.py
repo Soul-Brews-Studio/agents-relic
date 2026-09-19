@@ -40,3 +40,45 @@ def test_capped_at_70():
     # pending and sessions both print this inline; an uncapped description is a
     # 200-character row that wraps and destroys the column layout.
     assert len(name_of({"description": "x" * 300})) == 70
+
+PREAMBLES = [
+    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<!-- AUTONOMY DIRECTIVE -->",
+    "# AGENTS.md instructions for /opt/Code/github.com/x/y",
+    "<recommended_plugins> Here is a list of plugins that are available",
+    '<codex_internal_context source="goal"> Continue working towards',
+    "<environment_context>\n  <cwd>/Users/beta</cwd>\n  <shell>zsh</shell>",
+    "You have oh-my-codex installed. AGENTS.md is the orchestration brain",
+]
+
+
+@pytest.mark.parametrize("text", PREAMBLES)
+def test_host_preambles_are_not_names(text):
+    """1,126 of 1,750 codex sessions (64%) were named by injected text.
+
+    A FIFTH shape only became visible after the first four were skipped:
+    <environment_context> sits at user#2 and the real message at user#3.
+    """
+    assert name_of({"description": text}) == "(untitled)"
+
+
+def test_a_title_still_wins_over_a_preamble():
+    assert name_of({"title": "real name", "description": "<recommended_plugins> x"}) == "real name"
+
+
+def test_only_a_message_that_begins_as_the_directive_is_one():
+    # A human quoting the tag while debugging keeps their message as the name.
+    assert name_of({"description": "why does <recommended_plugins> show up in my name?"}) \
+        == "why does show up in my name?"
+
+
+def test_a_pasted_image_tag_is_stripped():
+    # The {1,40} scrubber cannot reach it — an image tag carries a long path.
+    assert name_of({"description": '<image name=[Image #1] path="/var/f/x.png"> summarize the book'}) \
+        == "summarize the book"
+
+
+def test_real_messages_are_untouched_thai_included():
+    assert name_of({"description": "no i just you read thor memory /mcp"}) \
+        == "no i just you read thor memory /mcp"
+    assert name_of({"description": "[drdo-oracle] deploy เสร็จแล้ว + แก้ความเข้าใจผิด"}) \
+        == "[drdo-oracle] deploy เสร็จแล้ว + แก้ความเข้าใจผิด"

@@ -19,6 +19,7 @@ from .models import (BankGroup, Hit, PendingFile, PendingGroup, PendingReport,
 from .repo import default_root, list_shards, repo_key_of
 from .store import LanceStore
 from .types import block_role, flatten_content
+from .types import is_host_preamble
 
 T = TypeVar("T")
 
@@ -252,8 +253,16 @@ def name_of(row: dict) -> str:
     # description is truncated at 200 chars, so a caveat block often has no closing tag
     # to match against. Drop from the opening tag to the end rather than leaving the
     # boilerplate as the session's name.
+    # A host's own boot directive is not a name. Claude's two shapes were already
+    # handled below; Codex's three were not, and they are 64% of its sessions.
+    if is_host_preamble(d):
+        return "(untitled)"
+
     d = re.sub(r"<local-command-caveat>[\s\S]*$", "", d)
     d = re.sub(r"^\s*Caveat: The messages below were generated[\s\S]*$", "", d)
+    # A pasted image carries a long tag the {1,40} scrubber cannot reach, and a message
+    # is often JUST the tag. Whatever the human typed after it is the name.
+    d = re.sub(r"<image\b[^>]*>", " ", d, flags=re.I)
     d = re.sub(r"<[^>]{1,40}>", " ", d)
     d = re.sub(r"\s+", " ", d).strip()
     return d[:70] if d else "(untitled)"

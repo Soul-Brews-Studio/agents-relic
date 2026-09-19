@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { asObj, str, truncate, uidOf, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
+import { isHostPreamble } from "../types.js";
 
 /**
  * Codex CLI rollouts — ~/.codex/sessions/**\/rollout-*.jsonl
@@ -25,7 +26,13 @@ export const parseCodex: Parser = async (filePath) => {
   const push = (role: string, text: string, ts: string | null, partIdx: number) => {
     const t = text.trim();
     if (!t) return;
-    if (!description && role === "user") description = truncate(t, 200);
+    // The first user message is usually the HOST's, not the human's: oh-my-codex
+    // injects a 27 KB AGENTS.md directive, a <recommended_plugins> list, or a
+    // <codex_internal_context> resume block before anything a person typed. Taking the
+    // first one made 64% of codex sessions share a name. Skip past them to the first
+    // real message; if there is none, description stays null and the caller says
+    // "(untitled)", which is true.
+    if (!description && role === "user" && !isHostPreamble(t)) description = truncate(t, 200);
     events.push({ uid: uidOf("codex", fileKey, seq * 1000 + partIdx), seq, role, ts, text: truncate(t) });
   };
 

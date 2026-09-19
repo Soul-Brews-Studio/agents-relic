@@ -47,3 +47,46 @@ describe("nameOf", () => {
     expect(nameOf({ title: "from a parse" })).toBe("from a parse");
   });
 });
+
+describe("host preambles are not names", () => {
+  /*
+   * Measured over 1,750 codex sessions: 1,126 (64%) were named by injected text,
+   * because only Claude's two shapes were recognised. The AGENTS.md blob alone is
+   * 27,708 chars stored truncated to 200, so every one of those sessions showed the
+   * same cut-off sentence differing only in a path.
+   *
+   * A FIFTH shape only became visible after the first four were skipped:
+   * <environment_context> sits at user#2 and the real message at user#3, so each fix
+   * uncovered the next. python/tests/test_name_of.py asserts the same list.
+   */
+  const PREAMBLES = [
+    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n<!-- AUTONOMY DIRECTIVE -->",
+    "# AGENTS.md instructions for /opt/Code/github.com/x/y",
+    "<recommended_plugins> Here is a list of plugins that are available",
+    "<codex_internal_context source=\"goal\"> Continue working towards",
+    "<environment_context>\n  <cwd>/Users/beta</cwd>\n  <shell>zsh</shell>",
+    "You have oh-my-codex installed. AGENTS.md is the orchestration brain",
+  ];
+  for (const p of PREAMBLES)
+    test(`"${p.slice(0, 34).replace(/\n/g, " ")}…"`, () => expect(nameOf({ description: p })).toBe("(untitled)"));
+
+  test("a title still wins over a preamble description", () => {
+    expect(nameOf({ title: "real name", description: "<recommended_plugins> x" })).toBe("real name");
+  });
+  test("only a message that BEGINS as the directive is the directive", () => {
+    // A human quoting the tag while debugging is a real message and keeps its name.
+    expect(nameOf({ description: "why does <recommended_plugins> show up in my name?" }))
+      .toBe("why does show up in my name?");
+  });
+  test("a pasted image tag is stripped, not left as the name", () => {
+    // The {1,40} scrubber cannot reach it — an image tag carries a long path.
+    expect(nameOf({ description: '<image name=[Image #1] path="/var/folders/41/x.png"> summarize the book' }))
+      .toBe("summarize the book");
+  });
+  test("real messages are untouched, Thai included", () => {
+    expect(nameOf({ description: "no i just you read thor memory /mcp" }))
+      .toBe("no i just you read thor memory /mcp");
+    expect(nameOf({ description: "[drdo-oracle] deploy เสร็จแล้ว + แก้ความเข้าใจผิด" }))
+      .toBe("[drdo-oracle] deploy เสร็จแล้ว + แก้ความเข้าใจผิด");
+  });
+});

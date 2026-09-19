@@ -1,4 +1,6 @@
 import { createReadStream, statSync } from "node:fs";
+import { isHostPreamble } from "./types.js";
+export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
@@ -750,8 +752,15 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   // description is truncated at 200 chars, so a caveat block often has no closing tag
   // to match against. Drop from the opening tag to the end rather than leaving the
   // boilerplate as the session's name.
+  // A host's own boot directive is not a name. Claude's two shapes were already
+  // handled below; Codex's three were not, and they account for 64% of its sessions.
+  if (isHostPreamble(d)) return "(untitled)";
+
   d = d.replace(/<local-command-caveat>[\s\S]*$/, "")
        .replace(/^\s*Caveat: The messages below were generated[\s\S]*$/, "")
+       // A pasted image carries a long tag the {1,40} scrubber below cannot reach, and
+       // a message is often JUST the tag. Whatever the human typed after it is the name.
+       .replace(/<image\b[^>]*>/gi, " ")
        .replace(/<[^>]{1,40}>/g, " ")
        .replace(/\s+/g, " ").trim();
   return d ? d.slice(0, 70) : "(untitled)";
