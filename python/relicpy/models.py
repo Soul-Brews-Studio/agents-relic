@@ -236,6 +236,11 @@ class PendingFile(BaseModel):
     size: int
     session_id: str = ""  # "" for shapes that have none (vault notes, memory files)
     repo: str = "_unresolved"  # read from the transcript's own cwd, never guessed
+    # Both come from the SAME parse that resolves `repo`, so they cost nothing extra
+    # once a file is being listed. A report that says "missing 1" without naming it
+    # makes the reader go find the file by hand — the one thing it exists to avoid.
+    cwd: str = ""   # the session's own working directory, "" when it wrote none
+    name: str = ""  # its title, or the slash command it opened with — see name_of
 
 
 class PendingGroup(BaseModel):

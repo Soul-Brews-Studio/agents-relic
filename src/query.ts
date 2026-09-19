@@ -606,7 +606,13 @@ export async function neighbours(
  * `<local-command-caveat>` preamble. Shown raw, the listing fills with tag soup and
  * every /dig session looks identical.
  */
-export function nameOf(r: SessionRow): string {
+/**
+ * A session's human-readable name. Takes the two fields it reads rather than a
+ * SessionRow, so `pending` — which has a parsed transcript and no row, because the
+ * whole point is that it is not in the index — can call the same function. Two copies
+ * of this would drift on the slash-command branch and nobody would notice.
+ */
+export function nameOf(r: { title?: unknown; description?: unknown }): string {
   const t = String((r as any).title ?? "").trim();
   if (t) return t;
 
@@ -772,6 +778,12 @@ export interface PendingFile {
   mtime: number; size: number;
   sessionId: string;   // "" for shapes that have none (vault notes, memory files)
   repo: string;        // real cwd-derived repo key, or "_unresolved" — see listPending
+  // Both read from the transcript, in the SAME parse that resolves `repo` — so they
+  // cost nothing extra once a file is being listed at all. A pending report that says
+  // "missing 1" without naming it makes the reader go find the file by hand, which is
+  // the one thing the report exists to avoid.
+  cwd: string;         // the session's own working directory, "" when it wrote none
+  name: string;        // its title, or the slash-command it opened with — see nameOf
 }
 export interface PendingReport {
   groups: PendingGroup[];
@@ -873,16 +885,33 @@ export async function pendingReport(
    * over the whole corpus, and this is N file reads. Sorting by mtime first means the
    * N that get read are the N a human actually asked about — the most recent.
    */
-  const cap = Math.max(0, Number(s.list ?? 0));
+  /*
+   * AUTO-LIST WHEN THE SET IS SMALL.
+   *
+   * `list` was opt-in because listing costs one file read per row. But the common case
+   * is a handful of files, where the summary's "missing 1" is exactly the wrong amount
+   * of information — it reports that something is missing and makes the reader go find
+   * out what. Reading 10 transcripts is milliseconds; reading 30,000 is the reason the
+   * cap exists. So: list by default up to AUTO_LIST, and keep the explicit flag for
+   * asking past it.
+   */
+  const AUTO_LIST = 10;
+  const cap = s.list === undefined
+    ? Math.min(pending.length, AUTO_LIST)
+    : Math.max(0, Number(s.list));
   pending.sort((a, b) => b.f.mtime - a.f.mtime);
   const files: PendingFile[] = [];
   for (const { f, state } of pending.slice(0, cap)) {
-    let repo = "_unresolved";
-    try { repo = repoKeyOf((await f.parser(f.path)).cwd) ?? "_unresolved"; }
-    catch { /* an unparseable file is exactly why it is still pending — say _unresolved */ }
+    let repo = "_unresolved", cwd = "", name = "";
+    try {
+      const parsed = await f.parser(f.path);
+      cwd = parsed.cwd ?? "";
+      repo = repoKeyOf(parsed.cwd) ?? "_unresolved";
+      name = nameOf(parsed as { title?: unknown; description?: unknown });
+    } catch { /* an unparseable file is exactly why it is still pending — say _unresolved */ }
     files.push({ path: f.path, bank: f.bank, source: f.source, tier: f.tier, state,
                  mtime: f.mtime, size: f.size,
-                 sessionId: sessionIdOfPath(f.path, f.source), repo });
+                 sessionId: sessionIdOfPath(f.path, f.source), repo, cwd, name });
   }
 
   return {

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { homedir } from "node:os";
 import { existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
@@ -672,6 +673,12 @@ async function cmdMemory(f: Record<string, string | boolean>) {
   }
 }
 
+/** `/Users/x/...` -> `~/...`. A cwd is long and its prefix is the least useful part. */
+function tildeHome(p: string): string {
+  const h = homedir();
+  return p && p.startsWith(h + "/") ? "~" + p.slice(h.length) : p;
+}
+
 async function cmdPending(f: Record<string, string | boolean>) {
   const r = await pendingReport({
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
@@ -680,7 +687,12 @@ async function cmdPending(f: Record<string, string | boolean>) {
     since: f.since ? String(f.since) : undefined,
     // `--list` with no value means "a screenful", not "zero" — a bare flag parses as
     // boolean true, and Number(true) is 1, which would silently show one row.
-    list: f.list === undefined ? 0 : (f.list === true ? 20 : Number(f.list)),
+    //
+    // ABSENT is not the same as 0 and must stay undefined: it means "decide for me",
+    // which pendingReport answers by listing a small pending set and capping a large
+    // one. Mapping it to 0 here is what made the default report say "missing 1" and
+    // then refuse to say which.
+    list: f.list === undefined ? undefined : (f.list === true ? 20 : Number(f.list)),
   });
   const pmode = outFmt(f);
   if (pmode === "json") { console.log(JSON.stringify(r, null, 2)); return; }
@@ -741,16 +753,25 @@ async function cmdPending(f: Record<string, string | boolean>) {
   }
 
   if (r.files.length) {
-    console.log(`\nnot indexed yet — newest first (repo read from each transcript's own cwd):\n`);
-    console.log(`  ${"when".padEnd(16)} ${"session".padEnd(10)} ${"state".padEnd(7)} ` +
-                `${"bank".padEnd(22)} ${"source/tier".padEnd(26)} repo`);
-    for (const x of r.files)
-      console.log(`  ${localDateTime(new Date(x.mtime * 1000).toISOString()).padEnd(16)} ` +
+    console.log(`\nnot indexed yet — newest first (name, cwd and repo read from each transcript):\n`);
+    console.log(`  ${"when".padEnd(17)} ${"session".padEnd(10)} ${"state".padEnd(8)} ` +
+                `${"source/tier".padEnd(26)} repo`);
+    for (const x of r.files) {
+      console.log(`  ${localDateTime(new Date(x.mtime * 1000).toISOString()).padEnd(17)} ` +
                   `${(x.sessionId ? x.sessionId.slice(0, 8) : "-").padEnd(10)} ` +
-                  `${x.state.padEnd(7)} ${x.bank.padEnd(22)} ` +
+                  `${x.state.padEnd(8)} ` +
                   `${(x.source + "/" + x.tier).padEnd(26)} ${x.repo}`);
-    if (r.filesOmitted) console.log(`  ... and ${fmt(r.filesOmitted)} more pending (--list N)`);
-  } else if (f.list !== undefined && r.missing + r.changed === 0) {
+      // The identity line. `bank` moved off the row above to make room: it is derivable
+      // from source, while a session's name and cwd are not derivable from anything.
+      // nameOf returns "(untitled)" when a transcript wrote no title and no usable
+      // description. Printing that in quotes is worse than printing nothing — it looks
+      // like the session is literally called that.
+      const named = x.name && x.name !== "(untitled)" ? `"${x.name.slice(0, 60)}"` : "";
+      const bits = [named, tildeHome(x.cwd)].filter(Boolean);
+      if (bits.length) console.log(`  ${" ".repeat(17)} ${bits.join("   ")}`);
+    }
+    if (r.filesOmitted) console.log(`\n  ... and ${fmt(r.filesOmitted)} more pending (--list N)`);
+  } else if (r.missing + r.changed === 0) {
     console.log(`\nnothing pending — every discovered file is in the index.`);
   }
 }

@@ -226,9 +226,37 @@ def name_of(row: dict) -> str:
     """What to CALL a session: the host's title, else the opening user message.
 
     A uuid is not a name. Falling back to the description is what makes `relic
-    sessions` readable without opening anything.
+    sessions` readable without opening anything — but the raw description is rarely a
+    name, and this used to return it verbatim. Sessions opened by a slash command were
+    listed as a wall of XML, and sessions resumed after a compaction were listed as
+    "<local-command-caveat>Caveat: The messages below were genera". Both are
+    boilerplate the host wrote, not something the human called the session.
+
+    Mirrors the TypeScript nameOf() step for step, including the order of the
+    replacements — a session's displayed name should not depend on which reader you
+    asked.
     """
-    return (row.get("title") or row.get("description") or "").strip() or "(untitled)"
+    t = str(row.get("title") or "").strip()
+    if t:
+        return t
+
+    d = str(row.get("description") or "")
+    # A slash command: the command NAME is the useful part, so promote it.
+    cmd = re.search(r"<command-name>\s*(/?[\w:-]+)\s*</command-name>", d)
+    if cmd:
+        args = re.search(r"<command-args>([\s\S]*?)</command-args>", d)
+        arg = args.group(1).strip() if args else ""
+        name = f"{cmd.group(1)} {arg}" if arg else cmd.group(1)
+        return re.sub(r"\s+", " ", name)[:70]
+
+    # description is truncated at 200 chars, so a caveat block often has no closing tag
+    # to match against. Drop from the opening tag to the end rather than leaving the
+    # boilerplate as the session's name.
+    d = re.sub(r"<local-command-caveat>[\s\S]*$", "", d)
+    d = re.sub(r"^\s*Caveat: The messages below were generated[\s\S]*$", "", d)
+    d = re.sub(r"<[^>]{1,40}>", " ", d)
+    d = re.sub(r"\s+", " ", d).strip()
+    return d[:70] if d else "(untitled)"
 
 
 def looks_like_id(s: str) -> bool:
@@ -474,18 +502,31 @@ def pending_report(scope: Scope, corpus: Optional[list[str]] = None,
     # THE LIST IS CAPPED AND PARSED; THE COUNTS ARE NEITHER. A file's repo is not
     # knowable from its path (the encoding maps both "/" and "." to "-"), so it is read
     # from the transcript's own cwd — which means opening it.
-    cap = max(0, int(list_n or 0))
+    #
+    # AUTO-LIST WHEN THE SET IS SMALL. Listing was opt-in because it costs one file read
+    # per row, but the common case is a handful of files — where the summary's
+    # "missing 1" is exactly the wrong amount of information: it reports that something
+    # is missing and makes the reader go find out what. Ten transcripts is milliseconds;
+    # thirty thousand is why the cap exists. So None means "decide for me", and 0 still
+    # means "none", which is not the same thing.
+    AUTO_LIST = 10
     pending.sort(key=lambda x: x[0].mtime, reverse=True)
+    cap = min(len(pending), AUTO_LIST) if list_n is None else max(0, int(list_n))
     files: list[PendingFile] = []
     for f, state in pending[:cap]:
-        repo = "_unresolved"
+        repo, cwd, name = "_unresolved", "", ""
         try:
-            repo = repo_key_of(f.parser(f.path).cwd) or "_unresolved"
+            parsed = f.parser(f.path)
+            cwd = parsed.cwd or ""
+            repo = repo_key_of(parsed.cwd) or "_unresolved"
+            name = name_of({"title": getattr(parsed, "title", ""),
+                            "description": getattr(parsed, "description", "")})
         except Exception:
             pass          # an unparseable file is exactly why it is still pending
         files.append(PendingFile(path=f.path, bank=f.bank, source=f.source, tier=f.tier,
                                  state=state, mtime=f.mtime, size=f.size,
-                                 session_id=session_id_of_path(f.path, f.source), repo=repo))
+                                 session_id=session_id_of_path(f.path, f.source),
+                                 repo=repo, cwd=cwd, name=name))
 
     return PendingReport(
         groups=sorted(groups.values(), key=lambda g: -(g.missing + g.changed)),
