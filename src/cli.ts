@@ -17,7 +17,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
-import { resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
+import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
   const f: Record<string, string | boolean> = {};
@@ -491,7 +491,28 @@ async function cmdStatus(f: Record<string, string | boolean>) {
     return;
   }
   console.log(`layout  ${dataRoot ?? (Boolean(f["in-repo"]) ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot())}`);
-  console.log(`store   LanceDB + ICU full-text index (BM25)\n`);
+  console.log(`store   LanceDB + ICU full-text index (BM25)`);
+  /*
+   * THE GHQ ROOT, AND WHETHER IT EXISTS.
+   *
+   * repoKeyOf() finds `github.com/<org>/<repo>` in a path without touching disk, so it
+   * works regardless. resolveRepoKey()'s two fallbacks do NOT: they resolve a bare repo
+   * name against an index of what is actually checked out, and an index of zero silently
+   * disables them.
+   *
+   * Measured on white.local, 2026-09-19: `ghq.root` was unset, so ghq answered with its
+   * built-in default ~/ghq — a directory that DOES NOT EXIST — while the 28 real repos
+   * sat in ~/Code. relic rebuilt a whole bank, reported success, and attributed nothing,
+   * because the feature had quietly become a no-op. One line here is the difference
+   * between that and a five-minute diagnosis.
+   */
+  const gr = ghqRoot();
+  const repos = repoIndex().size;
+  console.log(`repos   ${gr}` + (existsSync(gr)
+    ? `  ·  ${fmt(repos)} repo names indexed`
+    : `  ⚠ DOES NOT EXIST — worktree/scratchpad paths cannot resolve to a repo.` +
+      `\n        set it: git config --global ghq.root <path>`));
+  console.log("");
 
   const rows: { bank: string; repo: string; events: number; sessions: number;
                 lastIndexed: string; newestSession: string }[] = [];
