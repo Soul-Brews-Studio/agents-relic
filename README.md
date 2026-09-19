@@ -807,6 +807,123 @@ relic skipped --json
 Every drop is logged to `~/.relic/skipped.jsonl` with the rule that fired and the first
 120 characters, because **a filter you cannot audit is a filter you cannot trust**.
 
+### `embed` — the opt-in second pass
+
+`index` never writes a vector. Embedding is a separate command over an index that is
+already complete, and it is resumable, scoped, and free to skip.
+
+```bash
+relic embed --dry-run                      # what would this cost? no provider call
+relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
+relic embed --model bge-m3 --reset         # change model: drops `vectors` first
+relic-py embed --provider st --model intfloat/multilingual-e5-small
+```
+
+```
+provider  ollama:all-minilm
+scope     main tiers, text >= 24 chars, truncated at 2000
+
+  projects/github.com/laris-co/neo-oracle   61%  74,102/120,988 embedded  dim 384
+
+74,102 embedded · 46,886 pending · 0 failed · 1 shards · 512.0s  (145/s)
+```
+
+**Vectors go to a `vectors` table, never a column on `events`.** That is not a style
+preference — it is the only shape that works:
+
+| | |
+|---|---|
+| widening `events` | `addColumns` backfills a **scalar** default only, so an `embedding` column lands as `Utf8`. The TypeScript client then writes `[0.1, 0.2]` into it as the string `"0.1,0.2"` — **no error at write or read**. The Python client raises `ArrowNotImplementedError` on the same call: same Rust core, different client-side cast. Both are pinned by tests. |
+| cost of a column | a column forces a value for **every** row on the next write. 3,394,951 events × 384 dims × 4 B = **4.86 GiB**, 1.5× the entire 3.2 GB index — to embed a corpus whose search already answers better without it. |
+| a side table | starts absent, resumes by anti-joining `uid`, and embedding a **subset** needs no sentinel for "not embedded yet". Cost: one extra query — vector search returns uids, then `events` is read by uid. |
+
+`widen()` now refuses a non-scalar column outright, so the first failure above can no
+longer happen to any future field either.
+
+**Providers.** `ollama` is the default in both implementations — HTTP, no dependency
+added to a three-dependency tool, and identical output from either front end. Measured
+locally, dim read off the live response:
+
+| model | dim | cos(en, th translation) |
+|---|---|---|
+| `all-minilm` | 384 | +0.187 |
+| `nomic-embed-text` | 768 | +0.467 |
+| `mxbai-embed-large` | 1024 | +0.479 |
+| `qwen3-embedding:0.6b` | 1024 | +0.572 |
+| `bge-m3` | 1024 | +0.626 |
+
+That cosine is a **smoke test, not a benchmark**: one English string against its Thai
+translation, which says whether a model puts the two languages in one space at all and
+nothing about ranking quality. `all-minilm` at +0.187 is what "English-only" looks like.
+
+`--provider st` (sentence-transformers) reaches the models ollama does not serve —
+notably `intfloat/multilingual-e5-small`, 384 dims **and** multilingual, the combination
+the local catalogue lacks. **Both implementations have it**, and neither takes a
+torch-sized dependency to do so: the model runtime stays in Python, and the TypeScript
+side spawns `relicpy.embed_server` and talks JSON-lines to one persistent process. A
+subprocess per batch would spend its life loading a model that costs ~10 s to load.
+
+The sidecar's launcher is `uv run --with sentence-transformers`, so nothing is installed
+into the repo's environment — the dependency lives for the life of the process. Verified
+the same way as everything else here: both front ends embedded one 66-event shard into
+separate `--data-root`s and produced **bit-identical vectors** (`max |ts − py| =
+0.000e+00` over 25,344 components) under the same provider id,
+`st:intfloat/multilingual-e5-small+passage:`. The id matching matters — the model-mismatch
+guard compares it, so a divergence there would make each implementation refuse the
+other's shards.
+
+**Parity.** Both implementations embedded the same 66-event shard into separate
+`--data-root`s with the same model. Every component of all 25,344 floats matched
+exactly (`max |ts − py| = 0.000e+00`), and the two Arrow schemas compared equal.
+
+### Embeddings, measured — and why search still does not use them
+
+Full method and numbers: [`bench/README.md`](bench/README.md). The short version, on
+200 known-item queries over a shared 3,000-doc pool:
+
+```
+FTS (ICU)                 0.890 MRR@20   R@1 83.0%   miss  2.5%     1.3 ms
+multilingual-e5-small     0.600          R@1 52.5%   miss 22.0%     0.4 ms
+all-MiniLM-L6 (en only)   0.503          R@1 42.5%   miss 30.5%     0.3 ms
+multilingual-MiniLM-L12   0.430          R@1 36.5%   miss 40.0%     0.5 ms
+FTS + RRF fusion          0.822          R@1 73.5%   miss  3.0%   +480 ms
+```
+
+On Thai the gap is ~2.5× in lexical's favour (0.768 vs 0.308) — ICU word segmentation
+is doing work no 384-dim multilingual model matched. And **RRF fusion made retrieval
+worse**, 0.890 → 0.822: k=60 weights both lists equally, so blending a weak one into a
+strong one drags the strong one down.
+
+That set measures **known-item** retrieval, which is what lexical search is best at. The
+paraphrase set — same pool, **same 200 target documents**, queries rewritten by a local
+model told not to reuse the target's terms — is the other half, and **the ordering flips**:
+
+```
+                        known-item   paraphrase    delta
+FTS (ICU)                    0.890        0.046   -0.844
+multilingual-e5-small        0.600        0.140   -0.461
+```
+
+So the two methods fail in opposite regimes. What they do **not** do is fail on different
+queries *within* a regime — which is the measurement that decides whether to build anything:
+
+```
+KNOWN-ITEM           e5 HIT  e5 MISS       PARAPHRASE     e5 HIT  e5 MISS
+   FTS HIT             154       41          FTS HIT          18        5
+   FTS MISS              1        4          FTS MISS        50      127
+```
+
+Asymmetric containment. e5 adds **1** query in 200 to FTS on known-item; FTS adds **5** to
+e5 on paraphrase. Oracle bounds are +0.5% and +2.5% over the better single method, and RRF
+lost at every k in **both** directions — so no fusion and no router. The prize is the
+regime switch itself (paraphrase recall@20 **11.5% → 34%**), which no blend reaches.
+
+`search` still does not read vectors, and that is now a measured decision rather than an
+untested one: a `--semantic` mode is justified in principle — the user knows their query
+style better than a classifier would — but not by quality. 0.140 MRR, 34% recall@20,
+median target rank 68 of 3,000 is a different failure from FTS's, not a better one.
+`relic embed` ships as the infrastructure that makes this measurable.
+
 ### `attach` — index someone else's LanceDB
 
 ```bash
@@ -1037,7 +1154,7 @@ SQL.
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  relic — data model and its joins                        measured 2026-09-18 ║
-║  3 tables · 0 foreign keys · file_path is the real key, session_uuid is not  ║
+║  3 tables + 1 optional · 0 FKs · file_path is the real key, session_uuid not ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
  ONE LANCEDB DIR PER (BANK, REPO)  ~/.relic/banks/<bank>/github.com/<org>/<repo>/
@@ -1098,7 +1215,11 @@ SQL.
 
  ── WHAT IS NOT STORED ───────────────────────────────────────────────────────
     No full text of a file that exists on disk (--skip-noise drops readbacks).
-    No vectors yet — they land in `events`, same table, no migration.
+    No vectors, unless `relic embed` was run. They go to a 4th table,
+    `vectors` (uid PK -> FixedSizeList<Float32,dim>), NEVER a column on
+    `events`: a vector column cannot be added by widening, and in the
+    TypeScript client it lands as Utf8 and stores "0.1,0.2,..." as TEXT
+    with no error. `index` never writes it; embedding is a second pass.
     The index is a POINTER: (file_path, seq) -> `show` re-reads the source .jsonl.
 
  SIDECARS   ~/.relic/trace.jsonl    one line per query, + `opened` on show
@@ -1264,9 +1385,10 @@ worth keeping" into a count instead of an argument.
 - **Federating over other indexes.** Querying N heterogeneous stores means N adapters,
   incomparable relevance scores, and no shared dedup key. Where content is genuinely
   unique, ingest it as a source instead.
-- **Embeddings.** The schema leaves room (vectors land in the same table, no migration),
-  but on this corpus keyword retrieval measured far ahead of vectors, so keyword ships
-  first.
+- **Embeddings in the default path.** `relic embed` exists and writes a real `vectors`
+  table, but nothing calls it for you and search does not read it yet. On this corpus
+  keyword retrieval measured far ahead of every model tried (0.890 MRR@20 against
+  0.600), so keyword is what ships. See *Embeddings, measured* below.
 
 ## License
 

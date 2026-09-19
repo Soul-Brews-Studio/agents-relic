@@ -1,6 +1,6 @@
-import pickle
+import os, pickle
 import numpy as np
-r = pickle.load(open("/tmp/bench_all.pkl", "rb"))
+r = pickle.load(open(os.environ.get("BENCH_ALL", "/tmp/bench_all.pkl"), "rb"))
 K = 20
 
 def stats(rr):
@@ -17,7 +17,7 @@ def stats(rr):
 
 order = ["FTS (ICU)", "FTS + expand(fr) append", "FTS + expand(fr) RRF",
          "multilingual-MiniLM-L12", "multilingual-e5-small", "all-MiniLM-L6 (en only)"]
-print(f"  n={stats(r['FTS (ICU)'][0])['n']} known-item queries  ·  pool=3,000 docs  ·  MRR@{K}\n")
+print(f"  n={stats(r['FTS (ICU)'][0])['n']} {os.environ.get('BENCH_LABEL', 'known-item')} queries  ·  pool=3,000 docs  ·  MRR@{K}\n")
 print(f"  {'method':<26} {'MRR':>6} {'R@1':>6} {'R@10':>6} {'miss':>6} {'MRR th':>7} {'MRR en':>7}  {'query cost':<22} notes")
 print("  " + "-" * 122)
 for k in order:

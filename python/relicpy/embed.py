@@ -1,0 +1,268 @@
+"""Embedding the index — the WRITE half only.
+
+`index` never calls anything here, and that separation is the point. Embedding is
+expensive, optional, and was measured to LOSE to the full-text index on this corpus
+(FTS 0.890 MRR@20 against 0.600 for the best of three models — see bench/README.md).
+So it is a second pass over an index that is already complete and already answers:
+"index first, embed later", with later meaning "if at all".
+
+Everything written lands in the per-shard `vectors` table, never on `events`. See
+`vector_row_model()` in models.py for the measurement behind that.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+from .models import Scope
+from .query import pick_shards
+from .store import LanceStore
+
+DEFAULT_OLLAMA = "http://localhost:11434"
+
+
+# --------------------------------------------------------------------- providers
+
+
+@dataclass
+class Provider:
+    """`id` is what goes on disk in VectorRow.model — provider-qualified, so a table
+    written by ollama and one written by sentence-transformers never look alike."""
+
+    id: str
+    encode: Callable[[list[str]], list[list[float]]]
+
+
+def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
+    """Ollama over HTTP, on urllib — no dependency added to a 3-dependency tool.
+
+    The DEFAULT for both implementations, and the reason `relic embed` and
+    `relic-py embed` are the same command rather than two: neither needs a model
+    runtime of its own.
+
+    Models measured locally, 2026-09-18, dim read off the live response:
+
+        all-minilm             384   en only   cos(en, th-translation) +0.187
+        nomic-embed-text       768                                    +0.467
+        mxbai-embed-large     1024                                    +0.479
+        qwen3-embedding:0.6b  1024   multi                            +0.572
+        bge-m3                1024   multi                            +0.626
+
+    That cosine is a SMOKE TEST, not a benchmark: one English string against its Thai
+    translation, which says whether a model places the two languages in one space at
+    all, and nothing about ranking quality.
+    """
+    base = host.rstrip("/")
+
+    def encode(texts: list[str]) -> list[list[float]]:
+        req = urllib.request.Request(
+            f"{base}/api/embed",
+            data=json.dumps({"model": model, "input": texts}).encode(),
+            headers={"content-type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as r:
+            j = json.loads(r.read())
+        if j.get("error"):
+            raise RuntimeError(f"ollama: {j['error']}")
+        vecs = j.get("embeddings") or []
+        # A short batch back is worse than an error: the rows would pair to the wrong
+        # uids and every vector in the batch would be silently mislabelled.
+        if len(vecs) != len(texts):
+            raise RuntimeError(f"ollama returned {len(vecs)} vectors for {len(texts)} inputs")
+        return vecs
+
+    return Provider(id=f"ollama:{model}", encode=encode)
+
+
+def st_provider(model: str, device: Optional[str] = None,
+                query_prefix: str = "", doc_prefix: str = "") -> Provider:
+    """sentence-transformers, in-process. TypeScript reaches the SAME models through
+    `relicpy.embed_server`, which wraps this library behind a JSON-lines pipe rather
+    than porting it — adding a model runtime to the TypeScript side would mean a
+    torch-sized dependency in a tool that has three.
+
+    So both implementations offer `--provider st` and both produce the same provider id,
+    which is load-bearing: the model-mismatch guard compares ids, so a divergence would
+    make each implementation refuse the other's shards.
+
+    It exists because it reaches models ollama does not serve — notably
+    `intfloat/multilingual-e5-small`: 384 dims AND multilingual, which is exactly the
+    combination the ollama catalogue on this machine lacks (all-minilm is 384 but
+    English-only; bge-m3 is multilingual but 1024).
+
+    e5 models want asymmetric prefixes — "passage: " on documents, "query: " on queries.
+    Passing the wrong one silently costs recall, so the prefix is recorded in the
+    provider id and lands on disk with the vectors.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+    except ImportError as e:
+        raise RuntimeError(
+            "sentence-transformers is not installed. It is an optional extra, not a "
+            "dependency of relicpy: run `uv run --with sentence-transformers relic-py "
+            "embed --provider st ...`, or use --provider ollama (the default)."
+        ) from e
+
+    m = SentenceTransformer(model, device=device) if device else SentenceTransformer(model)
+
+    def encode(texts: list[str]) -> list[list[float]]:
+        # normalize_embeddings is left OFF here: normalisation happens in one place for
+        # every provider (l2_normalise below), so `norm` on disk means the same thing
+        # regardless of which backend wrote the row.
+        return [list(map(float, v)) for v in
+                m.encode([doc_prefix + t for t in texts], show_progress_bar=False)]
+
+    tag = f"st:{model}" + (f"+{doc_prefix.strip()}" if doc_prefix else "")
+    return Provider(id=tag, encode=encode)
+
+
+def provider_for(name: str, model: str, host: Optional[str] = None,
+                 device: Optional[str] = None) -> Provider:
+    if name == "ollama":
+        return ollama_provider(model, host or DEFAULT_OLLAMA)
+    if name == "st":
+        # e5 is the model this provider exists for, and it is useless without its
+        # prefix — so infer it rather than making silence the failure mode.
+        doc = "passage: " if "e5" in model.lower() else ""
+        return st_provider(model, device=device, doc_prefix=doc)
+    raise ValueError(f'unknown provider "{name}" — expected "ollama" or "st"')
+
+
+# ----------------------------------------------------------------------- helpers
+
+
+def l2_normalise(v: list[float]) -> list[float]:
+    """L2-normalise so LanceDB's default L2 distance ranks identically to cosine.
+
+    Done on WRITE, so the choice is recorded on disk (VectorRow.norm) instead of living
+    in whichever caller happens to run the search. A zero vector is left alone rather
+    than divided by zero — it can only come from a provider failure, and NaNs would
+    poison every later comparison silently.
+    """
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v] if n > 0 else v
+
+
+@dataclass
+class ShardEmbedStat:
+    key: str
+    bank: str
+    repo: str
+    eligible: int = 0     # events passing the tier/length filter
+    already: int = 0      # of those, already embedded
+    pending: int = 0      # what this run would do (before --limit)
+    embedded: int = 0     # what it actually did
+    failed: int = 0
+    model: str = ""
+    dim: int = 0
+    skipped: str = ""     # why this shard was left alone
+
+
+@dataclass
+class EmbedTally:
+    shards: list[ShardEmbedStat] = field(default_factory=list)
+    embedded: int = 0
+    failed: int = 0
+    pending: int = 0
+    ms: int = 0
+    dry_run: bool = False
+    provider_id: str = ""
+
+
+# -------------------------------------------------------------------- the driver
+
+
+def embed_shard(store: LanceStore, p: Provider, *, batch: int = 64,
+                limit: Optional[int] = None, main_tiers: bool = True,
+                min_chars: int = 24, max_chars: int = 2000,
+                dry_run: bool = False, reset: bool = False,
+                on_progress: Optional[Callable[[int, int], None]] = None) -> ShardEmbedStat:
+    """One shard. Resumable by construction: the anti-join is against what is ON DISK,
+    so an interrupted run is re-entered by running the command again."""
+    st = ShardEmbedStat(key="", bank="", repo="", model=p.id)
+    st.eligible = store.embeddable_count(main_tiers=main_tiers, min_chars=min_chars)
+    # --reset before the stats read, so the mismatch guard below sees the post-drop
+    # state rather than refusing on vectors this run is about to discard anyway.
+    if reset and not dry_run:
+        store.drop_vectors()
+    prior = store.vector_stats()
+    st.already = (prior or {}).get("rows", 0)
+
+    # A FixedSizeList has ONE width. Writing a 1024-dim vector into a table created at
+    # 384 fails mid-batch, after an arbitrary amount of work has already landed — so the
+    # mismatch is caught before the first HTTP call and the shard is skipped with a
+    # reason, rather than half-written. Saying so is cheaper than discovering it 40
+    # minutes into a backfill.
+    if prior and prior["rows"] > 0 and prior["model"] and prior["model"] != p.id:
+        st.dim = prior["dim"]
+        st.skipped = (f"holds {prior['rows']} vectors from {prior['model']} "
+                      f"(dim {prior['dim']}); re-embed with {p.id} by adding --reset "
+                      f"(drops this shard's vectors table only)")
+        return st
+
+    todo = store.unembedded(limit=limit, main_tiers=main_tiers, min_chars=min_chars)
+    st.pending = len(todo)
+    st.dim = (prior or {}).get("dim", 0)
+    if dry_run or not todo:
+        return st
+
+    for i in range(0, len(todo), max(1, batch)):
+        chunk = todo[i:i + max(1, batch)]
+        try:
+            vecs = p.encode([c["text"][:max_chars] for c in chunk])
+            widths = {len(v) for v in vecs}
+            # Every row in one table must share a width; a provider that changes its
+            # mind mid-run would otherwise corrupt the shard one batch at a time.
+            if len(widths) != 1:
+                raise RuntimeError(f"provider returned mixed dims: {sorted(widths)}")
+            dim = widths.pop()
+            if st.dim and dim != st.dim:
+                raise RuntimeError(f"dim changed mid-run: {st.dim} -> {dim}")
+            st.dim = dim
+            at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+            store.put_vectors([{"uid": c["uid"], "embedding": l2_normalise(v),
+                                "model": p.id, "dim": float(dim), "norm": "l2",
+                                "embedded_at": at}
+                               for c, v in zip(chunk, vecs)], dim)
+            st.embedded += len(chunk)
+        except Exception:
+            # One bad batch must not end a backfill that is resumable anyway — those
+            # uids simply stay pending and the next run picks them up.
+            st.failed += len(chunk)
+        if on_progress:
+            on_progress(st.embedded, len(todo))
+    return st
+
+
+def embed_shards(s: Scope, *, provider: str = "ollama", model: str = "all-minilm",
+                 host: Optional[str] = None, device: Optional[str] = None,
+                 batch: int = 64, limit: Optional[int] = None,
+                 main_tiers: bool = True, min_chars: int = 24, max_chars: int = 2000,
+                 dry_run: bool = False, reset: bool = False,
+                 on_progress: Optional[Callable[[str, int, int], None]] = None) -> EmbedTally:
+    t0 = time.time()
+    p = provider_for(provider, model, host, device)
+    tally = EmbedTally(dry_run=dry_run, provider_id=p.id)
+    for sh in pick_shards(s):
+        try:
+            store = LanceStore.open(sh.dir)
+            st = embed_shard(
+                store, p, batch=batch, limit=limit, main_tiers=main_tiers,
+                min_chars=min_chars, max_chars=max_chars, dry_run=dry_run, reset=reset,
+                on_progress=(lambda d, t, k=sh.key: on_progress(k, d, t)) if on_progress else None)
+            st.key, st.bank, st.repo = sh.key, sh.bank, sh.repo
+        except Exception as e:
+            st = ShardEmbedStat(key=sh.key, bank=sh.bank, repo=sh.repo,
+                                model=p.id, skipped=str(e)[:160])
+        tally.shards.append(st)
+        tally.embedded += st.embedded
+        tally.failed += st.failed
+        tally.pending += st.pending
+    tally.ms = int((time.time() - t0) * 1000)
+    return tally

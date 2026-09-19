@@ -5,10 +5,10 @@ A span, not the whole text — quoting a document verbatim makes lexical search 
 win and measures nothing. A contiguous 8-12 word span from the middle is what someone
 half-remembering a conversation actually types.
 """
-import json, random, re
+import json, os, random, re
 
 random.seed(4242)
-pool = json.load(open("/tmp/pool.json"))
+pool = json.load(open(os.environ.get("BENCH_POOL", "/tmp/pool.json")))
 THAI = re.compile(r"[฀-๿]")
 N = 200
 
@@ -40,7 +40,7 @@ for r in cands:
         continue
     used.add(r["uid"])
     qs.append({"q": s, "uid": r["uid"], "thai": thai})
-json.dump(qs, open("/tmp/queries.json", "w"))
+json.dump(qs, open(os.environ.get("BENCH_QUERIES", "/tmp/queries.json"), "w"))
 print(f"  {len(qs)} queries — {sum(q['thai'] for q in qs)} Thai, {sum(not q['thai'] for q in qs)} non-Thai")
 print("  sample en:", next(q['q'] for q in qs if not q['thai'])[:70])
 print("  sample th:", next(q['q'] for q in qs if q['thai'])[:50])

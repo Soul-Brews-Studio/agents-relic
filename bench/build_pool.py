@@ -4,8 +4,11 @@ Comparing FTS on the whole 3.4 M-event index against embeddings on a 3,000-doc p
 would be rigged — a bigger candidate set is strictly harder. So every method searches
 the SAME pool, built once here.
 """
-import json, random, re, sys
-sys.path.insert(0, "/opt/Code/github.com/Soul-Brews-Studio/agents-relic/wt/agents-relic-kind-vs-tier-18sep-fri2026/python")
+import json, os, random, re, sys
+# The repo's own python/ package, resolved from THIS file. It used to be an absolute
+# path to one worktree, which silently benchmarked another checkout's code — or failed
+# outright once that worktree was removed.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 from relicpy.models import Scope
 from relicpy.query import pick_shards
 from relicpy.store import LanceStore
@@ -45,6 +48,6 @@ for r in pool:
     if r["uid"] in seen:
         continue
     seen.add(r["uid"]); uniq.append(r)
-json.dump(uniq, open("/tmp/pool.json", "w"))
+json.dump(uniq, open(os.environ.get("BENCH_POOL", "/tmp/pool.json"), "w"))
 th = sum(1 for r in uniq if THAI.search(r["text"]))
 print(f"  pool: {len(uniq)} docs — {th} containing Thai, {len(uniq)-th} not")

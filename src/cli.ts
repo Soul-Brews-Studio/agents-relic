@@ -15,6 +15,7 @@ import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import
 import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
+import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -319,6 +320,84 @@ async function cmdSessions(f: Record<string, string | boolean>) {
 }
 
 // ---- status ----------------------------------------------------------------
+/*
+ * EMBED — a second pass over an index that is already complete.
+ *
+ * Deliberately not part of `index`. The measured result on this corpus is that the
+ * full-text index WINS (MRR@20 0.890 vs 0.600 for the best of three models, bench/),
+ * so embedding is opt-in, resumable, and scoped: `--repo`, `--bank` and `--limit` all
+ * narrow it, and `--dry-run` answers "how much would this cost" without an HTTP call.
+ */
+async function cmdEmbed(f: Record<string, string | boolean>) {
+  const o = {
+    dataRoot: (f["data-root"] as string) ?? null,
+    inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined,
+    bank: f.bank ? String(f.bank) : undefined,
+    provider: f.provider ? String(f.provider) : "ollama",
+    model: f.model ? String(f.model) : "all-minilm",
+    host: f.host ? String(f.host) : DEFAULT_OLLAMA,
+    device: f.device ? String(f.device) : undefined,
+    batch: f.batch ? Number(f.batch) : 64,
+    limit: f.limit ? Number(f.limit) : undefined,
+    // --all-tiers matches search's flag of the same name, so the population embedded
+    // and the population searched are described by ONE vocabulary.
+    mainTiers: !f["all-tiers"],
+    minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
+    maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
+    dryRun: Boolean(f["dry-run"]),
+    reset: Boolean(f.reset),
+  };
+
+  let last = 0, drew = false;
+  const r = await embedShards({
+    ...o,
+    onProgress: p => {
+      if (outFmt(f) !== "text" || p.done - last < 200) return;
+      last = p.done; drew = true;
+      process.stderr.write(`\r  ${p.shard}  ${fmt(p.done)}/${fmt(p.pending)}   `);
+    },
+  });
+  // Only erase a line that was actually drawn. Clearing unconditionally writes 78
+  // spaces into a terminal that never showed progress, which lands as indentation in
+  // front of the first line of output.
+  if (drew) process.stderr.write("\r" + " ".repeat(78) + "\r");
+
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  if (outFmt(f) === "jsonl") { for (const sh of r.shards) console.log(JSON.stringify(sh)); return; }
+
+  const touched = r.shards.filter(sh => sh.eligible > 0 || sh.skipped);
+  if (!touched.length) {
+    // Two different nothings, and reporting them as one sent the first test of this
+    // command chasing a --bank typo when the filter was doing exactly its job.
+    if (!r.shards.length) console.log("no shards match — check --repo / --bank, or run relic index first");
+    else console.log(`${r.shards.length} shards matched, but nothing is eligible: no event passes` +
+                     ` ${o.mainTiers ? "the main-tiers filter" : "the filter"} at >= ${o.minChars} chars.` +
+                     (o.mainTiers ? `\n(a memory or subagent bank is all non-main kinds — try --all-tiers)` : ""));
+    return;
+  }
+
+  console.log(`provider  ${r.providerId}${r.dryRun ? "   (dry run — nothing written)" : ""}`);
+  console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}\n`);
+  const w = Math.max(6, ...touched.map(sh => sh.key.length));
+  for (const sh of touched.slice(0, Number(f.limit ?? 40))) {
+    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); continue; }
+    const cov = sh.eligible ? Math.round((sh.already + sh.embedded) / sh.eligible * 100) : 0;
+    console.log(`  ${sh.key.padEnd(w)}  ${String(cov).padStart(3)}%  ` +
+                `${fmt(sh.already + sh.embedded)}/${fmt(sh.eligible)} embedded` +
+                (sh.embedded ? `  +${fmt(sh.embedded)} this run` : "") +
+                (sh.pending && r.dryRun ? `  ${fmt(sh.pending)} pending` : "") +
+                (sh.failed ? `  ${fmt(sh.failed)} FAILED` : "") +
+                (sh.dim ? `  dim ${sh.dim}` : ""));
+  }
+  const secs = r.ms / 1000;
+  console.log(`\n${fmt(r.embedded)} embedded · ${fmt(r.pending)} pending · ${fmt(r.failed)} failed` +
+              ` · ${touched.length} shards · ${secs.toFixed(1)}s` +
+              (r.embedded && secs > 0 ? `  (${(r.embedded / secs).toFixed(0)}/s)` : ""));
+  if (r.dryRun) console.log(`\nre-run without --dry-run to write. Vectors go to the per-shard`);
+  if (r.dryRun) console.log(`\`vectors\` table; \`events\` and the full-text index are untouched.`);
+}
+
 async function cmdStatus(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   let shards = listShards(dataRoot, Boolean(f["in-repo"]));
@@ -388,7 +467,27 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   // over fresh material, and only one of those is a problem to act on.
   console.log(`last indexed  ${when(maxISO(rows.map(r => r.lastIndexed)))}` +
               `   ·   newest session  ${when(maxISO(rows.map(r => r.newestSession)))}`);
-  console.log("vectors: none yet — they land in the same `events` table, no migration.");
+  /*
+   * VECTORS, MEASURED — this line used to be a hardcoded claim that vectors "land in
+   * the same `events` table, no migration". Both halves were wrong: they land in a
+   * separate `vectors` table, because a vector column cannot be added to `events` by
+   * widening without silently becoming text. A status line that states a design
+   * intention instead of reading the disk is how a wrong plan survives being disproved.
+   */
+  let vRows = 0, vShards = 0;
+  const models = new Set<string>();
+  for (const sh of shards) {
+    try {
+      const st = await (await LanceStore.open(sh.dir)).vectorStats();
+      if (!st || !st.rows) continue;
+      vShards++; vRows += st.rows;
+      if (st.model) models.add(`${st.model}/${st.dim}d`);
+    } catch { /* an unreadable shard is not a vector report */ }
+  }
+  console.log(vRows
+    ? `vectors ${fmt(vRows)} in ${vShards} of ${shards.length} shards` +
+      `  ·  ${[...models].join(", ")}  ·  written by \`relic embed\`, not read by \`search\` yet`
+    : "vectors none — `relic index` never writes them; see `relic embed --dry-run`");
 }
 
 // ---- banks / shards (layout, no engine) ------------------------------------
@@ -680,6 +779,11 @@ if (!cmd || f.help) {
                                names them — session id, repo, bank, newest first.
                                --paths adds the full session id and absolute path.
                                --tree groups them by directory — which RUN is missing.
+  embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
+                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
+                               second pass, opt-in: writes a per-shard \`vectors\` table,
+                               never a column on \`events\`. Resumable — re-run to continue.
+                               Measured first: FTS beats every model tried here (bench/).
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
@@ -702,8 +806,10 @@ A bank is one whole source root (a Claude projects dir, codex, omp, memory).
 --bank filters to one exactly; relic status prints the banks on this machine.
 
 LanceDB only, with an ICU full-text index: real Thai word segmentation, and
-2-character queries work (trigram cannot do either). Vectors land in the same
-table later, no migration.`);
+2-character queries work (trigram cannot do either). Vectors live in a SEPARATE
+per-shard \`vectors\` table, written only by \`relic embed\` — never as a column on
+\`events\`, which cannot be widened to a vector type without silently storing it
+as text. See relic embed --dry-run before spending anything.`);
   process.exit(0);
 }
 
@@ -867,5 +973,6 @@ else if (cmd === "mcp") {
 }
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
+else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

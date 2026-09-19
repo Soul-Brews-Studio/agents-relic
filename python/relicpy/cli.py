@@ -58,6 +58,96 @@ def _json(a: argparse.Namespace) -> bool:
     return bool(getattr(a, "json", False))
 
 
+def cmd_embed(a: argparse.Namespace) -> int:
+    """A second pass over an index that is already complete.
+
+    Deliberately not part of `index`. The measured result on this corpus is that the
+    full-text index WINS (MRR@20 0.890 vs 0.600 for the best of three models, bench/),
+    so embedding is opt-in, resumable, and scoped — and --dry-run answers "how much
+    would this cost" without a single call to the provider.
+    """
+    from .embed import embed_shards      # imported here so `relic-py --help` never
+                                         # touches an optional model runtime
+
+    main_tiers = not a.all_tiers
+    last = [0]
+    drew = [False]
+
+    def progress(key: str, done: int, total: int) -> None:
+        if _fmt(a) != "pretty" or done - last[0] < 200:
+            return
+        last[0] = done
+        drew[0] = True
+        sys.stderr.write(f"\r  {key}  {done:,}/{total:,}   ")
+
+    try:
+        t = embed_shards(_scope(a), provider=a.provider, model=a.model, host=a.host,
+                         device=a.device, batch=a.batch, limit=a.limit,
+                         main_tiers=main_tiers, min_chars=a.min_chars,
+                         max_chars=a.max_chars, dry_run=a.dry_run, reset=a.reset,
+                         on_progress=progress)
+    except (ValueError, RuntimeError) as e:
+        # A bad --provider or a missing optional dependency is a usage error, not a
+        # traceback: the message already says what to run instead.
+        print(str(e), file=sys.stderr)
+        return 2
+    # Only erase a line that was actually drawn — clearing unconditionally writes 78
+    # spaces into a terminal that never showed progress, which lands as indentation in
+    # front of the first line of output.
+    if drew[0]:
+        sys.stderr.write("\r" + " " * 78 + "\r")
+
+    if _json(a):
+        print(json.dumps({"provider": t.provider_id, "dryRun": t.dry_run,
+                          "embedded": t.embedded, "pending": t.pending,
+                          "failed": t.failed, "ms": t.ms,
+                          "shards": [vars(x) for x in t.shards]}, indent=2))
+        return 0
+
+    touched = [x for x in t.shards if x.eligible > 0 or x.skipped]
+    if not touched:
+        # Two different nothings. Reporting them as one sends the reader chasing a
+        # --bank typo when the filter is doing exactly its job.
+        if not t.shards:
+            print("no shards match — check --repo / --bank, or run relic index first")
+        else:
+            print(f"{len(t.shards)} shards matched, but nothing is eligible: no event "
+                  f"passes {'the main-tiers filter' if main_tiers else 'the filter'} "
+                  f"at >= {a.min_chars} chars.")
+            if main_tiers:
+                print("(a memory or subagent bank is all non-main kinds — try --all-tiers)")
+        return 1
+
+    print(f"provider  {t.provider_id}" + ("   (dry run — nothing written)" if t.dry_run else ""))
+    print(f"scope     {'main tiers' if main_tiers else 'all tiers'}, "
+          f"text >= {a.min_chars} chars, truncated at {a.max_chars}\n")
+    w = max([6] + [len(x.key) for x in touched])
+    for x in touched[: a.limit or 40]:
+        if x.skipped:
+            print(f"  {x.key:<{w}}  SKIP  {x.skipped}")
+            continue
+        cov = round((x.already + x.embedded) / x.eligible * 100) if x.eligible else 0
+        line = (f"  {x.key:<{w}}  {cov:>3}%  "
+                f"{x.already + x.embedded:,}/{x.eligible:,} embedded")
+        if x.embedded:
+            line += f"  +{x.embedded:,} this run"
+        if x.pending and t.dry_run:
+            line += f"  {x.pending:,} pending"
+        if x.failed:
+            line += f"  {x.failed:,} FAILED"
+        if x.dim:
+            line += f"  dim {x.dim}"
+        print(line)
+    secs = t.ms / 1000
+    rate = f"  ({t.embedded / secs:.0f}/s)" if t.embedded and secs > 0 else ""
+    print(f"\n{t.embedded:,} embedded · {t.pending:,} pending · {t.failed:,} failed"
+          f" · {len(touched)} shards · {secs:.1f}s{rate}")
+    if t.dry_run:
+        print("\nre-run without --dry-run to write. Vectors go to the per-shard "
+              "`vectors`\ntable; `events` and the full-text index are untouched.")
+    return 0
+
+
 def cmd_status(a: argparse.Namespace) -> int:
     root, rows = index_status(_scope(a), freshness=not a.no_freshness)
     if not rows:
@@ -698,6 +788,26 @@ def main(argv: list[str] | None = None) -> int:
     mc = sub.add_parser("mcp", parents=[common],
                         help="run the MCP server on stdio (same lookups, for a model)")
     mc.set_defaults(func=cmd_mcp)
+
+    em = sub.add_parser("embed", parents=[common],
+                        help="opt-in second pass: write a per-shard `vectors` table")
+    em.add_argument("--bank"); em.add_argument("--repo")
+    em.add_argument("--provider", default="ollama", choices=["ollama", "st"],
+                    help="ollama (default, no extra deps) or st (sentence-transformers)")
+    em.add_argument("--model", default="all-minilm")
+    em.add_argument("--host", default=None, help="ollama base URL")
+    em.add_argument("--device", default=None, help="st only: cpu | mps | cuda")
+    em.add_argument("--batch", type=int, default=64)
+    em.add_argument("--limit", type=int, default=None, help="cap per shard, not total")
+    em.add_argument("--all-tiers", action="store_true",
+                    help="include subagent/workflow/memory, not just the main thread")
+    em.add_argument("--min-chars", type=int, default=24)
+    em.add_argument("--max-chars", type=int, default=2000)
+    em.add_argument("--dry-run", action="store_true",
+                    help="count what would be embedded; no call to the provider")
+    em.add_argument("--reset", action="store_true",
+                    help="drop `vectors` first — the only way to change model or dim")
+    em.set_defaults(func=cmd_embed)
 
     ix = sub.add_parser("index", parents=[common], help="build or update the index")
     ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")
