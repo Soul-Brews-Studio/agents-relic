@@ -13,7 +13,7 @@ import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
-import { searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
+import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
@@ -110,6 +110,52 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 }
 
 // ---- search ----------------------------------------------------------------
+async function cmdSemantic(q: string, f: Record<string, string | boolean>,
+                           scope: Scope, limit: number) {
+  let r;
+  try {
+    r = await semanticSearch(q, {
+      ...scope, limit,
+      overfetch: f.overfetch ? Number(f.overfetch) : undefined,
+      tier: f.tier as string, role: f.role as string, source: f.source as string,
+      since: f.since as string, until: f.until as string,
+      device: f.device ? String(f.device) : undefined,
+      allTiers: Boolean(f["all-tiers"] || f.tier),
+    });
+  } catch (e) {
+    // "no vectors here" is a usage answer, not a stack trace — the message already
+    // names the command that fixes it.
+    console.error(String(e instanceof Error ? e.message : e));
+    process.exit(1);
+  }
+
+  const mode = outFmt(f);
+  if (mode === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+  if (mode === "jsonl") { for (const h of r.hits) console.log(JSON.stringify(h)); return; }
+  if (mode === "plain") {
+    for (const h of r.hits) console.log([h.file_path, h.seq, h.repo, h.text.replace(/\s+/g, " ")].join("\t"));
+    return;
+  }
+
+  console.log(`${r.hits.length} semantic match(es) for ${q} · ${r.embedded} embedded shard(s)` +
+              ` · ${r.ms} ms (query embed ${r.queryMs} ms)`);
+  console.log(`model ${r.model}   score = cosine, 1.000 is identical`);
+  // The silent-zero guard: a scope that is mostly unembedded returns few hits for a
+  // reason that has nothing to do with the query, and saying so costs one line.
+  if (r.unembedded)
+    console.log(`\n  ⚠ ${r.unembedded} of ${r.available} scoped shards hold NO vectors and were not searched.` +
+                `\n    \`relic index\` never writes them — see \`relic embed --dry-run\`.`);
+  console.log("");
+  for (const h of r.hits) {
+    const score = Number((h as any)._score ?? 0).toFixed(3);
+    const dup = Number((h as any)._dupes ?? 0);
+    console.log(`${score}  ${h.repo}  ${h.source}/${h.tier}  ${h.role}  ${h.ts}` +
+                (dup ? `   (+${dup} identical cop${dup === 1 ? "y" : "ies"} elsewhere)` : ""));
+    console.log(`  ${h.text.replace(/\s+/g, " ").trim().slice(0, 220)}`);
+    console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
+  }
+}
+
 async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const limit = Number(f.limit ?? 20);
@@ -123,6 +169,17 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     if (!dataRoot) console.log(`  or point elsewhere: relic search ... --data-root /path/to/index`);
     return;
   }
+
+  /*
+   * --semantic is a SEPARATE MODE, not a re-ranking of the lexical one.
+   *
+   * Measured on this corpus: known-item FTS 0.890 MRR@20 vs 0.600, and the vectors add
+   * one query in 200 to what FTS already finds; paraphrase flips it, 0.140 vs 0.046.
+   * RRF fusion lost at every k in both directions, so blending them is not on offer —
+   * the caller picks the regime, because the caller knows whether they are recalling a
+   * phrase or describing an idea, and a classifier would be guessing at that.
+   */
+  if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
   const { hits, shards: searched, ms } = await searchEvents(q, {
     ...scope, limit,
@@ -784,6 +841,10 @@ if (!cmd || f.help) {
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
+                  [--semantic] nearest-neighbour over relic-embed vectors instead of
+                  BM25. A separate MODE, never blended: measured here, FTS wins
+                  known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.
+                  [--overfetch 4] [--device mps]
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
                                --tree shows the SHAPE: which agents shared a workflow run

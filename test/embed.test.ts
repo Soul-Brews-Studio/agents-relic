@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lancedb from "@lancedb/lancedb";
 import { LanceStore } from "../src/store/lance.js";
-import { l2normalise, providerFor, embedShard, type EmbedProvider } from "../src/embed.js";
+import { l2normalise, providerFor, queryProviderFor, embedShard, type EmbedProvider } from "../src/embed.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "relic-embed-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -203,5 +203,80 @@ describe("the st provider — TypeScript reaches the Python models", () => {
     // is ~500 MB of RSS that never comes back.
     expect(typeof providerFor("st", "x").close).toBe("function");
     expect(providerFor("ollama", "x").close).toBeUndefined();
+  });
+});
+
+describe("queryProviderFor — reading a writer's id back", () => {
+  /*
+   * The stored id is the ONLY trustworthy record of how a shard's vectors were made.
+   * Re-deriving the model from a flag would let a query be embedded by a different
+   * model than the documents, which produces confident nonsense rather than an error:
+   * both sides are floats of the same width and the distance computes fine.
+   */
+  test("an e5 writer's passage prefix becomes the query prefix", () => {
+    // Asymmetric families want "passage: " on documents and "query: " on queries.
+    // Using the document prefix to embed a query costs recall SILENTLY.
+    expect(queryProviderFor("st:intfloat/multilingual-e5-small+passage:").id)
+      .toBe("st:intfloat/multilingual-e5-small+query:");
+  });
+  test("a symmetric st model gets no prefix either way", () => {
+    expect(queryProviderFor("st:sentence-transformers/all-MiniLM-L6-v2").id)
+      .toBe("st:sentence-transformers/all-MiniLM-L6-v2");
+  });
+  test("ollama round-trips unchanged", () => {
+    expect(queryProviderFor("ollama:bge-m3").id).toBe("ollama:bge-m3");
+  });
+  test("a model name containing ':' survives — ollama tags use one", () => {
+    expect(queryProviderFor("ollama:qwen3-embedding:0.6b").id).toBe("ollama:qwen3-embedding:0.6b");
+  });
+  test("an unreadable id is refused, not guessed", () => {
+    expect(() => queryProviderFor("garbage")).toThrow(/unreadable stored model id/);
+    expect(() => queryProviderFor("weird:thing")).toThrow(/unknown stored provider/);
+  });
+});
+
+describe("vectorSearch", () => {
+  const mk = async (name: string) => {
+    const s = await LanceStore.open(join(tmp, name));
+    await s.putEvents(["alpha", "beta", "gamma"].map((w, i) => ({
+      uid: `v${i}`, session_uuid: "s", file_path: "/f", repo_key: "r", seq: i,
+      role: i === 2 ? "tool_use" : "user", ts: `2026-09-0${i + 1}T00:00:00Z`,
+      text: `${w} a sentence long enough to pass the minimum length`,
+      source: "claude", tier: "session", kind: "transcript", worktree: "", cwd: "",
+      org: "", project: "", dir: "", mem_type: "", origin_session: "",
+    })));
+    // Unit vectors so cosine is exactly 1 - d^2/2 and the expected scores are known.
+    await s.putVectors([
+      { uid: "v0", embedding: [1, 0], model: "test:x", dim: 2, norm: "l2", embedded_at: "" },
+      { uid: "v1", embedding: [0, 1], model: "test:x", dim: 2, norm: "l2", embedded_at: "" },
+      { uid: "v2", embedding: [1, 0], model: "test:x", dim: 2, norm: "l2", embedded_at: "" },
+    ]);
+    return s;
+  };
+
+  test("ranks by cosine, and an exact match scores 1", async () => {
+    const s = await mk("vs");
+    const hits = await s.vectorSearch([1, 0], { limit: 3 });
+    expect(hits.length).toBe(3);
+    expect(Number((hits[0] as any)._score)).toBeCloseTo(1, 6);
+    // orthogonal vector -> cosine 0, and it sorts last
+    expect(Number((hits[2] as any)._score)).toBeCloseTo(0, 6);
+    expect(hits[2].uid).toBe("v1");
+  });
+
+  test("the scalar filter is applied to the EVENTS, after the vector hop", async () => {
+    // The vectors table has no tier/role columns to pre-filter on, by design — so this
+    // is a post-filter, and the overfetch exists to stop it starving the page.
+    const s = await mk("vsf");
+    const hits = await s.vectorSearch([1, 0], { limit: 3, role: "tool_use" });
+    expect(hits.map(h => h.uid)).toEqual(["v2"]);
+  });
+
+  test("a store with no vectors returns nothing rather than throwing", async () => {
+    // `index` never writes vectors, so this is the NORMAL state of most shards and
+    // must not abort a fan-out across hundreds of them.
+    const s = await LanceStore.open(join(tmp, "vs-none"));
+    await s.putFiles([{ file_path: "/a", repo_key: "r", mtime: 1, size: 2, imported_at: "" }]);
+    expect(await s.vectorSearch([1, 0], { limit: 5 })).toEqual([]);
   });
 });
