@@ -22,11 +22,31 @@ const fmt = (n: number) => n.toLocaleString("en-US");
  * would land in whichever bank happened to open first — silently, since both writes
  * succeed. The three Claude roots overlap by 742 sessions, so that is not hypothetical.
  */
+/**
+ * The (bank, repo) a parsed file belongs to, as one string.
+ *
+ * NUL separator: never legal in either part, so the key cannot be ambiguous and cannot
+ * be produced by concatenation elsewhere by accident.
+ *
+ * Exported because `prune` must group discovery by the SAME rule the importer grouped
+ * the rows by. A second copy that merely resembles this line would send prune at the
+ * wrong shard and delete rows it never compared.
+ */
+export function shardKeyFor(bank: string, repoKey: string | null): string {
+  return `${bank}\u0000${repoKey ?? "_unresolved"}`;
+}
+
+/** Split a shard key back apart — for display and for reopening a store. */
+export function splitShardKey(key: string): { bank: string; repo: string } {
+  const i = key.indexOf("\u0000");
+  return { bank: key.slice(0, i), repo: key.slice(i + 1) };
+}
+
 export class Shards {
   private pool = new Map<string, LanceStore>();
   constructor(private dataRoot: string | null, private inRepo = false) {}
   async get(repoKey: string | null, bank = DEFAULT_BANK): Promise<LanceStore> {
-    const key = `${bank}\u0000${repoKey ?? "_unresolved"}`;   // NUL: never legal in either part
+    const key = shardKeyFor(bank, repoKey);
     let s = this.pool.get(key);
     if (!s) {
       const dir = shardDirFor(repoKey, this.dataRoot, this.inRepo, bank);
@@ -38,6 +58,14 @@ export class Shards {
   }
   get size() { return this.pool.size; }
   keys() { return [...this.pool.keys()]; }
+  /**
+   * The store for a key this pool already opened, or undefined.
+   *
+   * Prune needs the store that WROTE a shard, not one reopened from a key it parsed
+   * back apart. Zipping keys() against stores() would work today and break the first
+   * time either is filtered.
+   */
+  byKey(key: string) { return this.pool.get(key); }
   /** The open stores themselves — for callers that must not re-derive a key to reopen. */
   stores() { return [...this.pool.values()]; }
 }
@@ -45,10 +73,25 @@ export class Shards {
 export interface ImportOpts {
   dataRoot: string | null; inRepo: boolean; skipNoise?: boolean;
   repoFilter?: string | null; verbose?: boolean; progress?: boolean;
+  /**
+   * Resolve every file to its shard and write NOTHING.
+   *
+   * This is `prune`'s scan. It exists here rather than in prune.ts so that the mapping
+   * from a file to a shard is produced by the importer itself — the same parse, the
+   * same resolveRepoKey, the same shardKeyFor. Prune deletes rows the importer wrote,
+   * so any divergence between the two mappings is a deletion in the wrong shard.
+   */
+  noWrite?: boolean;
 }
 export interface ImportTally {
   added: number; skipped: number; failed: number; filtered: number;
   skippedNoise: number; done: number; imported: number; shards: Shards;
+  /**
+   * Every file DISCOVERED this run, grouped by shard key — including the ones skipped
+   * as unchanged, which are the overwhelming majority on a repeat run and are exactly
+   * the files prune must not delete.
+   */
+  seen: Map<string, Set<string>>;
   /** FTS indexes actually built or confirmed, and what that phase cost. */
   ftsBuilt: number; ftsFailed: number; ftsMs: number;
 }
@@ -62,6 +105,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   const shards = new Shards(o.dataRoot, o.inRepo);
   const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
   let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0;
+  const seen = new Map<string, Set<string>>();
 
   /*
    * BATCHED WRITES.
@@ -135,15 +179,36 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       // directory the row lives in, and duplicating it would make every existing
       // `--repo` filter match bank names too.
       const repoCol = repoKey ?? "_unresolved";
-      const shardKey = `${file.bank}\u0000${repoCol}`;
+      const shardKey = shardKeyFor(file.bank, repoKey);
+      const store = await shards.get(repoKey, file.bank);
+
+      // BEFORE the unchanged-skip below. A file skipped as unchanged is still present
+      // on disk, and prune's question is "is it still discoverable", not "did this run
+      // rewrite it".
+      let sset = seen.get(shardKey);
+      if (!sset) { sset = new Set<string>(); seen.set(shardKey, sset); }
+      sset.add(file.path);
+
+      if (o.noWrite) {
+        if (o.progress && ++done % 500 === 0) {
+          const rate = done / ((Date.now() - t0) / 1000);
+          process.stderr.write(`\r  resolving shards  ${fmt(done)}/${fmt(found.length)} files` +
+                               `  ${shards.size} shards  ${rate.toFixed(0)}/s   `);
+        } else if (!o.progress) done++;
+        continue;
+      }
+
       const ctx = contextOf(p.cwd);
       const loc = locationOf(p.cwd);
-      const store = await shards.get(repoKey, file.bank);
 
       if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
       const man = manifests.get(shardKey)!;
-      const seen = man.get(file.path);
-      if (seen && seen.mtime === file.mtime && seen.size === file.size) { skipped++; continue; }
+      // `known`, not `seen`: the run-wide `seen` map is read earlier in this same
+      // block, and a second block-scoped `const seen` puts it in the temporal dead
+      // zone for the whole block — every file threw ReferenceError, and the importer
+      // reported them as parse failures.
+      const known = man.get(file.path);
+      if (known && known.mtime === file.mtime && known.size === file.size) { skipped++; continue; }
 
       const dropped: any[] = [];
       const kept = o.skipNoise
@@ -168,7 +233,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       }));
 
       const batch = pend(shardKey, store);
-      if (seen) batch.deletes.push(file.path);
+      if (known) batch.deletes.push(file.path);
       batch.events.push(...events);
       batch.sessions.push({
         session_uuid: p.sessionUuid, file_path: file.path, repo_key: repoCol,
@@ -201,6 +266,11 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   }
   if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
 
+  // A scan writes nothing, so there is nothing to flush and no index to rebuild.
+  if (o.noWrite)
+    return { added, skipped, failed, filtered, skippedNoise, done, imported, shards, seen,
+             ftsBuilt: 0, ftsFailed: 0, ftsMs: 0 };
+
   await flush();   // anything left below the batch threshold
 
   /*
@@ -224,6 +294,6 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     }
   }
   if (o.progress && stores.length) process.stderr.write("\r" + " ".repeat(60) + "\r");
-  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards,
+  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards, seen,
            ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0 };
 }

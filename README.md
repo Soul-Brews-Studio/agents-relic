@@ -431,6 +431,64 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+### `prune` — the only command that removes rows
+
+```bash
+relic prune                          # DRY RUN — names what would go, writes nothing
+relic prune --apply                  # actually delete
+relic prune --corpus claude-live     # limit which BANKS are eligible
+relic prune --max-drop 25            # raise the per-shard ceiling from 10%
+relic index --prune                  # index and prune in one pass — no second scan
+```
+
+The importer only ever adds and updates. A file that stops being discoverable — a new
+skip rule excluded it, it was deleted, it moved — keeps its `events`, `sessions` and
+`files` rows forever. Measured on the live index before this existed: **1,353
+`journal.jsonl` rows** for a file discovery has skipped since 2026-09-18, which made
+every session tree containing a workflow report one transcript too many. Two resolvers
+were taught to filter `journal.jsonl` out rather than fix it — two workarounds for one
+absent feature.
+
+**This is the only code in relic that deletes rows a human did not name**, so the whole
+design is the scoping. The naive version — *drop rows whose `file_path` was not seen
+this run* — destroys the index on any normal invocation, because a narrowed scan is the
+normal case: `--since 7d` cannot see a file older than seven days, and `--repo` never
+parses most of the corpus at all.
+
+Four gates, widest to narrowest:
+
+| # | Gate | Why |
+|---|---|---|
+| 1 | the run must be **unfiltered** — no `--since`, no `--repo` | an older file is not a deleted file |
+| 2 | nothing may have **failed to parse** | a file that failed is not a file that is gone |
+| 3 | only shards this run **reached** are considered | a bank whose source was not in `--corpus`, or whose root was missing, is never touched |
+| 4 | a shard losing more than `--max-drop` percent is **refused** | see below |
+
+Gate 4 is not paranoia, it is a bug that already happened. `ghq.root` was unset on one
+machine, so `resolveRepoKey` returned null for everything and every file resolved to
+`_unresolved`. Under gates 1–3 alone that reads as *every real shard lost all its
+files* — the index deletes itself and prints a clean summary. `--force` overrides it;
+check the source root is fully readable first.
+
+Two details that are load-bearing rather than tidy:
+
+- **The dry run and the real run are one call with a flag**, down into
+  `LanceStore.pruneFiles`. Two code paths would let the number a human approved differ
+  from the number that executed.
+- **`vectors` is deleted before `events`.** Its only join key to a file is through
+  `events.uid`, so deleting events first strands every embedding with nothing left to
+  find it by — and stranded rows are invisible, because `vectorStats()` counts rows,
+  not reachable ones.
+
+The report separates *nothing to prune* from *never looked*: shards on disk this run
+did not reach are counted and named as such, because only one of those two means the
+index is clean.
+
+`relic prune` runs a full parse pass and writes nothing, which costs the same read as
+an index run over an unchanged corpus. Use `relic index --prune` when you were indexing
+anyway — the import has already resolved every file to its shard, so pruning then costs
+one query per shard and no second scan.
+
 ### `search` — full text, BM25-ranked
 
 ```bash
