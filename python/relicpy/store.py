@@ -100,6 +100,17 @@ class LanceStore:
         return {r["file_path"]: {"mtime": r["mtime"], "size": r["size"]}
                 for r in tbl.to_pylist()}
 
+    def events_where(self, where: str, limit: int = 200_000) -> list[dict]:
+        """Every event matching a raw filter. Mirrors LanceStore.eventsWhere().
+
+        Exists so callers stop reaching into `_existing("events")` — which works and
+        silently couples them to a private.
+        """
+        t = self._existing("events")
+        if t is None:
+            return []
+        return t.search().where(where).limit(limit).to_list()
+
     def session_rows(self) -> list[dict]:
         """Raw session dicts, for callers that join across shards.
 

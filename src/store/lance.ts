@@ -416,9 +416,14 @@ export class LanceStore {
     const t = await this.existing("sessions");
     if (!t) return [];
     const q = idOrPrefix.replace(/'/g, "''");
-    const rows = await t.query()
+    const rows = (await t.query()
       .where(`session_uuid LIKE '${q}%' OR file_path LIKE '%${q}%'`)
-      .toArray() as unknown as SessionRow[];
+      .toArray() as unknown as SessionRow[])
+      // journal.jsonl is the workflow RUNNER's event log, not a transcript. Discovery
+      // has skipped it since 2026-09-18, but rows written before that remain — the
+      // index has no prune — so every session tree containing a workflow reports one
+      // transcript too many. Measured: 1,353 such rows across this index.
+      .filter(r => !String(r.file_path).endsWith("/journal.jsonl"));
     rows.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
     return rows;
   }
@@ -517,6 +522,20 @@ export class LanceStore {
     });
     out.sort((a, b) => Number((b as any)._score) - Number((a as any)._score));
     return out.slice(0, limit);
+  }
+
+  /**
+   * Every event matching a raw filter, seq-ordered by the caller.
+   *
+   * Exists so callers stop reaching into `existing("events")` through an `as any` cast
+   * — which compiles, works, and silently couples them to a private. The filter is a
+   * SQL string like the rest of this file; build it with sqlStr(), never by
+   * concatenating user input.
+   */
+  async eventsWhere(where: string, limit = 200_000): Promise<Hit[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    return (await t.query().where(where).limit(limit).toArray()) as unknown as Hit[];
   }
 
   /** Every uid that already has a vector. The anti-join key for a resumable backfill. */

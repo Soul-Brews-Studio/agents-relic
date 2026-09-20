@@ -308,10 +308,23 @@ def find_session_by_id(session_id: str, scope: Scope) -> list[dict]:
     for sh in pick_shards(scope):
         try:
             for r in LanceStore.open(sh.dir).session_rows():
-                if str(r.get("session_uuid") or "").startswith(session_id):
-                    r["repo"] = sh.repo
-                    r["bank"] = sh.bank
-                    out.append(r)
+                # BOTH clauses, matching LanceStore.findSession(). A session's tree
+                # includes transcripts whose OWN session_uuid differs — they live under
+                # the session's directory, so the id is in their path. Matching the uuid
+                # alone silently returns a smaller tree, which is how this diverged from
+                # the reference by one row without either side erroring.
+                if not (str(r.get("session_uuid") or "").startswith(session_id)
+                        or session_id in str(r.get("file_path") or "")):
+                    continue
+                # journal.jsonl is the workflow RUNNER's event log, not a transcript.
+                # Discovery has skipped it since 2026-09-18; rows written before that
+                # remain, because the index has no prune. Without this every session
+                # tree containing a workflow reports one transcript too many.
+                if str(r.get("file_path") or "").endswith("/journal.jsonl"):
+                    continue
+                r["repo"] = sh.repo
+                r["bank"] = sh.bank
+                out.append(r)
         except Exception:
             continue
     return out

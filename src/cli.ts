@@ -16,6 +16,7 @@ import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
+import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
@@ -110,6 +111,44 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 }
 
 // ---- search ----------------------------------------------------------------
+async function cmdRecap(id: string, f: Record<string, string | boolean>) {
+  const r = await sessionRecap(id, {
+    dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined,
+    limit: f.limit ? Number(f.limit) : undefined,
+    allTiers: Boolean(f["all-tiers"]),
+    chars: f.chars ? Number(f.chars) : undefined,
+  });
+  if (!r) { console.error(`no session matched ${id}`); process.exit(1); }
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
+
+  console.log(`${r.name}`);
+  console.log(`${r.sessionUuid}  ·  ${r.repo}${r.gitBranch ? `  ·  ${r.gitBranch}` : ""}`);
+  console.log(`${localDateTime(r.startedAt)} → ${localDateTime(r.endedAt)}  ·  ` +
+              `${fmt(r.transcripts)} transcripts · ${fmt(r.events)} ev${r.model ? `  ·  ${r.model}` : ""}`);
+  console.log(`  ${r.roles.map(x => `${x.role} ${fmt(x.n)}`).join(" · ")}`);
+
+  if (r.asked.length) {
+    console.log(`\nWHAT WAS ASKED  (${fmt(r.asked.length)} turns` +
+                (r.askedOmitted ? `, ${fmt(r.askedOmitted)} harness turns omitted` : "") + `)\n`);
+    for (const t of r.asked) console.log(`  ${localDateTime(t.ts).slice(11)}  ${t.text}`);
+  } else if (r.askedOmitted) {
+    // Saying WHY it is empty matters: "no turns" and "every turn was boilerplate" are
+    // different facts and only one of them means the session had no human input.
+    console.log(`\nWHAT WAS ASKED  —  none; all ${fmt(r.askedOmitted)} user turns were harness boilerplate`);
+  }
+
+  if (r.tools.length) {
+    console.log(`\nWHAT RAN\n`);
+    console.log(`  ${r.tools.map(t => `${t.name} ${fmt(t.n)}`).join(" · ")}`);
+  }
+  if (r.files.length) {
+    console.log(`\nFILES EDITED\n`);
+    for (const x of r.files) console.log(`  ${String(x.n).padStart(3)}x  ${x.path}`);
+  }
+  if (r.endedWith) console.log(`\nENDED WITH\n\n  ${r.endedWith}`);
+}
+
 async function cmdSemantic(q: string, f: Record<string, string | boolean>,
                            scope: Scope, limit: number) {
   let r;
@@ -887,6 +926,11 @@ if (!cmd || f.help) {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
+  recap   <id|prefix> [--limit N] [--all-tiers] [--chars 140] [--json]
+                               what HAPPENED in one session — the human's turns with
+                               harness boilerplate stripped, the tools that ran, files
+                               edited, and how it ended. A projection of indexed rows,
+                               not a summary: session gives shape, recap gives content.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what --skip-noise dropped, and the proof
@@ -1076,6 +1120,7 @@ else if (cmd === "mcp") {
 }
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
+else if (cmd === "recap") { if (!pos[1]) { console.error("recap needs a session id or prefix"); process.exit(1); } await cmdRecap(pos[1], f); }
 else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
