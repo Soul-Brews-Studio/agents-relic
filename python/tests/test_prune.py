@@ -227,3 +227,37 @@ def test_source_path_override(tmp_path):
     # code.
     assert [f for f in discover(["oracle-vault"], None, ("codex", root))
             if f.path.startswith(root)] == []
+
+
+def test_claude_home_walk_covers_every_projects_root(tmp_path):
+    """A HOME is one path, and that is what a bank should be.
+
+    Claude Code v2.1.278: `(process.env.CLAUDE_CONFIG_DIR ?? ~/.claude).normalize("NFC")`
+    — one path, not a list. Codex does the same with CODEX_HOME.
+
+    The walker directly, not through discover(): going through discover() would need
+    the home declared in ~/.relic/sources.json, which asserts about this machine's
+    config instead of the code.
+    """
+    import json
+    from relicpy.discover import _walk_claude_home
+    from relicpy.shapes import claude as shape_claude
+
+    home = tmp_path / "home"
+    for root, proj in (("projects", "-a"), ("projects-archive", "-b"),
+                       ("projects-1sep-tue2026", "-c")):
+        d = home / root / proj
+        d.mkdir(parents=True)
+        (d / "s.jsonl").write_text(json.dumps({
+            "type": "user", "uuid": "u", "sessionId": "s", "cwd": "/tmp",
+            "message": {"role": "user", "content": "hi there"}}) + "\n")
+    # Not a projects root — must NOT be walked, or a home's caches become transcripts.
+    (home / "plugins" / "-d").mkdir(parents=True)
+    (home / "plugins" / "-d" / "s.jsonl").write_text("{}\n")
+
+    out = []
+    _walk_claude_home(str(home), None, out, "claude-neo", shape_claude.parse)
+    roots = sorted({f.path[len(str(home)) + 1:].split("/")[0] for f in out})
+    assert roots == ["projects", "projects-1sep-tue2026", "projects-archive"]
+    # The live root is walked FIRST, so a killed run keeps the useful half.
+    assert out[0].path.startswith(str(home / "projects") + "/")

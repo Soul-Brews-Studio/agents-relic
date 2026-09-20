@@ -127,6 +127,36 @@ def load_sources() -> list[SourceDef]:
                     if s.key == k and isinstance(v, str):
                         s.path = v
                         s.enabled = True
+            # Homes expand BEFORE `add`, so an explicit `add` entry can still
+            # override one by key — the dup guard keeps the first match, and
+            # hand-written beats derived. See HomeDef in src/sources.ts for why a
+            # home is the right thing for a BANK to be.
+            for h in cfg.get("homes", []):
+                key = str(h.get("key") or "")
+                path = str(h.get("path") or "")
+                if not key or not path:
+                    continue
+                if path.startswith("~/"):
+                    path = os.path.join(HOME, path[2:])
+                enabled = h.get("enabled") is not False
+                if h.get("agent") == "codex":
+                    out.append(SourceDef(
+                        key=key, path=os.path.join(path, "sessions"), walk="flat",
+                        parser=_SHAPES["codex"], enabled=enabled, bank=key,
+                        note=f"declared Codex home {path}"))
+                    continue
+                # Transcripts: every projects* root inside the home, ONE source, ONE
+                # bank. Memory is a different KIND of thing, so a different bank —
+                # exactly as builtin claude-memory is a second reading of the same root.
+                out.append(SourceDef(
+                    key=key, path=path, walk="claude-home",
+                    parser=_SHAPES["claude"], enabled=enabled, bank=key,
+                    note=f"declared Claude home {path} — all projects* roots"))
+                out.append(SourceDef(
+                    key=f"{key}-memory", path=os.path.join(path, "projects"),
+                    walk="memory", parser=_SHAPES["memory"], enabled=enabled,
+                    bank=f"{key}-memory",
+                    note=f"declared Claude home {path} — typed memory facts"))
             for a in cfg.get("add", []):
                 walk = a.get("walk")
                 walk = walk if walk in ("claude-tiers", "vault", "vaults", "omp", "memory", "hermes") else "flat"
