@@ -416,9 +416,14 @@ export class LanceStore {
     const t = await this.existing("sessions");
     if (!t) return [];
     const q = idOrPrefix.replace(/'/g, "''");
-    const rows = await t.query()
+    const rows = (await t.query()
       .where(`session_uuid LIKE '${q}%' OR file_path LIKE '%${q}%'`)
-      .toArray() as unknown as SessionRow[];
+      .toArray() as unknown as SessionRow[])
+      // journal.jsonl is the workflow RUNNER's event log, not a transcript. Discovery
+      // has skipped it since 2026-09-18, but rows written before that remain — the
+      // index has no prune — so every session tree containing a workflow reports one
+      // transcript too many. Measured: 1,353 such rows across this index.
+      .filter(r => !String(r.file_path).endsWith("/journal.jsonl"));
     rows.sort((a, b) => String(a.started_at).localeCompare(String(b.started_at)));
     return rows;
   }
@@ -480,7 +485,7 @@ export class LanceStore {
    */
   async vectorSearch(vec: number[], opts: { limit?: number; overfetch?: number;
                      mainTiers?: boolean; tier?: string; since?: string; until?: string;
-                     role?: string; source?: string } = {}): Promise<Hit[]> {
+                     role?: string; source?: string; session?: string } = {}): Promise<Hit[]> {
     const vt = await this.existing("vectors");
     const et = await this.existing("events");
     if (!vt || !et) return [];
@@ -495,6 +500,7 @@ export class LanceStore {
     for (const r of near) dist.set(String(r.uid), Number((r as any)._distance ?? 0));
 
     const filters: string[] = [];
+    if (opts.session) filters.push(`session_uuid = ${sqlStr(opts.session)}`);
     if (opts.tier) filters.push(`tier = ${sqlStr(opts.tier)}`);
     else if (opts.mainTiers) filters.push(await this.mainTiersFilter(et));
     if (opts.role)   filters.push(`role = ${sqlStr(opts.role)}`);
@@ -519,6 +525,20 @@ export class LanceStore {
     return out.slice(0, limit);
   }
 
+  /**
+   * Every event matching a raw filter, seq-ordered by the caller.
+   *
+   * Exists so callers stop reaching into `existing("events")` through an `as any` cast
+   * — which compiles, works, and silently couples them to a private. The filter is a
+   * SQL string like the rest of this file; build it with sqlStr(), never by
+   * concatenating user input.
+   */
+  async eventsWhere(where: string, limit = 200_000): Promise<Hit[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    return (await t.query().where(where).limit(limit).toArray()) as unknown as Hit[];
+  }
+
   /** Every uid that already has a vector. The anti-join key for a resumable backfill. */
   async embeddedUids(): Promise<Set<string>> {
     const t = await this.existing("vectors");
@@ -539,13 +559,20 @@ export class LanceStore {
    * to everything, so it pollutes every result list while carrying no meaning — and it
    * costs the same to compute as a real one.
    */
-  async unembedded(opts: { limit?: number; mainTiers?: boolean; minChars?: number } = {}): Promise<{ uid: string; text: string }[]> {
+  async unembedded(opts: { limit?: number; mainTiers?: boolean; minChars?: number; session?: string } = {}): Promise<{ uid: string; text: string }[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const done = await this.embeddedUids();
     const minChars = opts.minChars ?? 24;
     let q = t.query().select(["uid", "text", "seq"]);
-    if (opts.mainTiers) q = q.where(await this.mainTiersFilter(t));
+    // ONE session is the unit a handoff cares about: after /forward + /new the next
+    // session wants the previous one queryable, not the whole 5.8 M-event corpus.
+    // 12,046 events is 19 MB of vectors and ~40 s — the whole corpus is 8.3 GiB.
+    const filters = [
+      opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
+      opts.mainTiers ? await this.mainTiersFilter(t) : "",
+    ].filter(Boolean);
+    if (filters.length) q = q.where(filters.join(" AND "));
     const out: { uid: string; text: string }[] = [];
     const limit = opts.limit ?? Infinity;
     for (const r of await q.toArray()) {
@@ -560,12 +587,16 @@ export class LanceStore {
   }
 
   /** How many events are eligible, ignoring what is already done — the denominator. */
-  async embeddableCount(opts: { mainTiers?: boolean; minChars?: number } = {}): Promise<number> {
+  async embeddableCount(opts: { mainTiers?: boolean; minChars?: number; session?: string } = {}): Promise<number> {
     const t = await this.existing("events");
     if (!t) return 0;
     const minChars = opts.minChars ?? 24;
     let q = t.query().select(["text"]);
-    if (opts.mainTiers) q = q.where(await this.mainTiersFilter(t));
+    const filters = [
+      opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
+      opts.mainTiers ? await this.mainTiersFilter(t) : "",
+    ].filter(Boolean);
+    if (filters.length) q = q.where(filters.join(" AND "));
     let n = 0;
     for (const r of await q.toArray()) if (String(r.text ?? "").length >= minChars) n++;
     return n;
