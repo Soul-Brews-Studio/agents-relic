@@ -20,6 +20,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -347,6 +348,8 @@ async function cmdSemantic(q: string, f: Record<string, string | boolean>,
     console.log(`${score}  ${h.repo}  ${h.source}/${h.tier}  ${h.role}  ${h.ts}` +
                 (dup ? `   (+${dup} identical cop${dup === 1 ? "y" : "ies"} elsewhere)` : ""));
     console.log(`  ${h.text.replace(/\s+/g, " ").trim().slice(0, 220)}`);
+    const eph = ephemeralNote(h.text, bankOfHit(h.repo));
+    if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
   }
 }
@@ -421,6 +424,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     const wt = h.worktree ? `  [${h.worktree}]` : "";
     console.log(`${h.repo.replace("github.com/", "")}${wt}  ${h.source}/${h.tier}  ${h.role} ${h.ts}`);
     console.log(`  ...${snip.replace(/\s+/g, " ").trim()}...`);
+    // Flagged against the WHOLE event text, not the 160-char snippet — the path that
+    // matters is usually a tool's output line, not the part that matched the query.
+    const eph = ephemeralNote(h.text, bankOfHit(h.repo));
+    if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
   }
 }
@@ -1065,6 +1072,14 @@ if (!cmd || f.help) {
                                failures, skips shards this run never reached, and
                                REFUSES any shard losing more than --max-drop percent.
   search  <query> [--repo S] [--bank B] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
+                  BM25 FINDS TOPICS, NOT SPECIFIC FACTS. For "did I already do X",
+                  search the most UNIQUE literal string in the request — an id, a
+                  filename, an error string — not the topic words. Measured on 288
+                  real queries here: longer queries return 11x MORE hits than short
+                  ones (median 1,392 vs 123), because FTS ranks any document holding
+                  any term, so every extra word widens the candidate set.
+                    95,529 hits  "herdr pane run agent prompt recent-unwrapped"
+                         1 hit   "VoiceProcessingEnabled"
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]

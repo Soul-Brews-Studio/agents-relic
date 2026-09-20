@@ -243,6 +243,12 @@ def cmd_search(a: argparse.Namespace) -> int:
         print(f"{h.repo}{wt} · {h.source}/{h.tier} · {h.role} · {h.ts}")
         snippet = " ".join(h.text.split())[:240]
         print(f"  ...{snippet}...")
+        # Flagged against the WHOLE event text, not the snippet — the path that matters
+        # is usually a tool's output line, not the part that matched the query.
+        from .ephemeral import bank_of_hit, ephemeral_note
+        eph = ephemeral_note(h.text, bank_of_hit(h.repo))
+        if eph:
+            print(eph)
         print(f"  relic show {h.file_path} --seq {int(h.seq)}\n")
     return 0
 

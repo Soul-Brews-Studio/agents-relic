@@ -227,3 +227,110 @@ def test_source_path_override(tmp_path):
     # code.
     assert [f for f in discover(["oracle-vault"], None, ("codex", root))
             if f.path.startswith(root)] == []
+
+
+# --------------------------------------------------- index hygiene (#31, #35, #36)
+
+def _write(tmp_path, name, *lines):
+    f = tmp_path / name
+    f.write_text("".join(lines))
+    return str(f)
+
+
+def _user(cwd, text):
+    import json
+    return json.dumps({"type": "user", "uuid": "u", "sessionId": "s", "cwd": cwd,
+                       "timestamp": "2026-09-20T00:00:00Z",
+                       "message": {"role": "user", "content": text}}) + "\n"
+
+
+def test_cwd_is_an_event_property_not_a_file_property(tmp_path):
+    """Before this, the parser kept the FIRST cwd and the importer stamped it on every
+    event. Session 2bb9b553: 201 of 4,068 events were in a different worktree and
+    `--worktree` could not reach any of them."""
+    from relicpy.shapes.claude import parse
+    f = _write(tmp_path, "two-repos.jsonl",
+               _user("/repo/a", "first repo work here"),
+               _user("/repo/a", "still the first repo"),
+               _user("/repo/b", "moved to the second repo"))
+    p = parse(f)
+    assert [e.cwd for e in p.events] == ["/repo/a", "/repo/a", "/repo/b"]
+    # Findable, not attributable: repo_key and the shard still come from p.cwd.
+    assert p.cwd == "/repo/a"
+
+
+SIG = "CAQS3QYKEAgRGAI4AUIIdG" + "A" * 1138
+
+
+def test_hashed_thinking_never_becomes_an_event(tmp_path):
+    """90.7% of thinking blocks are hashed — thinking:"" plus a ~1,160-char signature.
+    Adding `signature` to the keys flatten_content reads, or loosening the falsy check,
+    puts 32,386 x ~1,160 chars = ~37 MB of base64 into the FTS index. NOTHING WOULD
+    FAIL. That is why this test exists."""
+    import json
+    from relicpy.shapes.claude import parse
+    f = _write(tmp_path, "hashed.jsonl", json.dumps({
+        "type": "assistant", "uuid": "u", "sessionId": "s", "cwd": "/r",
+        "message": {"role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "", "signature": SIG}]}}) + "\n")
+    assert parse(f).events == []
+
+
+def test_the_signature_never_reaches_any_event_text(tmp_path):
+    # Asserted on the TEXT, not just the count: a future change could keep the event
+    # (because another block carried it) and still smuggle the signature in.
+    import json
+    from relicpy.shapes.claude import parse
+    f = _write(tmp_path, "mixed.jsonl", json.dumps({
+        "type": "assistant", "uuid": "u", "sessionId": "s", "cwd": "/r",
+        "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": SIG},
+            {"type": "text", "text": "the visible answer"}]}}) + "\n")
+    p = parse(f)
+    assert len(p.events) == 1
+    assert p.events[0].text == "the visible answer"
+    assert not any("CAQS3QY" in e.text for e in p.events)
+
+
+def test_readable_thinking_is_still_indexed(tmp_path):
+    # The inverse control. A fix that dropped ALL thinking would pass the two tests
+    # above and silently lose 1.8 MB of real reasoning (9.3% of blocks).
+    import json
+    from relicpy.shapes.claude import parse
+    f = _write(tmp_path, "readable.jsonl", json.dumps({
+        "type": "assistant", "uuid": "u", "sessionId": "s", "cwd": "/r",
+        "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "reasoning a human can read",
+             "signature": SIG}]}}) + "\n")
+    p = parse(f)
+    assert len(p.events) == 1
+    assert p.events[0].text == "reasoning a human can read"
+
+
+def test_ephemeral_path_tiers():
+    from relicpy.ephemeral import ephemeral_hint, ephemeral_note
+    # Structural shapes carry their own proof: the pid is IN the path.
+    assert ephemeral_hint("wrote /private/tmp/claude-501/-opt-Code/x/out.mp4")["tier"] == "structural"
+    assert ephemeral_hint("saved to /Users/b/proj/scratchpad/frames/001.png")["tier"] == "structural"
+    # A bare /tmp prefix only correlates — a daemon keeping state there matches too.
+    assert ephemeral_hint("config writes to /tmp/daemon.sock")["tier"] == "weak"
+    # Prose about temp files is not a path.
+    assert ephemeral_hint("we should clean up tmp files someday") is None
+    assert ephemeral_hint("the /var/tmpfiles.d unit") is None
+    assert ephemeral_hint("/opt/Code/github.com/laris-co/neo-oracle/src/index.ts") is None
+    # peer-projects holds 29k files from another account on another box, so a path
+    # recorded there cannot be stat'd meaningfully from here — say which bank.
+    assert "bank peer-projects" in ephemeral_note("out at /tmp/claude-99/x.bin", "peer-projects")
+    assert ephemeral_note("nothing ephemeral here", "peer-projects") == ""
+
+
+def test_bank_of_hit():
+    """A hit has NO `bank` attribute; the bank is the first segment of `repo`. The first
+    version of this feature read `getattr(h, "bank", None)`, which returns None and
+    drops the host note on EVERY hit — the unit tests could not catch it because they
+    pass the bank in directly. The gap was between the tested unit and the caller."""
+    from relicpy.ephemeral import bank_of_hit
+    assert bank_of_hit("peer-projects/github.com/Arkkra-Co/volt-oracle") == "peer-projects"
+    assert bank_of_hit("projects/github.com/laris-co/neo-oracle") == "projects"
+    assert bank_of_hit("_unresolved") is None
+    assert bank_of_hit("") is None

@@ -453,6 +453,35 @@ skips a source whose root does not exist, so a typo'd path, an unknown corpus, o
 refuses the flag outright — an overridden root is a different population, so every file
 under the source's real root would look deleted.
 
+### Ephemeral paths — flagged at read time, never at write time
+
+A hit that quotes `/private/tmp/claude-501/.../scratchpad/out.mp4` is answering
+correctly and pointing at a file a temp janitor deleted days ago. relic tags it:
+
+```
+  ⚠ ephemeral-path (claude-<pid> scratch root, recorded in bank peer-projects)
+    — this path was session-scoped and is probably gone
+```
+
+Measured on bank `projects`, 408,886 events: **23,818 (5.8%)** reference an ephemeral
+path. One event in seventeen.
+
+Two confidence tiers, because they are not the same evidence. `/claude-<pid>/` and
+`/scratchpad/` are **structural** — the pid is *in* the path, and the scratchpad is a
+directory the tooling itself tears down, so each carries its own proof. A bare `/tmp`
+prefix only **correlates**: a daemon configured to keep state there matches too. Same
+hierarchy as the blob detection in #37 — prefer the shape that proves itself over the
+prefix that merely suggests.
+
+The note names the **bank**, because relic indexes another account's corpus and another
+machine's. A path recorded under a different uid on a different host cannot be `stat`ed
+meaningfully from here, which is also why there is no live check — this is pure string
+work, no disk access.
+
+**Never at write time.** "we downloaded it to /tmp and transcoded it" is exactly what a
+later session needs to find. The transcript is the record of what happened; an ephemeral
+path in it is information, not noise.
+
 ### `prune` — the only command that removes rows
 
 ```bash

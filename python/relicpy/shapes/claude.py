@@ -49,8 +49,12 @@ def parse(file_path: str) -> ParsedFile:
 
             # cwd comes from the session's own field, never decoded from the directory
             # name: the encoding maps BOTH "/" and "." to "-", so it is lossy.
+            # `cwd` (first seen) identifies the SESSION and picks its shard.
+            # `line_cwd` is what THIS record said, and rides on the event — a session
+            # that changes repos mid-flight had 201 events unreachable by cwd before.
+            line_cwd = s(rec.get("cwd"))
             if not cwd:
-                cwd = s(rec.get("cwd"))
+                cwd = line_cwd
             if not _UUID36.match(session_uuid):
                 session_uuid = s(rec.get("sessionId")) or session_uuid
 
@@ -89,7 +93,7 @@ def parse(file_path: str) -> ParsedFile:
                 description = truncate(text, 200)
             events.append(ParsedEvent(
                 uid=uid_of("claude", file_key, seq),   # path-independent by design
-                seq=seq, role=role, ts=ts, text=truncate(text),
+                seq=seq, role=role, ts=ts, text=truncate(text), cwd=line_cwd,
             ))
 
     return ParsedFile(

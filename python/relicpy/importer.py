@@ -184,7 +184,10 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
                 uid=e.uid, session_uuid=p.session_uuid, file_path=f.path, repo_key=repo_col,
                 seq=float(e.seq), role=e.role, ts=e.ts or "", text=e.text,
                 source=f.source, tier=f.tier, kind=kind_of(f.tier, f.source),
-                worktree=ctx["worktree"], cwd=p.cwd or "",
+                # The EVENT's own cwd, falling back to the session's. Shards and
+                # repo_key still come from p.cwd, so this changes what is findable,
+                # never where a row lives — see ParsedEvent.cwd.
+                worktree=ctx["worktree"], cwd=e.cwd or p.cwd or "",
                 org=loc["org"], project=loc["project"], dir=loc["dir"],
                 mem_type=p.mem_type, origin_session=p.origin_session_id,
             ) for e in p.events]
