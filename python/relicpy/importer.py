@@ -141,8 +141,37 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
                 b.store.put_files(b.files)
             b.events, b.sessions, b.files, b.deletes = [], [], [], []
 
+    def _tick() -> None:
+        """One progress line, naming what the numbers MEAN.
+
+        `scanned` is every file looked at; `imported` is the subset that needed
+        writing. Printing only the second against a total of the first is what made a
+        healthy run look dead — see the comment at the `t.done += 1` below.
+        """
+        secs = max(0.001, time.time() - t0)
+        rate = t.done / secs
+        eta = round((len(found) - t.done) / rate) if rate > 0 else 0
+        pct = round(t.done / max(1, len(found)) * 100)
+        print(f"\r  {pct:3d}%  {t.done:,}/{len(found):,} scanned  {t.imported:,} imported  "
+              f"{t.skipped:,} unchanged  {t.added:,} events  {shards.size} shards  "
+              f"{rate:.0f}/s  eta {eta}s   ", end="", file=sys.stderr)
+
     since_flush = 0
     for f in found:
+        # COUNT THE FILE HERE, not at the bottom. Every `continue` below — unchanged,
+        # filtered, no_write — skipped the bottom-of-loop increment, so `done` counted
+        # only files this run IMPORTED while the denominator counted every file
+        # DISCOVERED. On a re-index, where unchanged is the overwhelming majority, that
+        # reads as a stalled run:
+        #
+        #     0%  100/206,680 files  32,100 events  56 shards  3/s  eta 61317s
+        #
+        # observed at 82% CPU with zero shards written in three minutes. The run was
+        # fine; the counter had moved 100 times because it had written 100 files. Rate
+        # and ETA are both derived from it, so both were fiction — 61,317s is 17 hours.
+        t.done += 1
+        if progress and t.done % 100 == 0:
+            _tick()
         try:
             p = f.parser(f.path)
             repo_key = resolve_repo_key(p.cwd)
@@ -163,12 +192,7 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             t.seen.setdefault(shard_key, set()).add(f.path)
 
             if no_write:
-                t.done += 1
-                if progress and t.done % 500 == 0:
-                    rate = t.done / max(0.001, time.time() - t0)
-                    print(f"\r  resolving shards  {t.done:,}/{len(found):,} files  "
-                          f"{shards.size} shards  {rate:.0f}/s   ", end="", file=sys.stderr)
-                continue
+                continue          # counted at the top of the loop, like every path
 
             ctx, loc = context_of(p.cwd), location_of(p.cwd)
 
@@ -225,13 +249,6 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             t.failed += 1
             if verbose:
                 print(f"  FAIL {f.path}: {str(err)[:160]}", file=sys.stderr)
-        t.done += 1
-        if progress and t.done % 100 == 0:
-            pct = round(t.done / max(1, len(found)) * 100)
-            rate = t.done / max(0.001, time.time() - t0)
-            print(f"\r  {pct:3d}%  {t.done:,}/{len(found):,} files  {t.added:,} events  "
-                  f"{shards.size} shards  {rate:.0f}/s   ", end="", file=sys.stderr)
-
     if progress and t.done >= 100:
         print("\r" + " " * 90 + "\r", end="", file=sys.stderr)
 

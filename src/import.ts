@@ -166,9 +166,44 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     }
   }
 
+  /**
+   * One progress line, naming what the numbers MEAN.
+   *
+   * `scanned` is every file looked at; `imported` is the subset that needed writing.
+   * Printing only the second against a total of the first is what made a healthy run
+   * look dead. The ETA uses the scan rate, which is the thing that actually paces the
+   * run — an unchanged file still costs a parse.
+   */
+  const progressTick = () => {
+    const secs = (Date.now() - t0) / 1000;
+    const rate = secs > 0 ? done / secs : 0;
+    const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
+    const pct = Math.round((done / Math.max(1, found.length)) * 100);
+    process.stderr.write(
+      `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} scanned` +
+      `  ${fmt(imported)} imported  ${fmt(skipped)} unchanged  ${fmt(added)} events` +
+      `  ${shards.size} shards  ${rate.toFixed(0)}/s  eta ${eta}s   `);
+  };
+
   let sinceFlush = 0;
 
   for (const file of found) {
+    /*
+     * COUNT THE FILE HERE, not at the bottom.
+     *
+     * Every `continue` below — unchanged, filtered, noWrite — used to skip the
+     * bottom-of-loop increment, so `done` counted only files this run IMPORTED while
+     * the denominator counted every file DISCOVERED. On a re-index, where unchanged is
+     * the overwhelming majority, that reads as a stalled run:
+     *
+     *     0%  100/206,680 files  32,100 events  56 shards  3/s  eta 61317s
+     *
+     * observed at 82% CPU with zero shards written in three minutes. The run was fine;
+     * the counter had moved 100 times because it had written 100 files. The rate and
+     * the ETA are both derived from it, so both were fiction — 61,317s is 17 hours.
+     */
+    done++;
+    if (o.progress && done % 100 === 0) progressTick();
     try {
       const p = await file.parser(file.path);
       const repoKey = resolveRepoKey(p.cwd);
@@ -189,14 +224,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       if (!sset) { sset = new Set<string>(); seen.set(shardKey, sset); }
       sset.add(file.path);
 
-      if (o.noWrite) {
-        if (o.progress && ++done % 500 === 0) {
-          const rate = done / ((Date.now() - t0) / 1000);
-          process.stderr.write(`\r  resolving shards  ${fmt(done)}/${fmt(found.length)} files` +
-                               `  ${shards.size} shards  ${rate.toFixed(0)}/s   `);
-        } else if (!o.progress) done++;
-        continue;
-      }
+      if (o.noWrite) continue;      // counted at the top of the loop, like every path
 
       const ctx = contextOf(p.cwd);
       const loc = locationOf(p.cwd);
@@ -257,15 +285,6 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       failed++;
       if (o.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
     }
-    if (o.progress && ++done % 100 === 0) {
-      const pct = Math.round((done / found.length) * 100);
-      const rate = done / ((Date.now() - t0) / 1000);
-      const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
-      process.stderr.write(
-        `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} files` +
-        `  ${fmt(added)} events  ${shards.size} shards` +
-        `  ${rate.toFixed(0)}/s  eta ${eta}s   `);
-    } else if (!o.progress) done++;
   }
   if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
 
