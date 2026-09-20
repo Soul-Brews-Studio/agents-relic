@@ -519,6 +519,20 @@ def cmd_index(a) -> int:
     return 0
 
 
+def _drop_shapes(paths: list[str], top: int = 3) -> str:
+    """The drop set by filename, commonest first.
+
+    A refusal that says only "72.7%" gives a human no way to decide whether --force is
+    safe. Measured on the live index: both refused `_unresolved` shards were 100% ONE
+    filename — journal.jsonl, the exact rows prune was built to remove — and the
+    percentage alone hid that completely.
+    """
+    from collections import Counter
+    by = Counter(p.rsplit("/", 1)[-1] for p in paths)
+    head = ", ".join(f"{n:,}x {b}" for b, n in by.most_common(top))
+    return head + (f", +{len(by) - top} more names" if len(by) > top else "")
+
+
 def _report_prune(plan, max_drop_pct: float) -> None:
     """Print a prune plan. Same renderer for the dry run and the applied one — the only
     difference in the output is the verb, because the only difference in the run is
@@ -537,6 +551,7 @@ def _report_prune(plan, max_drop_pct: float) -> None:
         if sh.blocked:
             print(f"  ⚠ {name}")
             print(f"      SKIPPED — {sh.blocked}. {len(sh.drop):,} of {sh.indexed:,} files.")
+            print(f"      they are: {_drop_shapes(sh.drop)}")
             print("      --force prunes it anyway; check the source root is fully readable first.")
             continue
         r = sh.removed or {}

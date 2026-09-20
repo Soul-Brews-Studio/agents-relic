@@ -169,3 +169,34 @@ def test_a_refused_run_looks_at_no_shard_at_all(tmp_path):
 
 def test_default_ceiling_is_ten_percent():
     assert DEFAULT_MAX_DROP_PCT == 10
+
+
+def test_a_file_that_moved_shard_is_still_on_disk(tmp_path):
+    """MEASURED ON THE LIVE INDEX, and why prune compares against one global set.
+
+    Two memory notes had rows in `memory/_unresolved` and now resolve to
+    `memory/github.com/laris-co/neo-oracle` — a memory note takes its cwd from the
+    session that produced it, and that session was not indexed yet when the note was
+    first written. Per-shard comparison called both DELETED. Both are on disk, and a
+    prune-only run writes no replacement.
+    """
+    moved, gone = "/m/note.md", "/m/journal.jsonl"
+    old = LanceStore.open(str(tmp_path / "moved-old"))
+    old.put_events([ev("u1", moved)])
+    old.put_sessions([se(moved), se(gone)])
+    old.put_files([fi(moved), fi(gone)])
+
+    old_key = ("memory", "_unresolved")
+    new_key = ("memory", "github.com/laris-co/neo-oracle")
+    shards = Shards(None)
+    shards._pool[old_key] = old
+    shards._pool[new_key] = LanceStore.open(str(tmp_path / "moved-new"))
+
+    # The file WAS discovered — under the new shard, not the old one.
+    t = ImportTally(shards=shards, seen={old_key: set(), new_key: {moved}})
+    plan = prune(t, apply=True, max_drop_pct=100.0,
+                 data_root=str(tmp_path / "no-such-root"))
+
+    old_plan = next(x for x in plan.shards if x.repo == "_unresolved")
+    assert old_plan.drop == [gone]                 # NOT the moved file
+    assert old.indexed_files() == {moved}

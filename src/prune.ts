@@ -87,13 +87,31 @@ export async function prune(t: ImportTally, o: PruneOpts): Promise<PrunePlan> {
   const refused = pruneRefusal(t, o);
   if (refused) return { refused, shards: [], untouched: 0, applied: false };
 
+  /*
+   * ONE GLOBAL SET, not one per shard — a file that MOVED shard is still on disk.
+   *
+   * Measured on the live index: two memory files sat in `memory/_unresolved` and now
+   * resolve to `memory/github.com/laris-co/neo-oracle`, because a memory note takes
+   * its cwd from the session that produced it and that session had not been indexed
+   * yet when the note was first written. Comparing per shard reads that as "deleted"
+   * — and a prune-only run writes no replacement row, so the file would be on disk
+   * with nothing in the index pointing at it.
+   *
+   * Keeping the stale row is the safe failure: uid already collapses duplicates at
+   * read time, so a row in the wrong shard costs a little space and answers correctly.
+   * Deleting it loses the only copy. Shard migration is a different feature; prune
+   * must not do it by accident.
+   */
+  const everywhere = new Set<string>();
+  for (const v of t.seen.values()) for (const p of v) everywhere.add(p);
+
   const out: ShardPrune[] = [];
   for (const [shardKey, discovered] of t.seen) {
     const store = t.shards.byKey(shardKey);
     if (!store) continue;                      // cannot happen: seen is filled beside the pool
     const { bank, repo } = splitShardKey(shardKey);
     const indexed = await store.indexedFiles();
-    const drop = [...indexed].filter(p => !discovered.has(p)).sort();
+    const drop = [...indexed].filter(p => !everywhere.has(p)).sort();
     const dropPct = indexed.size ? (drop.length / indexed.size) * 100 : 0;
 
     let blocked: string | null = null;

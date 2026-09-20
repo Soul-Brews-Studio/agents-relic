@@ -88,6 +88,22 @@ def prune(t: ImportTally, *, apply: bool, max_drop_pct: float = DEFAULT_MAX_DROP
     if refused:
         return PrunePlan(refused=refused)
 
+    # ONE GLOBAL SET, not one per shard — a file that MOVED shard is still on disk.
+    #
+    # Measured on the live index: two memory files sat in `memory/_unresolved` and now
+    # resolve to `memory/github.com/laris-co/neo-oracle`, because a memory note takes
+    # its cwd from the session that produced it and that session had not been indexed
+    # yet when the note was first written. Comparing per shard reads that as "deleted"
+    # — and a prune-only run writes no replacement row, so the file would be on disk
+    # with nothing in the index pointing at it.
+    #
+    # Keeping the stale row is the safe failure: uid already collapses duplicates at
+    # read time. Deleting it loses the only copy. Shard migration is a different
+    # feature; prune must not do it by accident.
+    everywhere: set[str] = set()
+    for v in t.seen.values():
+        everywhere |= v
+
     out: list[ShardPrune] = []
     for shard_key, discovered in t.seen.items():
         store = t.shards.by_key(shard_key) if t.shards else None
@@ -95,7 +111,7 @@ def prune(t: ImportTally, *, apply: bool, max_drop_pct: float = DEFAULT_MAX_DROP
             continue
         bank, repo = shard_key
         indexed = store.indexed_files()
-        drop = sorted(p for p in indexed if p not in discovered)
+        drop = sorted(p for p in indexed if p not in everywhere)
         drop_pct = (len(drop) / len(indexed) * 100) if indexed else 0.0
 
         blocked = None

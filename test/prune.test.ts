@@ -260,3 +260,45 @@ describe("importFiles --noWrite is what prune scans with", () => {
     expect(pruneTotals(plan)).toMatchObject({ files: 0 });
   });
 });
+
+describe("a file that moved SHARD is still on disk", () => {
+  /*
+   * MEASURED ON THE LIVE INDEX, and it is why prune compares against one global set.
+   *
+   * Two memory notes had rows in `memory/_unresolved` and now resolve to
+   * `memory/github.com/laris-co/neo-oracle` — a memory note takes its cwd from the
+   * session that produced it, and that session was not indexed yet when the note was
+   * first written. Per-shard comparison called both DELETED. Both are on disk, and a
+   * prune-only run writes no replacement, so the file would have been left with
+   * nothing in the index pointing at it.
+   */
+  test("its old shard keeps the row; only a file gone EVERYWHERE is dropped", async () => {
+    const moved = "/m/note.md";
+    const gone  = "/m/journal.jsonl";
+    const old = await LanceStore.open(join(tmp, "moved-old"));
+    await old.putEvents([ev("u1", moved)]);
+    await old.putSessions([se(moved), se(gone)]);
+    await old.putFiles([fi(moved), fi(gone)]);
+
+    const oldKey = shardKeyFor("memory", null);                        // _unresolved
+    const newKey = shardKeyFor("memory", "github.com/laris-co/neo-oracle");
+    const fresh = await LanceStore.open(join(tmp, "moved-new"));
+    const shards = new Shards(null);
+    (shards as any).pool.set(oldKey, old);
+    (shards as any).pool.set(newKey, fresh);
+
+    const t: ImportTally = {
+      added: 0, skipped: 0, failed: 0, filtered: 0, skippedNoise: 0, done: 0, imported: 0,
+      shards,
+      // The file was discovered — but under the NEW shard, not the old one.
+      seen: new Map([[oldKey, new Set<string>()], [newKey, new Set([moved])]]),
+      ftsBuilt: 0, ftsFailed: 0, ftsMs: 0,
+    };
+    const plan = await prune(t, { apply: true, maxDropPct: 100, force: false,
+      dataRoot: join(tmp, "no-such-root"), inRepo: false, sinceMs: null, repoFilter: null });
+
+    const oldPlan = plan.shards.find(x => x.repo === "_unresolved")!;
+    expect(oldPlan.drop).toEqual([gone]);            // NOT the moved file
+    expect([...await old.indexedFiles()].sort()).toEqual([moved]);
+  });
+});

@@ -470,7 +470,17 @@ machine, so `resolveRepoKey` returned null for everything and every file resolve
 files* — the index deletes itself and prints a clean summary. `--force` overrides it;
 check the source root is fully readable first.
 
-Two details that are load-bearing rather than tidy:
+**A file is only "gone" if discovery found it in no shard at all.** Prune compares
+against one global set, not each shard's own. Measured on the live index: two memory
+notes had rows in `memory/_unresolved` and now resolve to
+`memory/github.com/laris-co/neo-oracle`, because a memory note takes its cwd from the
+session that produced it and that session was not indexed yet when the note was written.
+Per-shard comparison calls both *deleted* — and a prune-only run writes no replacement
+row, so a file that is sitting on disk ends up with nothing in the index pointing at it.
+Keeping a stale row is the safe failure: `uid` already collapses duplicates at read
+time. Shard migration is a different feature, and prune must not do it by accident.
+
+Two more details that are load-bearing rather than tidy:
 
 - **The dry run and the real run are one call with a flag**, down into
   `LanceStore.pruneFiles`. Two code paths would let the number a human approved differ

@@ -126,6 +126,24 @@ async function cmdIndex(f: Record<string, string | boolean>) {
  * difference in the output is the verb, because the only difference in the run is
  * whether `delete` was called.
  */
+/**
+ * The drop set by filename, commonest first.
+ *
+ * A refusal that says only "72.7%" gives a human no way to decide whether --force is
+ * safe. Measured on the live index: both refused `_unresolved` shards were 100% ONE
+ * filename — journal.jsonl, the exact rows prune was built to remove — and the
+ * percentage alone hid that completely.
+ */
+function dropShapes(paths: string[], top = 3): string {
+  const by = new Map<string, number>();
+  for (const p of paths) {
+    const b = p.slice(p.lastIndexOf("/") + 1);
+    by.set(b, (by.get(b) ?? 0) + 1);
+  }
+  return [...by].sort((a, b) => b[1] - a[1]).slice(0, top)
+    .map(([b, n]) => `${fmt(n)}x ${b}`).join(", ") + (by.size > top ? `, +${by.size - top} more names` : "");
+}
+
 function reportPrune(plan: PrunePlan, maxDropPct: number) {
   if (plan.refused) {
     console.log(`\n  prune REFUSED — ${plan.refused}`);
@@ -140,6 +158,7 @@ function reportPrune(plan: PrunePlan, maxDropPct: number) {
     if (sh.blocked) {
       console.log(`  \u26A0 ${name}`);
       console.log(`      SKIPPED — ${sh.blocked}. ${fmt(sh.drop.length)} of ${fmt(sh.indexed)} files.`);
+      console.log(`      they are: ${dropShapes(sh.drop)}`);
       console.log(`      --force prunes it anyway; check the source root is fully readable first.`);
       continue;
     }
