@@ -220,7 +220,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
 export interface SemanticOpts extends Scope {
   limit?: number; overfetch?: number; allTiers?: boolean;
   tier?: string; role?: string; source?: string; since?: string; until?: string;
-  device?: string;
+  device?: string; session?: string;
 }
 
 export interface SemanticResult extends SearchResult {
@@ -282,7 +282,7 @@ export async function semanticSearch(q: string, o: SemanticOpts = {}): Promise<S
   }
   const queryMs = Math.round(performance.now() - q0);
 
-  const opts = { limit, overfetch: o.overfetch,
+  const opts = { limit, overfetch: o.overfetch, session: o.session,
                  mainTiers: !o.allTiers && !o.tier, tier: o.tier, role: o.role,
                  source: o.source, since: toISO(o.since), until: toISO(o.until, true) };
 

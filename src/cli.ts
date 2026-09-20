@@ -159,6 +159,7 @@ async function cmdSemantic(q: string, f: Record<string, string | boolean>,
       tier: f.tier as string, role: f.role as string, source: f.source as string,
       since: f.since as string, until: f.until as string,
       device: f.device ? String(f.device) : undefined,
+      session: f.session ? String(f.session) : undefined,
       allTiers: Boolean(f["all-tiers"] || f.tier),
     });
   } catch (e) {
@@ -443,6 +444,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
     maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
     dryRun: Boolean(f["dry-run"]),
+    session: f.session ? String(f.session) : undefined,
     reset: Boolean(f.reset),
   };
 
@@ -923,6 +925,7 @@ if (!cmd || f.help) {
                                --tree groups them by directory — which RUN is missing.
   embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
+                               [--session ID]  embed ONE session — the /forward + /new unit
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
