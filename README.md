@@ -431,6 +431,28 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+### `--source-path` — run one source against another root
+
+```bash
+relic index --corpus oracle-vault --source-path /path/to/repo/wt/<slug>/ψ
+```
+
+`sources.ts` documented this flag before it existed — the comment told you to run a
+command that fails. It exists now because a real vault needed it: **55 worktree vaults
+(`<repo>/wt/<slug>/ψ`) across 17 repos are real directories the `vaults` walker never
+descends into**, and 227 of one such vault's notes had index rows with no way to
+rebuild them.
+
+It overrides **one** source's root for **one** run. The walker, parser and bank are
+unchanged — that is what makes the rows land where the rest of that source's rows
+already live. It is not a way to widen a walk.
+
+Every guard it carries exists because the failure would otherwise be silent: `discover`
+skips a source whose root does not exist, so a typo'd path, an unknown corpus, or two
+`--corpus` values would each produce a clean `scanned 0 files` and exit 0. `prune`
+refuses the flag outright — an overridden root is a different population, so every file
+under the source's real root would look deleted.
+
 ### `prune` — the only command that removes rows
 
 ```bash

@@ -232,17 +232,31 @@ _WALKERS = {
 }
 
 
-def discover(only: Optional[list[str]], since_ms: Optional[int]) -> list[Found]:
+def discover(only: Optional[list[str]], since_ms: Optional[int],
+             path_override: Optional[tuple[str, str]] = None) -> list[Found]:
+    """`path_override` is (source key, root): run ONE source against a path it does not
+    normally walk.
+
+    sources.py has documented this flag since the oracle-vault entry was written and it
+    did not exist — the comment told you to run a command that fails. It exists now
+    because a real vault needed it: 55 worktree vaults (<repo>/wt/<slug>/ψ) across 17
+    repos are real directories the `vaults` walker never descends into.
+
+    Deliberately NOT a way to widen a walk. It overrides one source's root for one run,
+    so the walker, parser and bank are unchanged — which is what makes the result land
+    where the rest of that source's rows already live.
+    """
     out: list[Found] = []
     for src in load_sources():
         wanted = (src.key in only) if only else src.enabled
-        if not wanted or not os.path.exists(src.path):
+        root = path_override[1] if path_override and path_override[0] == src.key else src.path
+        if not wanted or not os.path.exists(root):
             continue
         walker = _WALKERS.get(src.walk)
         if not walker:
             continue          # hermes is SQLite — not ported to Python yet
         before = len(out)
-        walker(src.path, since_ms, out, src.key, src.parser)
+        walker(root, since_ms, out, src.key, src.parser)
         # Stamp the bank on what this source contributed, rather than threading it
         # through every walker: a file's bank is a property of its SOURCE.
         bank = bank_of(src)

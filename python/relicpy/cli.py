@@ -478,16 +478,48 @@ def cmd_sources(a) -> int:
     return 0
 
 
+def _resolve_source_path(a, only) -> Optional[tuple[str, str]]:
+    """Validate --source-path before anything walks.
+
+    Every failure here is one that would otherwise be SILENT: discover() skips a source
+    whose root does not exist, so a typo'd path, an unknown corpus name, or two corpora
+    all produce a clean "scanned 0 files" and a successful exit. Same shape as the
+    ghq.root bug — a feature that became a no-op and still printed a summary.
+    """
+    import os
+    from .sources import source_keys
+    raw = getattr(a, "source_path", None)
+    if raw is None:
+        return None
+    if not only or len(only) != 1:
+        print("--source-path overrides ONE source's root, so it needs exactly one --corpus.",
+              file=sys.stderr)
+        print("  e.g. relic index --corpus oracle-vault --source-path /path/to/repo/ψ",
+              file=sys.stderr)
+        raise SystemExit(1)
+    if only[0] not in source_keys():
+        print(f'unknown corpus "{only[0]}" — see: relic sources', file=sys.stderr)
+        raise SystemExit(1)
+    if not os.path.exists(raw):
+        print(f"--source-path does not exist: {raw}", file=sys.stderr)
+        print("  (discover skips a missing root silently, so this would have indexed "
+              "nothing and exited 0)", file=sys.stderr)
+        raise SystemExit(1)
+    return (only[0], raw)
+
+
 def cmd_index(a) -> int:
     from .discover import discover, parse_since
     from .importer import import_files
     only = a.corpus.split(",") if a.corpus and a.corpus != "all" else None
     since_ms = parse_since(a.since)
+    override = _resolve_source_path(a, only)
     t0 = time.time()
     print(f"🏺 relic indexing  ({only and '+'.join(only) or 'all enabled sources'} · "
+          f"{'path=' + override[1] + ' · ' if override else ''}"
           f"{'since ' + a.since if a.since else 'full history'}"
           f"{' · DRY RUN — no writes' if a.dry_run else ''})", file=sys.stderr)
-    found = discover(only, since_ms)
+    found = discover(only, since_ms, override)
     print(f"  scanned {len(found):,} files", file=sys.stderr)
     if a.dry_run:
         print("--dry-run: nothing written")
@@ -593,6 +625,12 @@ def cmd_prune(a) -> int:
 
     # --since/--repo would silently change WHAT WAS SCANNED, so reject them before the
     # scan rather than refusing after it.
+    if getattr(a, "source_path", None) is not None:
+        print("prune cannot take --source-path — an overridden root is a different "
+              "population,", file=sys.stderr)
+        print("so every file under the source's REAL root would look deleted.",
+              file=sys.stderr)
+        return 1
     if getattr(a, "since", None) or a.repo:
         print("prune cannot take --since or --repo — a narrowed scan makes every file "
               "outside it look deleted.", file=sys.stderr)
@@ -976,6 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
     # makes every file outside it look deleted; argparse rejecting them as unknown
     # would print "unrecognized arguments" and teach nothing.
     pr.add_argument("--repo"); pr.add_argument("--since")
+    pr.add_argument("--source-path", dest="source_path")
     pr.add_argument("--verbose", action="store_true")
     pr.add_argument("--max-drop", dest="max_drop", type=float,
                     help="refuse any shard losing more than this percent (default 10)")
@@ -984,6 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ix = sub.add_parser("index", parents=[common], help="build or update the index")
     ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")
+    ix.add_argument("--source-path", dest="source_path",
+                    help="run ONE --corpus against a root it does not normally walk")
     ix.add_argument("--dry-run", action="store_true")
     ix.add_argument("--verbose", action="store_true")
     ix.add_argument("--prune", action="store_true",

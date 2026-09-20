@@ -3,8 +3,9 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
-import { discover, parseSince, type Found } from "./discover.js";
+import { discover, parseSince, type Found, type PathOverride } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
+import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
@@ -50,6 +51,35 @@ function outFmt(f: Record<string, string | boolean>): Fmt {
   return v === "json" || v === "jsonl" || v === "plain" ? v : "pretty";
 }
 
+/**
+ * Validate `--source-path` before anything walks.
+ *
+ * Every failure here is one that would otherwise be SILENT: discover() skips a source
+ * whose root does not exist, so a typo'd path, an unknown corpus name, or two corpora
+ * all produce a clean "scanned 0 files" and a successful exit. That is the same shape
+ * as the ghq.root bug — a feature that became a no-op and still printed a summary.
+ */
+function resolveSourcePath(f: Record<string, string | boolean>, only: string[] | null): PathOverride | null {
+  const raw = f["source-path"];
+  if (raw === undefined) return null;
+  const path = String(raw);
+  if (!only || only.length !== 1) {
+    console.error("--source-path overrides ONE source's root, so it needs exactly one --corpus.");
+    console.error("  e.g. relic index --corpus oracle-vault --source-path /path/to/repo/\u03C8");
+    process.exit(1);
+  }
+  if (!sourceKeys().includes(only[0])) {
+    console.error(`unknown corpus "${only[0]}" — see: relic sources`);
+    process.exit(1);
+  }
+  if (!existsSync(path)) {
+    console.error(`--source-path does not exist: ${path}`);
+    console.error("  (discover skips a missing root silently, so this would have indexed nothing and exited 0)");
+    process.exit(1);
+  }
+  return { key: only[0], path };
+}
+
 // ---- index -----------------------------------------------------------------
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
@@ -57,14 +87,16 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   const skipNoise = Boolean(f["skip-noise"]);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
+  const override = resolveSourcePath(f, only);
 
   const t0 = Date.now();
   const mode = [only ? only.join("+") : "all enabled sources",
+                override ? `path=${override.path}` : null,
                 sinceMs ? `since ${localDateTime(sinceMs)}` : "full history",
                 f.repo ? `repo~${f.repo}` : null,
                 f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
   console.log(`\u{1F3FA} relic indexing  (${mode})`);
-  let found = discover(only, sinceMs);
+  let found = discover(only, sinceMs, override);
 
   // --repo scopes the index to one repo — "personal memory" rather than fleet-wide.
   // Cheap prefilter first: the encoded project dir name contains the repo name with
@@ -199,6 +231,11 @@ async function cmdPrune(f: Record<string, string | boolean>) {
 
   // Gate 1 is checked by pruneRefusal against the run, but --since/--repo would also
   // silently change WHAT WAS SCANNED. Reject them here so the scan never happens.
+  if (f["source-path"] !== undefined) {
+    console.error("prune cannot take --source-path — an overridden root is a different population,");
+    console.error("so every file under the source's REAL root would look deleted.");
+    process.exit(1);
+  }
   if (f.since || f.repo) {
     console.error("prune cannot take --since or --repo — a narrowed scan makes every file outside it look deleted.");
     console.error("prune always scans in full; use --corpus to limit which BANKS are eligible.");
@@ -976,6 +1013,9 @@ if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run] [--prune]
+          [--source-path PATH]   run ONE --corpus against a root it does not normally
+                               walk — same walker, parser and bank. For a vault the
+                               vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.

@@ -200,3 +200,30 @@ def test_a_file_that_moved_shard_is_still_on_disk(tmp_path):
     old_plan = next(x for x in plan.shards if x.repo == "_unresolved")
     assert old_plan.drop == [gone]                 # NOT the moved file
     assert old.indexed_files() == {moved}
+
+
+def test_source_path_override(tmp_path):
+    """`--source-path` was documented in sources.py before it existed — the comment told
+    you to run a command that fails. Pin the behaviour so it stays true."""
+    from relicpy.discover import discover
+
+    vault = tmp_path / "wt" / "some-worktree" / "ψ" / "memory" / "learnings"
+    vault.mkdir(parents=True)
+    (vault / "a-note.md").write_text("---\nname: a\n---\n\nsome learning text here\n")
+    (vault / "b-note.md").write_text("---\nname: b\n---\n\nanother learning text\n")
+    root = str(tmp_path / "wt" / "some-worktree" / "ψ")
+
+    found = discover(["oracle-vault"], None, ("oracle-vault", root))
+    assert sorted(f.path.rsplit("/", 1)[-1] for f in found) == ["a-note.md", "b-note.md"]
+    # The walker, parser and BANK are unchanged — only the root moves. An override that
+    # also changed the bank would scatter one source across two.
+    assert found[0].source == "oracle-vault"
+    assert found[0].bank == "vault"
+
+    # The key must match, or this silently redirects the wrong source. Asserted as "no
+    # result came from the override root", not as an empty list: oracle-vault's real
+    # path is per-machine, and the first version of this assertion failed against
+    # 10,129 real files. An environment-dependent assertion tests the machine, not the
+    # code.
+    assert [f for f in discover(["oracle-vault"], None, ("codex", root))
+            if f.path.startswith(root)] == []
