@@ -3,8 +3,9 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
-import { discover, parseSince, type Found } from "./discover.js";
+import { discover, parseSince, type Found, type PathOverride } from "./discover.js";
 import { detect, KNOWN_NON_JSONL } from "./sources.js";
+import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
@@ -13,6 +14,7 @@ import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
+import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
@@ -50,6 +52,35 @@ function outFmt(f: Record<string, string | boolean>): Fmt {
   return v === "json" || v === "jsonl" || v === "plain" ? v : "pretty";
 }
 
+/**
+ * Validate `--source-path` before anything walks.
+ *
+ * Every failure here is one that would otherwise be SILENT: discover() skips a source
+ * whose root does not exist, so a typo'd path, an unknown corpus name, or two corpora
+ * all produce a clean "scanned 0 files" and a successful exit. That is the same shape
+ * as the ghq.root bug — a feature that became a no-op and still printed a summary.
+ */
+function resolveSourcePath(f: Record<string, string | boolean>, only: string[] | null): PathOverride | null {
+  const raw = f["source-path"];
+  if (raw === undefined) return null;
+  const path = String(raw);
+  if (!only || only.length !== 1) {
+    console.error("--source-path overrides ONE source's root, so it needs exactly one --corpus.");
+    console.error("  e.g. relic index --corpus oracle-vault --source-path /path/to/repo/\u03C8");
+    process.exit(1);
+  }
+  if (!sourceKeys().includes(only[0])) {
+    console.error(`unknown corpus "${only[0]}" — see: relic sources`);
+    process.exit(1);
+  }
+  if (!existsSync(path)) {
+    console.error(`--source-path does not exist: ${path}`);
+    console.error("  (discover skips a missing root silently, so this would have indexed nothing and exited 0)");
+    process.exit(1);
+  }
+  return { key: only[0], path };
+}
+
 // ---- index -----------------------------------------------------------------
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
@@ -57,14 +88,16 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   const skipNoise = Boolean(f["skip-noise"]);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
+  const override = resolveSourcePath(f, only);
 
   const t0 = Date.now();
   const mode = [only ? only.join("+") : "all enabled sources",
+                override ? `path=${override.path}` : null,
                 sinceMs ? `since ${localDateTime(sinceMs)}` : "full history",
                 f.repo ? `repo~${f.repo}` : null,
                 f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
   console.log(`\u{1F3FA} relic indexing  (${mode})`);
-  let found = discover(only, sinceMs);
+  let found = discover(only, sinceMs, override);
 
   // --repo scopes the index to one repo — "personal memory" rather than fleet-wide.
   // Cheap prefilter first: the encoded project dir name contains the repo name with
@@ -108,6 +141,128 @@ async function cmdIndex(f: Record<string, string | boolean>) {
               `, ${tally.ftsBuilt} fts index built in ${idxSecs}s` +
               (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
   console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
+
+  // Opt-in, never implicit. The import just resolved every discovered file to its
+  // shard, so pruning here costs one query per shard and no second parse pass.
+  if (f.prune) {
+    const maxDropPct = f["max-drop"] !== undefined ? Number(f["max-drop"]) : DEFAULT_MAX_DROP_PCT;
+    const plan = await prune(tally, {
+      apply: true, maxDropPct, force: Boolean(f.force), dataRoot, inRepo,
+      sinceMs, repoFilter,
+    });
+    reportPrune(plan, maxDropPct);
+  }
+}
+
+/**
+ * Print a prune plan. Same renderer for the dry run and the applied one — the only
+ * difference in the output is the verb, because the only difference in the run is
+ * whether `delete` was called.
+ */
+/**
+ * The drop set by filename, commonest first.
+ *
+ * A refusal that says only "72.7%" gives a human no way to decide whether --force is
+ * safe. Measured on the live index: both refused `_unresolved` shards were 100% ONE
+ * filename — journal.jsonl, the exact rows prune was built to remove — and the
+ * percentage alone hid that completely.
+ */
+function dropShapes(paths: string[], top = 3): string {
+  const by = new Map<string, number>();
+  for (const p of paths) {
+    const b = p.slice(p.lastIndexOf("/") + 1);
+    by.set(b, (by.get(b) ?? 0) + 1);
+  }
+  return [...by].sort((a, b) => b[1] - a[1]).slice(0, top)
+    .map(([b, n]) => `${fmt(n)}x ${b}`).join(", ") + (by.size > top ? `, +${by.size - top} more names` : "");
+}
+
+function reportPrune(plan: PrunePlan, maxDropPct: number) {
+  if (plan.refused) {
+    console.log(`\n  prune REFUSED — ${plan.refused}`);
+    return;
+  }
+  const tot = pruneTotals(plan);
+  const verb = plan.applied ? "removed" : "would remove";
+  console.log(`\nprune (${plan.applied ? "APPLIED" : "dry run — nothing written"})`);
+  for (const sh of plan.shards) {
+    if (!sh.drop.length && !sh.blocked) continue;
+    const name = `${sh.bank}/${sh.repo}`;
+    if (sh.blocked) {
+      console.log(`  \u26A0 ${name}`);
+      console.log(`      SKIPPED — ${sh.blocked}. ${fmt(sh.drop.length)} of ${fmt(sh.indexed)} files.`);
+      console.log(`      they are: ${dropShapes(sh.drop)}`);
+      console.log(`      --force prunes it anyway; check the source root is fully readable first.`);
+      continue;
+    }
+    console.log(`  ${name}`);
+    console.log(`      ${verb} ${fmt(sh.drop.length)} of ${fmt(sh.indexed)} files (${sh.dropPct.toFixed(1)}%)` +
+                `  ${fmt(sh.removed?.events ?? 0)} events  ${fmt(sh.removed?.sessions ?? 0)} sessions` +
+                (sh.removed?.vectors ? `  ${fmt(sh.removed.vectors)} vectors` : ""));
+    for (const d of sh.drop.slice(0, 3)) console.log(`        ${d}`);
+    if (sh.drop.length > 3) console.log(`        … ${fmt(sh.drop.length - 3)} more`);
+  }
+  if (!tot.files && !tot.blocked) console.log(`  nothing to prune — every indexed file is still discoverable.`);
+  console.log(`\n  ${verb}: ${fmt(tot.files)} file${tot.files === 1 ? "" : "s"}  ${fmt(tot.events)} events  ` +
+              `${fmt(tot.sessions)} sessions  ${fmt(tot.vectors)} vectors  across ${tot.shards} shard${tot.shards === 1 ? "" : "s"}`);
+  if (tot.blocked) console.log(`  \u26A0 ${tot.blocked} shard${tot.blocked === 1 ? "" : "s"} refused by the ${maxDropPct}% ceiling — see --force`);
+  // "nothing to prune" and "never looked" are different facts. Only one means clean.
+  if (plan.untouched) console.log(`  ${plan.untouched} shard${plan.untouched === 1 ? "" : "s"} on disk were not reached by this run — never considered`);
+  if (!plan.applied && tot.files) console.log(`\n  to remove them:  relic prune --apply`);
+}
+
+// ---- prune -----------------------------------------------------------------
+/**
+ * Scan every source, then remove index rows for files discovery no longer yields.
+ *
+ * DRY BY DEFAULT. `--apply` is the only thing that deletes, and the preview it prints
+ * comes from the same call with the flag flipped, so the number approved is the number
+ * executed.
+ *
+ * This writes nothing on the way in — it is a full parse pass with `noWrite`, which
+ * costs the same read as an index run over an unchanged corpus and adds no rows. Use
+ * `relic index --prune` to do both in one pass when you were indexing anyway.
+ */
+async function cmdPrune(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
+  const apply = Boolean(f.apply);
+  const maxDropPct = f["max-drop"] !== undefined ? Number(f["max-drop"]) : DEFAULT_MAX_DROP_PCT;
+  const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
+
+  // Gate 1 is checked by pruneRefusal against the run, but --since/--repo would also
+  // silently change WHAT WAS SCANNED. Reject them here so the scan never happens.
+  if (f["source-path"] !== undefined) {
+    console.error("prune cannot take --source-path — an overridden root is a different population,");
+    console.error("so every file under the source's REAL root would look deleted.");
+    process.exit(1);
+  }
+  if (f.since || f.repo) {
+    console.error("prune cannot take --since or --repo — a narrowed scan makes every file outside it look deleted.");
+    console.error("prune always scans in full; use --corpus to limit which BANKS are eligible.");
+    process.exit(1);
+  }
+  if (!Number.isFinite(maxDropPct) || maxDropPct < 0 || maxDropPct > 100) {
+    console.error(`--max-drop must be a percentage between 0 and 100 (got ${String(f["max-drop"])})`);
+    process.exit(1);
+  }
+
+  const t0 = Date.now();
+  process.stderr.write(`\u{1F3FA} relic prune  (${only ? only.join("+") : "all enabled sources"} · ` +
+                       `${apply ? "APPLY — rows will be deleted" : "dry run"} · ceiling ${maxDropPct}%)\n`);
+  const found = discover(only, null);
+  const tally = await importFiles(found, { dataRoot, inRepo, noWrite: true, progress: true,
+                                          verbose: Boolean(f.verbose) }, t0);
+  process.stderr.write("\r" + " ".repeat(96) + "\r");
+
+  console.log(`  scanned:     ${fmt(found.length)} files -> ${tally.seen.size} shards reached`);
+  if (tally.failed) console.log(`  \u26A0 failed:    ${fmt(tally.failed)} (re-run with --verbose to see why)`);
+
+  const plan = await prune(tally, { apply, maxDropPct, force: Boolean(f.force),
+                                    dataRoot, inRepo, sinceMs: null, repoFilter: null });
+  reportPrune(plan, maxDropPct);
+  console.log(`  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  if (plan.refused) process.exit(1);
 }
 
 // ---- search ----------------------------------------------------------------
@@ -898,7 +1053,17 @@ async function cmdPending(f: Record<string, string | boolean>) {
 if (!cmd || f.help) {
   console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
-  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run]
+  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run] [--prune]
+          [--source-path PATH]   run ONE --corpus against a root it does not normally
+                               walk — same walker, parser and bank. For a vault the
+                               vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
+  prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
+                               remove index rows for files discovery no longer yields.
+                               DRY BY DEFAULT — --apply is the only thing that deletes.
+                               Refuses --since/--repo (a narrowed scan makes everything
+                               outside it look deleted), refuses a run with parse
+                               failures, skips shards this run never reached, and
+                               REFUSES any shard losing more than --max-drop percent.
   search  <query> [--repo S] [--bank B] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
@@ -964,6 +1129,7 @@ as text. See relic embed --dry-run before spending anything.`);
 }
 
 if (cmd === "index") await cmdIndex(f);
+else if (cmd === "prune") await cmdPrune(f);
 else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {

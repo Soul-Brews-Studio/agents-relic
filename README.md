@@ -431,6 +431,96 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+### `--source-path` — run one source against another root
+
+```bash
+relic index --corpus oracle-vault --source-path /path/to/repo/wt/<slug>/ψ
+```
+
+`sources.ts` documented this flag before it existed — the comment told you to run a
+command that fails. It exists now because a real vault needed it: **55 worktree vaults
+(`<repo>/wt/<slug>/ψ`) across 17 repos are real directories the `vaults` walker never
+descends into**, and 227 of one such vault's notes had index rows with no way to
+rebuild them.
+
+It overrides **one** source's root for **one** run. The walker, parser and bank are
+unchanged — that is what makes the rows land where the rest of that source's rows
+already live. It is not a way to widen a walk.
+
+Every guard it carries exists because the failure would otherwise be silent: `discover`
+skips a source whose root does not exist, so a typo'd path, an unknown corpus, or two
+`--corpus` values would each produce a clean `scanned 0 files` and exit 0. `prune`
+refuses the flag outright — an overridden root is a different population, so every file
+under the source's real root would look deleted.
+
+### `prune` — the only command that removes rows
+
+```bash
+relic prune                          # DRY RUN — names what would go, writes nothing
+relic prune --apply                  # actually delete
+relic prune --corpus claude-live     # limit which BANKS are eligible
+relic prune --max-drop 25            # raise the per-shard ceiling from 10%
+relic index --prune                  # index and prune in one pass — no second scan
+```
+
+The importer only ever adds and updates. A file that stops being discoverable — a new
+skip rule excluded it, it was deleted, it moved — keeps its `events`, `sessions` and
+`files` rows forever. Measured on the live index before this existed: **1,353
+`journal.jsonl` rows** for a file discovery has skipped since 2026-09-18, which made
+every session tree containing a workflow report one transcript too many. Two resolvers
+were taught to filter `journal.jsonl` out rather than fix it — two workarounds for one
+absent feature.
+
+**This is the only code in relic that deletes rows a human did not name**, so the whole
+design is the scoping. The naive version — *drop rows whose `file_path` was not seen
+this run* — destroys the index on any normal invocation, because a narrowed scan is the
+normal case: `--since 7d` cannot see a file older than seven days, and `--repo` never
+parses most of the corpus at all.
+
+Four gates, widest to narrowest:
+
+| # | Gate | Why |
+|---|---|---|
+| 1 | the run must be **unfiltered** — no `--since`, no `--repo` | an older file is not a deleted file |
+| 2 | nothing may have **failed to parse** | a file that failed is not a file that is gone |
+| 3 | only shards this run **reached** are considered | a bank whose source was not in `--corpus`, or whose root was missing, is never touched |
+| 4 | a shard losing more than `--max-drop` percent is **refused** | see below |
+
+Gate 4 is not paranoia, it is a bug that already happened. `ghq.root` was unset on one
+machine, so `resolveRepoKey` returned null for everything and every file resolved to
+`_unresolved`. Under gates 1–3 alone that reads as *every real shard lost all its
+files* — the index deletes itself and prints a clean summary. `--force` overrides it;
+check the source root is fully readable first.
+
+**A file is only "gone" if discovery found it in no shard at all.** Prune compares
+against one global set, not each shard's own. Measured on the live index: two memory
+notes had rows in `memory/_unresolved` and now resolve to
+`memory/github.com/laris-co/neo-oracle`, because a memory note takes its cwd from the
+session that produced it and that session was not indexed yet when the note was written.
+Per-shard comparison calls both *deleted* — and a prune-only run writes no replacement
+row, so a file that is sitting on disk ends up with nothing in the index pointing at it.
+Keeping a stale row is the safe failure: `uid` already collapses duplicates at read
+time. Shard migration is a different feature, and prune must not do it by accident.
+
+Two more details that are load-bearing rather than tidy:
+
+- **The dry run and the real run are one call with a flag**, down into
+  `LanceStore.pruneFiles`. Two code paths would let the number a human approved differ
+  from the number that executed.
+- **`vectors` is deleted before `events`.** Its only join key to a file is through
+  `events.uid`, so deleting events first strands every embedding with nothing left to
+  find it by — and stranded rows are invisible, because `vectorStats()` counts rows,
+  not reachable ones.
+
+The report separates *nothing to prune* from *never looked*: shards on disk this run
+did not reach are counted and named as such, because only one of those two means the
+index is clean.
+
+`relic prune` runs a full parse pass and writes nothing, which costs the same read as
+an index run over an unchanged corpus. Use `relic index --prune` when you were indexing
+anyway — the import has already resolved every file to its shard, so pruning then costs
+one query per shard and no second scan.
+
 ### `search` — full text, BM25-ranked
 
 ```bash

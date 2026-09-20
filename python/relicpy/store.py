@@ -100,6 +100,62 @@ class LanceStore:
         return {r["file_path"]: {"mtime": r["mtime"], "size": r["size"]}
                 for r in tbl.to_pylist()}
 
+    def indexed_files(self) -> set[str]:
+        """Every file_path this shard holds a row for — the population prune compares
+        discovery against.
+
+        Union of `files` and `sessions`, not either alone. A file that parses to ZERO
+        events still gets a session row and a file row, and journal.jsonl — the 1,353
+        stale rows that motivated prune — is exactly that shape. Reading only `events`
+        would report the index as already clean.
+        """
+        out: set[str] = set()
+        for name in ("files", "sessions"):
+            t = self._existing(name)
+            if t is None:
+                continue
+            for r in t.to_arrow().select(["file_path"]).to_pylist():
+                out.add(r["file_path"])
+        return out
+
+    def prune_files(self, paths: list[str], apply: bool) -> dict[str, int]:
+        """Remove every row belonging to these files — or count what removal would take.
+
+        ONE code path for the dry run and the real one, switched by `apply`. Two paths
+        would let the number a human approved differ from the number that executed,
+        which is the whole risk of a destructive command.
+
+        `vectors` FIRST, and deliberately: its only join key to a file is through
+        events.uid, so deleting events first strands every embedding with nothing left
+        to find it by — and stranded rows are invisible, because vector_stats() counts
+        rows, not reachable ones.
+
+        Chunked because a Lance filter is a SQL string: an unbounded IN (...) over
+        thousands of paths is one enormous predicate.
+        """
+        r = {"events": 0, "sessions": 0, "files": 0, "vectors": 0}
+        if not paths:
+            return r
+        chunk = 200
+        q = lambda v: "'" + v.replace("'", "''") + "'"          # noqa: E731
+        ev, se, fi, ve = (self._existing(n) for n in ("events", "sessions", "files", "vectors"))
+        for i in range(0, len(paths), chunk):
+            where = "file_path IN (%s)" % ", ".join(q(x) for x in paths[i:i + chunk])
+            if ve is not None and ev is not None:
+                uids = [x["uid"] for x in ev.search().select(["uid"]).where(where).limit(0).to_list()]
+                for j in range(0, len(uids), chunk):
+                    w = "uid IN (%s)" % ", ".join(q(x) for x in uids[j:j + chunk])
+                    r["vectors"] += ve.count_rows(w)
+                    if apply:
+                        ve.delete(w)
+            for key, t in (("events", ev), ("sessions", se), ("files", fi)):
+                if t is None:
+                    continue
+                r[key] += t.count_rows(where)
+                if apply:
+                    t.delete(where)
+        return r
+
     def events_where(self, where: str, limit: int = 200_000) -> list[dict]:
         """Every event matching a raw filter. Mirrors LanceStore.eventsWhere().
 

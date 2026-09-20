@@ -228,6 +228,69 @@ export class LanceStore {
     await t?.delete(`file_path = ${sqlStr(filePath)}`);
   }
 
+  /**
+   * Every file_path this shard holds a row for — the population `prune` compares
+   * discovery against.
+   *
+   * Union of `files` and `sessions`, not either alone. A file that parses to ZERO
+   * events still gets a session row and a file row, and journal.jsonl — the 1,353
+   * stale rows that motivated prune — is exactly that shape. Reading only `events`
+   * would report the index as already clean.
+   */
+  async indexedFiles(): Promise<Set<string>> {
+    const out = new Set<string>();
+    for (const name of ["files", "sessions"]) {
+      const t = await this.existing(name);
+      if (!t) continue;
+      for (const r of await t.query().select(["file_path"]).toArray() as any[])
+        out.add(String(r.file_path));
+    }
+    return out;
+  }
+
+  /**
+   * Remove every row belonging to these files — or count what removal would take.
+   *
+   * ONE code path for the dry run and the real one, switched by `apply`. Two paths
+   * would let the number a human approved differ from the number that executed, which
+   * is the whole risk of a destructive command: the preview must be produced by the
+   * code that does the work, not by a second query that resembles it.
+   *
+   * `vectors` FIRST, and deliberately: its only join key to a file is through
+   * `events.uid`, so deleting events first would strand every embedding with no way
+   * left to find it. Orphan vectors are invisible — `vectorStats()` counts rows, not
+   * reachable ones — so this ordering is the difference between a clean prune and a
+   * table that grows forever.
+   *
+   * Chunked because a Lance filter is a SQL string: an unbounded `IN (...)` over
+   * thousands of paths is one enormous predicate. 200 keeps it parseable and still
+   * costs one commit per chunk rather than one per file.
+   */
+  async pruneFiles(paths: string[], apply: boolean): Promise<{ events: number; sessions: number; files: number; vectors: number }> {
+    const r = { events: 0, sessions: 0, files: 0, vectors: 0 };
+    if (!paths.length) return r;
+    const CHUNK = 200;
+    const ev = await this.existing("events");
+    const se = await this.existing("sessions");
+    const fi = await this.existing("files");
+    const ve = await this.existing("vectors");
+    for (let i = 0; i < paths.length; i += CHUNK) {
+      const where = `file_path IN (${paths.slice(i, i + CHUNK).map(sqlStr).join(", ")})`;
+      if (ve && ev) {
+        const uids = (await ev.query().where(where).select(["uid"]).toArray() as any[]).map(x => String(x.uid));
+        for (let j = 0; j < uids.length; j += CHUNK) {
+          const w = `uid IN (${uids.slice(j, j + CHUNK).map(sqlStr).join(", ")})`;
+          r.vectors += await ve.countRows(w);
+          if (apply) await ve.delete(w);
+        }
+      }
+      if (ev) { r.events   += await ev.countRows(where); if (apply) await ev.delete(where); }
+      if (se) { r.sessions += await se.countRows(where); if (apply) await se.delete(where); }
+      if (fi) { r.files    += await fi.countRows(where); if (apply) await fi.delete(where); }
+    }
+    return r;
+  }
+
   /** The manifest, as a map — small enough to hold in memory per shard. */
   async manifest(): Promise<Map<string, { mtime: number; size: number }>> {
     const out = new Map<string, { mtime: number; size: number }>();

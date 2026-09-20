@@ -514,16 +514,48 @@ def cmd_sources(a) -> int:
     return 0
 
 
+def _resolve_source_path(a, only) -> Optional[tuple[str, str]]:
+    """Validate --source-path before anything walks.
+
+    Every failure here is one that would otherwise be SILENT: discover() skips a source
+    whose root does not exist, so a typo'd path, an unknown corpus name, or two corpora
+    all produce a clean "scanned 0 files" and a successful exit. Same shape as the
+    ghq.root bug — a feature that became a no-op and still printed a summary.
+    """
+    import os
+    from .sources import source_keys
+    raw = getattr(a, "source_path", None)
+    if raw is None:
+        return None
+    if not only or len(only) != 1:
+        print("--source-path overrides ONE source's root, so it needs exactly one --corpus.",
+              file=sys.stderr)
+        print("  e.g. relic index --corpus oracle-vault --source-path /path/to/repo/ψ",
+              file=sys.stderr)
+        raise SystemExit(1)
+    if only[0] not in source_keys():
+        print(f'unknown corpus "{only[0]}" — see: relic sources', file=sys.stderr)
+        raise SystemExit(1)
+    if not os.path.exists(raw):
+        print(f"--source-path does not exist: {raw}", file=sys.stderr)
+        print("  (discover skips a missing root silently, so this would have indexed "
+              "nothing and exited 0)", file=sys.stderr)
+        raise SystemExit(1)
+    return (only[0], raw)
+
+
 def cmd_index(a) -> int:
     from .discover import discover, parse_since
     from .importer import import_files
     only = a.corpus.split(",") if a.corpus and a.corpus != "all" else None
     since_ms = parse_since(a.since)
+    override = _resolve_source_path(a, only)
     t0 = time.time()
     print(f"🏺 relic indexing  ({only and '+'.join(only) or 'all enabled sources'} · "
+          f"{'path=' + override[1] + ' · ' if override else ''}"
           f"{'since ' + a.since if a.since else 'full history'}"
           f"{' · DRY RUN — no writes' if a.dry_run else ''})", file=sys.stderr)
-    found = discover(only, since_ms)
+    found = discover(only, since_ms, override)
     print(f"  scanned {len(found):,} files", file=sys.stderr)
     if a.dry_run:
         print("--dry-run: nothing written")
@@ -540,7 +572,134 @@ def cmd_index(a) -> int:
         print(f"  failed:      {t.failed:,}")
     print(f"  wrote:       {getattr(a, 'data_root', None) or default_root()} "
           f"in {time.time()-t0:.1f}s")
+
+    # Opt-in, never implicit. The import just resolved every discovered file to its
+    # shard, so pruning here costs one query per shard and no second parse pass.
+    if getattr(a, "prune", False):
+        from .prune import prune, DEFAULT_MAX_DROP_PCT
+        max_drop = getattr(a, "max_drop", None)
+        max_drop = DEFAULT_MAX_DROP_PCT if max_drop is None else float(max_drop)
+        plan = prune(t, apply=True, max_drop_pct=max_drop, force=getattr(a, "force", False),
+                     data_root=getattr(a, "data_root", None),
+                     in_repo=getattr(a, "in_repo", False),
+                     since_ms=since_ms, repo_filter=a.repo)
+        _report_prune(plan, max_drop)
     return 0
+
+
+def _drop_shapes(paths: list[str], top: int = 3) -> str:
+    """The drop set by filename, commonest first.
+
+    A refusal that says only "72.7%" gives a human no way to decide whether --force is
+    safe. Measured on the live index: both refused `_unresolved` shards were 100% ONE
+    filename — journal.jsonl, the exact rows prune was built to remove — and the
+    percentage alone hid that completely.
+    """
+    from collections import Counter
+    by = Counter(p.rsplit("/", 1)[-1] for p in paths)
+    head = ", ".join(f"{n:,}x {b}" for b, n in by.most_common(top))
+    return head + (f", +{len(by) - top} more names" if len(by) > top else "")
+
+
+def _report_prune(plan, max_drop_pct: float) -> None:
+    """Print a prune plan. Same renderer for the dry run and the applied one — the only
+    difference in the output is the verb, because the only difference in the run is
+    whether `delete` was called."""
+    from .prune import prune_totals
+    if plan.refused:
+        print(f"\n  prune REFUSED — {plan.refused}")
+        return
+    tot = prune_totals(plan)
+    verb = "removed" if plan.applied else "would remove"
+    print(f"\nprune ({'APPLIED' if plan.applied else 'dry run — nothing written'})")
+    for sh in plan.shards:
+        if not sh.drop and not sh.blocked:
+            continue
+        name = f"{sh.bank}/{sh.repo}"
+        if sh.blocked:
+            print(f"  ⚠ {name}")
+            print(f"      SKIPPED — {sh.blocked}. {len(sh.drop):,} of {sh.indexed:,} files.")
+            print(f"      they are: {_drop_shapes(sh.drop)}")
+            print("      --force prunes it anyway; check the source root is fully readable first.")
+            continue
+        r = sh.removed or {}
+        print(f"  {name}")
+        print(f"      {verb} {len(sh.drop):,} of {sh.indexed:,} files ({sh.drop_pct:.1f}%)"
+              f"  {r.get('events', 0):,} events  {r.get('sessions', 0):,} sessions"
+              + (f"  {r['vectors']:,} vectors" if r.get("vectors") else ""))
+        for d in sh.drop[:3]:
+            print(f"        {d}")
+        if len(sh.drop) > 3:
+            print(f"        … {len(sh.drop) - 3:,} more")
+    if not tot["files"] and not tot["blocked"]:
+        print("  nothing to prune — every indexed file is still discoverable.")
+    print(f"\n  {verb}: {tot['files']:,} file{'' if tot['files'] == 1 else 's'}  "
+          f"{tot['events']:,} events  "
+          f"{tot['sessions']:,} sessions  {tot['vectors']:,} vectors  "
+          f"across {tot['shards']} shard{'' if tot['shards'] == 1 else 's'}")
+    if tot["blocked"]:
+        print(f"  ⚠ {tot['blocked']} shard{'' if tot['blocked'] == 1 else 's'} refused by "
+              f"the {max_drop_pct:g}% ceiling — see --force")
+    # "nothing to prune" and "never looked" are different facts. Only one means clean.
+    if plan.untouched:
+        print(f"  {plan.untouched} shard{'' if plan.untouched == 1 else 's'} on disk were "
+              "not reached by this run — never considered")
+    if not plan.applied and tot["files"]:
+        print("\n  to remove them:  relic prune --apply")
+
+
+def cmd_prune(a) -> int:
+    """Scan every source, then remove index rows for files discovery no longer yields.
+
+    DRY BY DEFAULT. `--apply` is the only thing that deletes, and the preview it prints
+    comes from the same call with the flag flipped, so the number approved is the
+    number executed.
+    """
+    from .discover import discover
+    from .importer import import_files
+    from .prune import prune, DEFAULT_MAX_DROP_PCT
+
+    # --since/--repo would silently change WHAT WAS SCANNED, so reject them before the
+    # scan rather than refusing after it.
+    if getattr(a, "source_path", None) is not None:
+        print("prune cannot take --source-path — an overridden root is a different "
+              "population,", file=sys.stderr)
+        print("so every file under the source's REAL root would look deleted.",
+              file=sys.stderr)
+        return 1
+    if getattr(a, "since", None) or a.repo:
+        print("prune cannot take --since or --repo — a narrowed scan makes every file "
+              "outside it look deleted.", file=sys.stderr)
+        print("prune always scans in full; use --corpus to limit which BANKS are eligible.",
+              file=sys.stderr)
+        return 1
+    max_drop = getattr(a, "max_drop", None)
+    max_drop = DEFAULT_MAX_DROP_PCT if max_drop is None else float(max_drop)
+    if not (0 <= max_drop <= 100):
+        print(f"--max-drop must be a percentage between 0 and 100 (got {max_drop:g})",
+              file=sys.stderr)
+        return 1
+
+    only = a.corpus.split(",") if a.corpus and a.corpus != "all" else None
+    apply_it = bool(getattr(a, "apply", False))
+    t0 = time.time()
+    print(f"🏺 relic prune  ({only and '+'.join(only) or 'all enabled sources'} · "
+          f"{'APPLY — rows will be deleted' if apply_it else 'dry run'} · "
+          f"ceiling {max_drop:g}%)", file=sys.stderr)
+    found = discover(only, None)
+    t = import_files(found, data_root=getattr(a, "data_root", None),
+                     in_repo=getattr(a, "in_repo", False),
+                     progress=True, verbose=a.verbose, no_write=True)
+    print(f"  scanned:     {len(found):,} files -> {len(t.seen)} shards reached")
+    if t.failed:
+        print(f"  ⚠ failed:    {t.failed:,} (re-run with --verbose to see why)")
+
+    plan = prune(t, apply=apply_it, max_drop_pct=max_drop, force=getattr(a, "force", False),
+                 data_root=getattr(a, "data_root", None),
+                 in_repo=getattr(a, "in_repo", False), since_ms=None, repo_filter=None)
+    _report_prune(plan, max_drop)
+    print(f"  {time.time()-t0:.1f}s")
+    return 1 if plan.refused else 0
 
 
 def cmd_shards(a) -> int:
@@ -882,6 +1041,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="drop `vectors` first — the only way to change model or dim")
     em.set_defaults(func=cmd_embed)
 
+    pr = sub.add_parser("prune", parents=[common],
+                        help="remove index rows for files discovery no longer yields")
+    pr.add_argument("--apply", action="store_true",
+                    help="actually delete; without it this is a dry run")
+    pr.add_argument("--corpus", help="limit which BANKS are eligible")
+    # --repo and --since exist here ONLY so the guard can name them. A narrowed scan
+    # makes every file outside it look deleted; argparse rejecting them as unknown
+    # would print "unrecognized arguments" and teach nothing.
+    pr.add_argument("--repo"); pr.add_argument("--since")
+    pr.add_argument("--source-path", dest="source_path")
+    pr.add_argument("--verbose", action="store_true")
+    pr.add_argument("--max-drop", dest="max_drop", type=float,
+                    help="refuse any shard losing more than this percent (default 10)")
+    pr.add_argument("--force", action="store_true", help="ignore the --max-drop ceiling")
+    pr.set_defaults(func=cmd_prune)
+
     rc = sub.add_parser("recap", parents=[common],
                         help="what HAPPENED in one session — turns, tools, files, ending")
     rc.add_argument("id")
@@ -893,8 +1068,16 @@ def main(argv: list[str] | None = None) -> int:
 
     ix = sub.add_parser("index", parents=[common], help="build or update the index")
     ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")
+    ix.add_argument("--source-path", dest="source_path",
+                    help="run ONE --corpus against a root it does not normally walk")
     ix.add_argument("--dry-run", action="store_true")
     ix.add_argument("--verbose", action="store_true")
+    ix.add_argument("--prune", action="store_true",
+                    help="after importing, remove rows for files discovery no longer "
+                         "yields (refused unless the run was unfiltered and clean)")
+    ix.add_argument("--max-drop", dest="max_drop", type=float,
+                    help="refuse any shard losing more than this percent (default 10)")
+    ix.add_argument("--force", action="store_true", help="ignore the --max-drop ceiling")
     ix.set_defaults(func=cmd_index)
 
     a = p.parse_args(argv)

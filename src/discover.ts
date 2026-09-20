@@ -355,23 +355,40 @@ function walkMemory(root: string, sinceMs: number | null, out: Found[], srcKey: 
   }
 }
 
-export function discover(only: string[] | null, sinceMs: number | null): Found[] {
+/**
+ * `--source-path`: run one source against a path it does not normally walk.
+ *
+ * `sources.ts` has documented this flag since the oracle-vault entry was written and
+ * it did not exist — the comment told you to run a command that fails. It exists now
+ * because a real vault needed it: 55 worktree vaults (`<repo>/wt/<slug>/ψ`) across 17
+ * repos are real directories the `vaults` walker never descends into, and 227 of one
+ * such vault's notes had index rows with no way to rebuild them.
+ *
+ * Deliberately NOT a way to widen a walk. It overrides ONE source's root for ONE run,
+ * so the walker, parser and bank are unchanged — which is what makes the result land
+ * where the rest of that source's rows already live.
+ */
+export interface PathOverride { key: string; path: string }
+
+export function discover(only: string[] | null, sinceMs: number | null,
+                         pathOverride: PathOverride | null = null): Found[] {
   const out: Found[] = [];
   const tick = () => {
     if (out.length && out.length % 2000 === 0) progressLine(`  scanning… ${out.length.toLocaleString()} files found`);
   };
   for (const src of loadSources()) {
     const wanted = only ? only.includes(src.key) : src.enabled;
-    if (!wanted || !existsSync(src.path)) continue;
+    const root = pathOverride && pathOverride.key === src.key ? pathOverride.path : src.path;
+    if (!wanted || !existsSync(root)) continue;
     progressLine(`  scanning ${src.key}…`);
     const before = out.length;
-    if (src.walk === "memory") walkMemory(src.path, sinceMs, out, src.key, src.parser);
-    else if (src.walk === "hermes") walkHermes(src.path, sinceMs, out, src.key, src.parser);
-    else if (src.walk === "vaults") walkVaults(src.path, sinceMs, out, src.key, src.parser);
-    else if (src.walk === "vault") walkVault(src.path, sinceMs, out, src.key, src.parser, 0, tick);
-    else if (src.walk === "omp") walkOmp(src.path, sinceMs, out, src.key, src.parser);
-    else if (src.walk === "flat") walkFlat(src.path, sinceMs, out, src.key, src.parser);
-    else walkClaude(src.path, sinceMs, out, src.key, src.parser);
+    if (src.walk === "memory") walkMemory(root, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "hermes") walkHermes(root, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "vaults") walkVaults(root, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "vault") walkVault(root, sinceMs, out, src.key, src.parser, 0, tick);
+    else if (src.walk === "omp") walkOmp(root, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "flat") walkFlat(root, sinceMs, out, src.key, src.parser);
+    else walkClaude(root, sinceMs, out, src.key, src.parser);
     // Stamp the bank on what this source just contributed, rather than threading it
     // through all six walkers. A file's bank is a property of the SOURCE it was found
     // under, so the walkers never need to know about it.

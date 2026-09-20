@@ -63,6 +63,15 @@ class Shards:
     def stores(self) -> list[LanceStore]:
         return list(self._pool.values())
 
+    def by_key(self, key: tuple[str, str]) -> Optional[LanceStore]:
+        """The store for a key this pool already opened, or None.
+
+        Prune needs the store that WROTE a shard, not one reopened from a key it
+        reconstructed. Zipping the key list against the store list would work today
+        and break the first time either is filtered.
+        """
+        return self._pool.get(key)
+
 
 @dataclass
 class ImportTally:
@@ -76,6 +85,10 @@ class ImportTally:
     fts_failed: int = 0
     fts_ms: int = 0
     shards: Optional[Shards] = None
+    # Every file DISCOVERED this run, grouped by (bank, repo) — including the ones
+    # skipped as unchanged, which are the majority on a repeat run and are exactly the
+    # files prune must not delete.
+    seen: dict[tuple[str, str], set[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,7 +109,16 @@ FLUSH_EVERY = 250
 
 def import_files(found: list[Found], *, data_root: Optional[str] = None,
                  in_repo: bool = False, repo_filter: Optional[str] = None,
-                 progress: bool = False, verbose: bool = False) -> ImportTally:
+                 progress: bool = False, verbose: bool = False,
+                 no_write: bool = False) -> ImportTally:
+    """Import a list of files.
+
+    `no_write` resolves every file to its shard and writes NOTHING — that is prune's
+    scan. It lives here rather than in prune.py so the file-to-shard mapping is
+    produced by the importer itself: the same parse, the same resolve_repo_key, the
+    same key. Prune deletes rows the importer wrote, so any divergence between the two
+    mappings is a deletion in the wrong shard.
+    """
     shards = Shards(data_root, in_repo)
     manifests: dict[tuple[str, str], dict] = {}
     t = ImportTally(shards=shards)
@@ -133,8 +155,22 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             # and duplicating it would make every `--repo` filter match bank names too.
             repo_col = repo_key or "_unresolved"
             shard_key = (f.bank, repo_col)
-            ctx, loc = context_of(p.cwd), location_of(p.cwd)
             store = shards.get(repo_key, f.bank)
+
+            # BEFORE the unchanged-skip below. A file skipped as unchanged is still
+            # present on disk, and prune's question is "is it still discoverable", not
+            # "did this run rewrite it".
+            t.seen.setdefault(shard_key, set()).add(f.path)
+
+            if no_write:
+                t.done += 1
+                if progress and t.done % 500 == 0:
+                    rate = t.done / max(0.001, time.time() - t0)
+                    print(f"\r  resolving shards  {t.done:,}/{len(found):,} files  "
+                          f"{shards.size} shards  {rate:.0f}/s   ", end="", file=sys.stderr)
+                continue
+
+            ctx, loc = context_of(p.cwd), location_of(p.cwd)
 
             if shard_key not in manifests:
                 manifests[shard_key] = store.manifest()
@@ -195,6 +231,11 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
 
     if progress and t.done >= 100:
         print("\r" + " " * 90 + "\r", end="", file=sys.stderr)
+
+    # A scan writes nothing, so there is nothing to flush and no index to rebuild.
+    if no_write:
+        return t
+
     flush()          # anything left below the batch threshold
 
     # THE FTS PHASE IS THE QUIET ONE, and quiet is what gets a run killed. A run killed
