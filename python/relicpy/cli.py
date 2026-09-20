@@ -148,6 +148,42 @@ def cmd_embed(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recap(a) -> int:
+    """What happened in one session. Same output as the TypeScript CLI."""
+    from .recap import session_recap
+    r = session_recap(a.id, _scope(a), limit=a.limit, all_tiers=a.all_tiers, chars=a.chars)
+    if not r:
+        print(f"no session matched {a.id}", file=sys.stderr)
+        return 1
+    if _json(a):
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0
+    print(r["name"])
+    print(f"{r['sessionUuid']}  ·  {r['repo']}" + (f"  ·  {r['gitBranch']}" if r["gitBranch"] else ""))
+    print(f"{_local(r['startedAt'])} → {_local(r['endedAt'])}  ·  "
+          f"{r['transcripts']:,} transcripts · {r['events']:,} ev"
+          + (f"  ·  {r['model']}" if r["model"] else ""))
+    print("  " + " · ".join(f"{x['role']} {x['n']:,}" for x in r["roles"]))
+    if r["asked"]:
+        om = f", {r['askedOmitted']:,} harness turns omitted" if r["askedOmitted"] else ""
+        print(f"\nWHAT WAS ASKED  ({len(r['asked']):,} turns{om})\n")
+        for t in r["asked"]:
+            print(f"  {_local(t['ts'])[11:]}  {t['text']}")
+    elif r["askedOmitted"]:
+        # "no turns" and "every turn was boilerplate" are different facts.
+        print(f"\nWHAT WAS ASKED  —  none; all {r['askedOmitted']:,} user turns were harness boilerplate")
+    if r["tools"]:
+        print("\nWHAT RAN\n")
+        print("  " + " · ".join(f"{t['name']} {t['n']:,}" for t in r["tools"]))
+    if r["files"]:
+        print("\nFILES EDITED\n")
+        for x in r["files"]:
+            print(f"  {x['n']:>3}x  {x['path']}")
+    if r["endedWith"]:
+        print(f"\nENDED WITH\n\n  {r['endedWith']}")
+    return 0
+
+
 def cmd_status(a: argparse.Namespace) -> int:
     root, rows = index_status(_scope(a), freshness=not a.no_freshness)
     if not rows:
@@ -1020,6 +1056,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="refuse any shard losing more than this percent (default 10)")
     pr.add_argument("--force", action="store_true", help="ignore the --max-drop ceiling")
     pr.set_defaults(func=cmd_prune)
+
+    rc = sub.add_parser("recap", parents=[common],
+                        help="what HAPPENED in one session — turns, tools, files, ending")
+    rc.add_argument("id")
+    rc.add_argument("--bank"); rc.add_argument("--repo")
+    rc.add_argument("--limit", type=int, default=None)
+    rc.add_argument("--all-tiers", action="store_true")
+    rc.add_argument("--chars", type=int, default=140)
+    rc.set_defaults(func=cmd_recap)
 
     ix = sub.add_parser("index", parents=[common], help="build or update the index")
     ix.add_argument("--corpus"); ix.add_argument("--since"); ix.add_argument("--repo")

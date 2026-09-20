@@ -213,6 +213,7 @@ export interface EmbedOpts extends Scope {
   minChars?: number;
   maxChars?: number;
   dryRun?: boolean;
+  session?: string;       // embed ONE session — the /forward + /new unit
   reset?: boolean;        // drop `vectors` first — the only way to change model/dim
   onProgress?: (p: { shard: string; done: number; pending: number }) => void;
 }
@@ -248,7 +249,7 @@ export async function embedShard(
   const batch = Math.max(1, o.batch ?? 64);
   const mainTiers = o.mainTiers !== false;
 
-  const eligible = await store.embeddableCount({ mainTiers, minChars });
+  const eligible = await store.embeddableCount({ mainTiers, minChars, session: o.session });
   // --reset before the stats read, so the mismatch guard below sees the post-drop state
   // rather than refusing on vectors this run is about to discard anyway.
   if (o.reset && !o.dryRun) await store.dropVectors();
@@ -268,7 +269,7 @@ export async function embedShard(
                       `re-embed with ${p.id} by adding --reset (drops this shard's vectors table only)` };
   }
 
-  const todo = await store.unembedded({ limit: o.limit, mainTiers, minChars });
+  const todo = await store.unembedded({ limit: o.limit, mainTiers, minChars, session: o.session });
   if (o.dryRun || !todo.length)
     return { eligible, already, pending: todo.length, embedded: 0, failed: 0, dim: prior?.dim ?? 0 };
 
