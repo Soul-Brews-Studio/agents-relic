@@ -44,6 +44,9 @@ export function helpText(): string {
                   BM25. A separate MODE, never blended: measured here, FTS wins
                   known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.
                   [--overfetch 4] [--device mps]
+                  [--no-warn]  suppress the generic-query warning: fires when EVERY
+                  term you typed is common across the scoped corpus, meaning no term
+                  can anchor a search — never blocks the search or changes ranking.
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
                                --tree shows the SHAPE: which agents shared a workflow run
