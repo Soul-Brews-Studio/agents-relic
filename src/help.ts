@@ -102,6 +102,11 @@ export function helpText(): string {
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
+  probe   [--corpus claude-live] [--repo S] [--files 40] [--samples 3] [--json]
+                               what the noise rules WOULD drop, with samples of each
+                               rule's catches. Writes nothing. Run this after touching
+                               noise.ts — a rule that eats content still passes its
+                               unit tests; only real transcripts show it.
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
   backend [--probe]            which engine answers what, and how fast here
   banks                        bank names on this machine

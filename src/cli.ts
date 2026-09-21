@@ -300,6 +300,70 @@ async function recapTarget(arg: string | undefined): Promise<string> {
   return prev.id;
 }
 
+/*
+ * `relic probe` — what WOULD the noise rules drop, without writing an index.
+ *
+ * This existed first as a throwaway script in /tmp, written to check a PR that
+ * widened the binary-blob rule. It found that the widened rule flagged 678 events
+ * where the old one flagged 14, and that 664 of the difference were deep file paths,
+ * one-line JSON tool results and `rg` command lines — content the index exists to
+ * find. The PR's own tests were green throughout; only real data showed it.
+ *
+ * A check that can decide that belongs in the tool, not in /tmp. Every future change
+ * to noise.ts should be answerable with one command against real transcripts:
+ * how many events does each rule claim, and what do its catches actually look like?
+ */
+async function cmdProbe(f: Record<string, string | boolean>) {
+  const { discover, parseSince } = await import("./discover.js");
+  const { classify } = await import("./noise.js");
+  const corpus = f.corpus ? String(f.corpus).split(",") : ["claude-live"];
+  const files = Number(f.files ?? 40);
+  const samples = Number(f.samples ?? 3);
+  const chars = Number(f.chars ?? 110);
+  const repo = f.repo ? String(f.repo).toLowerCase() : null;
+
+  let found = discover(corpus, parseSince(f.since as string | undefined));
+  if (repo) found = found.filter(x => x.path.toLowerCase().includes(repo));
+  // Newest first: a rule regression shows up in what the machine is producing NOW,
+  // not in the oldest transcripts on disk.
+  found.sort((a, b) => b.mtime - a.mtime);
+  const take = files > 0 ? found.slice(0, files) : found;
+  if (!take.length) { console.error(`no files matched (corpus=${corpus.join(",")}${repo ? ` repo~${repo}` : ""})`); process.exit(1); }
+
+  const { parserFor } = await import("./sources.js");
+  let events = 0, skipped = 0;
+  const byRule = new Map<string, number>();
+  const shown = new Map<string, string[]>();
+  for (const x of take) {
+    let parsed; try { parsed = await parserFor(x.path)(x.path); } catch { continue; }
+    for (const e of parsed.events) {
+      events++;
+      const v = classify(e.text, e.role);
+      if (!v.skip) continue;
+      skipped++;
+      byRule.set(v.rule, (byRule.get(v.rule) ?? 0) + 1);
+      const list = shown.get(v.rule) ?? [];
+      if (list.length < samples) { list.push(`[${e.role}] ${e.text.replace(/\s+/g, " ").slice(0, chars)}`); shown.set(v.rule, list); }
+    }
+  }
+
+  if (outFmt(f) === "json") {
+    console.log(JSON.stringify({ files: take.length, events, skipped,
+      rules: [...byRule].map(([rule, n]) => ({ rule, n, pct: +(n / events * 100).toFixed(2), samples: shown.get(rule) ?? [] })) }, null, 2));
+    return;
+  }
+  console.log(`probe  ${fmt(take.length)} files · ${fmt(events)} events · ${fmt(skipped)} would be skipped ` +
+              `(${(skipped / Math.max(1, events) * 100).toFixed(1)}%)\n`);
+  for (const [rule, n] of [...byRule].sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${rule.padEnd(20)} ${String(fmt(n)).padStart(7)}  ${(n / events * 100).toFixed(2)}%`);
+    // The samples are the point. A count cannot tell you whether a rule is eating
+    // content; reading four of its catches can, in about ten seconds.
+    for (const x of shown.get(rule) ?? []) console.log(`      ${x}`);
+    console.log("");
+  }
+  console.log(`  read from disk, not the index — nothing was written.`);
+}
+
 async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   const r = await sessionRecap(id, {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
@@ -1701,6 +1765,7 @@ else if (cmd === "mcp") {
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
 else if (cmd === "recap") await cmdRecap(await recapTarget(pos[1]), f);
+else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

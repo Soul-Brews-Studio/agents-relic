@@ -265,3 +265,57 @@ describe("#37 — binary-blob widened from base64-only to any unbroken 120-char 
     expect(t.skippedNoise).toBe(0);
   });
 });
+
+/*
+ * The binary-blob rule after #50's review. The PR widened it to "any unbroken run of
+ * >= 120 non-whitespace characters", which is a LENGTH test rather than a blob test:
+ * measured on 7,067 real events it flagged 678 where the old regex flagged 14, and the
+ * 664-event difference was deep file paths, one-line JSON tool results and rg command
+ * lines — exactly the content the index exists to find.
+ */
+describe("#50 review — binary-blob names encodings instead of measuring length", () => {
+  const { isBlob } = require("../src/noise.js");
+
+  test("a base64 payload is a blob", () => {
+    expect(isBlob("[tool_result] " + "iVBORw0KGgoAAAANSUhEUg".repeat(8))).toBe(true);
+  });
+
+  test("a hex digest is a blob", () => {
+    expect(isBlob("[tool_result] " + "deadbeef".repeat(20))).toBe(true);
+  });
+
+  test("a JWT is a blob, including a minimal 17-character header", () => {
+    // eyJhbGciOiJIUzI1NiJ9 is {"alg":"HS256"} — the first pattern required 20 chars
+    // after eyJ and missed it.
+    expect(isBlob("eyJhbGciOiJIUzI1NiJ9." + "x".repeat(80) + "." + "y".repeat(30))).toBe(true);
+  });
+
+  /*
+   * The four shapes that made the widened rule unusable. Each one clears 120 unbroken
+   * characters and each one is content someone would search for.
+   */
+  test("a deep file path is NOT a blob", () => {
+    const p = "/opt/Code/github.com/laris-co/neo-oracle/wt/neo-jsonl-big-boss-16sep-wed2026/" +
+              "ψ/lab/agents-relic/src/store/lance.ts:/opt/Code/github.com/laris-co/neo-oracle/ψ/memory";
+    expect(p.length).toBeGreaterThan(120);
+    expect(isBlob(`[tool_result] ${p}`)).toBe(false);
+  });
+
+  test("a one-line JSON tool result is NOT a blob", () => {
+    const j = '{"id":"cli:agent:start","result":{"agent":{"agent":"codex","agent_status":"idle",' +
+              '"cwd":"/opt/Code/github.com/laris-co/neo-oracle","focus":true,"session":"abc123"}}}';
+    expect(j.length).toBeGreaterThan(120);
+    expect(isBlob(`[tool_result] ${j}`)).toBe(false);
+  });
+
+  test("a long rg command line is NOT a blob", () => {
+    const cmd = "rg -o --no-ignore -e '[a-z-]*opus-4[.-]6[a-z0-9-]*' -e 'Opus' " +
+                "~/.claude/projects/-opt-Code-github-com-laris-co-neo-oracle/*.jsonl --glob '!node_modules'";
+    expect(isBlob(`[tool_use Bash] {"command":"${cmd}"}`)).toBe(false);
+  });
+
+  test("base64url is deliberately not a shape — its alphabet is ordinary identifier text", () => {
+    // Flagged a measurement table and a filename dump when it was included.
+    expect(isBlob("[tool_result] " + "a_long-identifier_name-with-dashes".repeat(5))).toBe(false);
+  });
+});
