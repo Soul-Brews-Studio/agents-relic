@@ -334,3 +334,40 @@ def test_bank_of_hit():
     assert bank_of_hit("projects/github.com/laris-co/neo-oracle") == "projects"
     assert bank_of_hit("_unresolved") is None
     assert bank_of_hit("") is None
+
+
+def test_repo_key_must_not_echo_the_cwds_casing():
+    """One repo acquired three keys because repo_key_of echoed the cwd's casing, and
+    `--repo` filters that column exactly: 2,720 / 119 / 10 events across
+    DustBoy-Oracle, Dustboy-Oracle, dustboy-oracle. macOS hid it (one inode); Linux
+    splits it into three shard directories."""
+    from relicpy.repo import canonical_repo_key, repo_key_of, resolve_repo_key
+
+    # repo_key_of stays PURE and keeps echoing — that is its contract. If it ever
+    # canonicalises it has gained a filesystem dependency.
+    assert repo_key_of("/x/github.com/laris-co/DustBoy-Oracle") == "github.com/laris-co/DustBoy-Oracle"
+
+    once = canonical_repo_key("github.com/laris-co/DustBoy-Oracle")
+    assert canonical_repo_key(once) == once          # idempotent
+
+    # The fixture comes from repo_index() itself, not from a repo I happen to have.
+    # Hard-coding a repo name asserts about THIS machine's ghq tree — the same
+    # environment-dependence that already broke two earlier tests.
+    from relicpy.repo import repo_index
+    keys = [k for ks in repo_index().values() for k in ks]
+    if keys:
+        any_key = keys[0]
+        parts = any_key.split("/")
+        flipped = "/".join(parts[:2] + [p.upper() for p in parts[2:]])
+        resolved = {
+            resolve_repo_key(f"/opt/Code/{any_key}"),
+            resolve_repo_key(f"/opt/Code/{flipped}/wt/thing"),
+            resolve_repo_key(f"/Users/someone/Code/{any_key.lower()}/x"),
+        }
+        assert len(resolved) == 1
+        assert resolved.pop() == any_key       # and it is the tree's OWN spelling
+
+    # A repo this machine does not have passes through UNCHANGED — inventing a spelling
+    # would stop the key matching rows already written from a peer root.
+    assert resolve_repo_key("/opt/Code/github.com/nowhere/not-a-real-repo-xyz") \
+        == "github.com/nowhere/not-a-real-repo-xyz"

@@ -137,3 +137,56 @@ describe("bankOfHit — the field that does not exist", () => {
     expect(bankOfHit("")).toBeUndefined();
   });
 });
+
+import { canonicalRepoKey, repoIndex, repoKeyOf, resolveRepoKey } from "../src/repo.js";
+
+describe("#44 — repo_key must not echo the cwd's casing", () => {
+  /*
+   * One repo acquired three keys because repoKeyOf echoed whatever the session's cwd
+   * used, and `--repo` filters that column exactly:
+   *
+   *     2,720  github.com/laris-co/DustBoy-Oracle
+   *       119  github.com/laris-co/Dustboy-Oracle
+   *        10  github.com/laris-co/dustboy-oracle
+   *
+   * macOS hid it — all three resolved to ONE inode. On Linux it splits into three
+   * shard directories holding a third of the history each.
+   */
+  test("repoKeyOf stays PURE and keeps echoing — that is its contract", () => {
+    // If this ever canonicalises, the function has quietly gained a filesystem
+    // dependency and is no longer host-independent or trivially testable.
+    expect(repoKeyOf("/x/github.com/laris-co/DustBoy-Oracle"))
+      .toBe("github.com/laris-co/DustBoy-Oracle");
+  });
+
+  test("canonicalRepoKey is idempotent", () => {
+    const once = canonicalRepoKey("github.com/laris-co/DustBoy-Oracle");
+    expect(canonicalRepoKey(once)).toBe(once);
+  });
+
+  test("every casing of one repo resolves to the SAME key", () => {
+    /*
+     * The fixture comes from repoIndex() itself, not from a repo I happen to have.
+     * Hard-coding `dustboy-oracle` asserts about THIS machine's ghq tree — the same
+     * environment-dependence that already broke the --source-path and homes tests.
+     */
+    const anyKey = [...repoIndex().values()].flat()[0];
+    if (!anyKey) return;                       // no ghq tree here; nothing to assert
+    const flip = (k: string) => k.split("/").map((seg, i) =>
+      i < 2 ? seg : seg.toUpperCase()).join("/");
+    const keys = new Set([
+      resolveRepoKey(`/opt/Code/${anyKey}`),
+      resolveRepoKey(`/opt/Code/${flip(anyKey)}/wt/thing`),
+      resolveRepoKey(`/Users/someone/Code/${anyKey.toLowerCase()}/x`),
+    ]);
+    expect(keys.size).toBe(1);
+    expect([...keys][0]).toBe(anyKey);         // and it is the tree's OWN spelling
+  });
+
+  test("a repo this machine does not have passes through UNCHANGED", () => {
+    // Peer roots carry paths from another host. Inventing a spelling for them would be
+    // worse than echoing — the key would stop matching the rows already written.
+    expect(resolveRepoKey("/opt/Code/github.com/nowhere/not-a-real-repo-xyz"))
+      .toBe("github.com/nowhere/not-a-real-repo-xyz");
+  });
+});
