@@ -433,13 +433,14 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms } = await searchEvents(q, {
+  const { hits, shards: searched, ms, generic } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
     org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
     allTiers: Boolean(f["all-tiers"] || f.tier),
+    warnGeneric: !f["no-warn"],
   });
 
   const filters: Record<string, string> = {};
@@ -449,6 +450,21 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     shards: searched, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
             top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true,
   }, dataRoot);
+
+  /*
+   * ACTIONABLE, NOT JUST "your query is generic" — names the rarest term the user
+   * already typed (so they know which word to search alone) and lists the ways out.
+   * stderr, so `--json`/`--jsonl`/`--plain` piped elsewhere stay uncontaminated;
+   * never blocks the search or reorders hits — see query.ts for the measurements.
+   */
+  if (generic?.warn) {
+    console.error(`\n  ⚠ generic query — every term is common across this corpus, so BM25 cannot` +
+                  ` isolate one session (${generic.terms.map(t => `${t.term}=${Math.round(t.df * 100)}%`).join(", ")}).`);
+    console.error(`    Looking for ONE specific session? Search "${generic.rarest}" alone — it is` +
+                  ` the rarest of your terms — or a more unique literal still: an id, filename, error string.`);
+    console.error(`    Or narrow the scope: --repo/--since/--worktree.  Or try --semantic for a paraphrase.`);
+    console.error(`    Suppress this warning: --no-warn`);
+  }
 
   const top = hits.slice(0, limit);
   const mode = outFmt(f);

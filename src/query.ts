@@ -38,6 +38,12 @@ export interface SearchOpts extends Scope {
   allTiers?: boolean;
   since?: string; until?: string;   // 7d / 12h / 30m / 2026-09-01 / full ISO
   prose?: boolean;
+  /**
+   * Run the generic-query heuristic (see checkGenericQuery). Default true — the
+   * check is cheap relative to the search it rides along with, so opting OUT is the
+   * flag, not opting in.
+   */
+  warnGeneric?: boolean;
 }
 
 /**
@@ -112,6 +118,173 @@ export interface SearchResult {
   available: number;       // shards that matched the scope
   ms: number;
   total: number;           // hits before the limit slice
+  generic?: GenericCheck;  // set when warnGeneric ran; undefined if skipped or < 2 shards
+}
+
+/*
+ * GENERIC-QUERY WARNING — issue #32.
+ *
+ * The failure this catches: a query built from ordinary English topic words (e.g.
+ * "facebook transcribe") over a corpus of 1,000+ shards returns thousands of hits,
+ * and the one session the user actually wants is outranked by whatever document
+ * happens to repeat a query word the most — BM25 finds topics, not specific facts
+ * (see help.ts). A warning belongs here because the fix is a workflow change
+ * ("search a rarer literal instead"), not a ranking change.
+ *
+ * REJECTED: warn when `total` (raw hit count) crosses a threshold.
+ *
+ * Measured against 288 real queries in this repo's own `~/.relic/trace.jsonl`:
+ * hits run median 259, p75 2,319, p90 8,626 — a count threshold anywhere useful
+ * fires on 20-55% of ALL searches, which is a banner, not a warning. Worse, the
+ * correlation runs backwards: short queries (<=25 chars, n=184) had a median of
+ * 123 hits; long queries (>25 chars, n=104) had a median of 1,392 — 11x MORE, not
+ * fewer, because FTS unions on every extra term, so a longer query returns a wider
+ * candidate set almost by construction. The six widest queries ever logged here are
+ * all multi-word common-English strings ("herdr pane run agent prompt
+ * recent-unwrapped" — 95,529 hits); the narrowest are single rare identifiers
+ * ("VoiceProcessingEnabled" — 1 hit). Query SHAPE carries the signal; the result
+ * count does not, and penalizes longer queries in the wrong direction.
+ *
+ * THE SIGNAL USED INSTEAD: is every content term in the query, taken alone, common
+ * across the scoped corpus? A query is only as specific as its RAREST term — one
+ * rare identifier anchors an otherwise-generic sentence, and BM25's own IDF already
+ * rewards it. So this samples the ACTUAL scoped shards (respecting --repo/--bank,
+ * same population the real search will read) and asks, per content term: does a
+ * cheap probe search for that term ALONE come back "full" (>= GENERIC_PROBE_LIMIT
+ * hits) in most of the sample?
+ *
+ * Measured on this repo's live index (1,136 shards, `.tmp/probe4.ts` at the PR that
+ * introduced this, 40-shard stratified sample, probe limit 3):
+ *
+ *   term                      df fraction   verdict
+ *   VoiceProcessingEnabled         0.00     rare (identifier)
+ *   structured_output_mode         0.00     rare (identifier)
+ *   devicectl                      0.00     rare (identifier)
+ *   relic                          0.00     rare (this index predates the tool)
+ *   herdr                          0.07     rare (specific tool name)
+ *   inserts                        0.10     rare (narrow technical noun)
+ *   ambiguous                      0.38     common
+ *   merge                          0.57     common
+ *   facebook                       0.30     common
+ *   transcribe                     0.15     borderline (see caveat below)
+ *   search / run / agent / prompt  0.55-0.72 common (plain English verbs/nouns)
+ *
+ * Clear gap between the rare cluster (0.00-0.10) and the common cluster (0.30+),
+ * so GENERIC_RARE_DF = 0.15 sits in that gap. On this data the check correctly
+ * stays silent for "ambiguous merge inserts" (inserts=0.10 anchors it) and for any
+ * single rare identifier, and fires for "herdr pane run agent prompt
+ * recent-unwrapped" (every remaining term >= 0.55) — the two ends of the measured
+ * range. "the"/"in"/"of" never reach the probe at all: they are stopwords in
+ * `contentTerms`, matching the fact that the FTS index itself returns 0 hits for
+ * them (measured: `t.search("the", "fts")` on a live shard — the tokenizer drops
+ * them, so counting them toward rarity would misclassify every stopword as
+ * "specific").
+ *
+ * MIN TERM COUNT IS 2, NOT NAT'S PROPOSED 3: the issue's own motivating failure —
+ * "facebook transcribe" — is two words. Gating on 3 would never fire on the report
+ * that opened this issue. A single term is already as narrow as a query can get
+ * (nothing to union against), so 2 is the smallest count where the "wide union of
+ * common terms" failure mode can occur at all.
+ *
+ * CAVEAT, stated plainly rather than hidden: this environment's live index is not
+ * the one the issue was measured against, so "facebook transcribe" itself does not
+ * reproduce the reported 3,400+ hits here (transcribe sits at 0.15, borderline
+ * against the 0.15 cutoff) — the same gap nazt flagged for the original 3,400+
+ * figure. The threshold is chosen from the measured rare/common gap on THIS index,
+ * not from reproducing one specific historical count.
+ *
+ * COST: bounded regardless of corpus size. A stratified sample of up to 40 shards
+ * (never the full scoped set), probe limit 3 (search can stop looking once it has
+ * 3 hits), at most GENERIC_MAX_TERMS_CHECKED terms, same concurrency cap pattern as
+ * the real fan-out. Measured: 27-304 ms across the queries above, against a real
+ * search that is itself hundreds of ms to several seconds on this corpus.
+ */
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do", "does",
+  "for", "from", "had", "has", "have", "how", "i", "if", "in", "is", "it", "its",
+  "just", "me", "my", "no", "not", "of", "on", "or", "our", "so", "that", "the",
+  "their", "them", "then", "there", "this", "to", "was", "we", "were", "what",
+  "when", "where", "which", "who", "why", "will", "with", "you", "your",
+]);
+
+/** Content terms a genericity check should consider — pure, no I/O, order-preserving. */
+export function contentTerms(q: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of q.split(/\s+/)) {
+    const t = raw.replace(/[^\w-]/g, "");
+    if (t.length < 2) continue;
+    const low = t.toLowerCase();
+    if (STOPWORDS.has(low) || seen.has(low)) continue;
+    seen.add(low);
+    out.push(t);
+  }
+  return out;
+}
+
+export interface GenericCheck {
+  warn: boolean;
+  terms: { term: string; df: number }[];   // df = fraction of the sample where the term probed "full"
+  rarest: string | null;                   // the term that most anchors the query, if any were checked
+}
+
+const GENERIC_MIN_TERMS = 2;
+const GENERIC_RARE_DF = 0.15;
+const GENERIC_PROBE_LIMIT = 3;
+const GENERIC_SAMPLE_SHARDS = 40;
+const GENERIC_MAX_TERMS_CHECKED = 8;
+const GENERIC_CAP = 12;
+
+/** Fraction of `sample` where a probe search for `term` alone comes back "full". */
+async function dfFraction(term: string, sample: { dir: string }[]): Promise<number> {
+  if (!sample.length) return 0;
+  let common = 0, next = 0;
+  await Promise.all(Array.from({ length: Math.min(GENERIC_CAP, sample.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= sample.length) return;
+      try {
+        const store = await LanceStore.open(sample[i].dir);
+        const hits = await store.search(term, { limit: GENERIC_PROBE_LIMIT, mainTiers: true });
+        if (hits.length >= GENERIC_PROBE_LIMIT) common++;
+      } catch { /* a shard mid-write can throw; same tolerance as the real fan-out */ }
+    }
+  }));
+  return common / sample.length;
+}
+
+/**
+ * Warn when a query cannot plausibly isolate one session — see the block comment
+ * above for the reasoning and the measurements behind the constants. Never blocks a
+ * search, never changes ranking; a caller decides whether to show it.
+ */
+/**
+ * The decision itself, split out as a PURE function — everything above it is about
+ * getting a `{term, df}[]` cheaply; this is the only part with a threshold to get
+ * right, so it is the only part `pure.test.ts` needs a real index to avoid testing.
+ */
+export function decideGeneric(results: { term: string; df: number }[]): GenericCheck {
+  if (!results.length) return { warn: false, terms: [], rarest: null };
+  const rarest = results.reduce((a, b) => (a.df <= b.df ? a : b));
+  const warn = results.length >= GENERIC_MIN_TERMS && results.every(r => r.df > GENERIC_RARE_DF);
+  return { warn, terms: results, rarest: rarest.term };
+}
+
+export async function checkGenericQuery(q: string, shards: { dir: string }[]): Promise<GenericCheck | null> {
+  const terms = contentTerms(q).slice(0, GENERIC_MAX_TERMS_CHECKED);
+  if (terms.length < GENERIC_MIN_TERMS || !shards.length) return null;
+
+  // Stratified, not "first N" — shards are grouped by bank in listing order, and the
+  // first N alphabetically undercounts every bank after the first (measured: the
+  // first 24 of 1,136 shards, all one small bank, probed 0/24 for "herdr" and
+  // "pane" both — terms this index otherwise holds thousands of times).
+  const step = Math.max(1, Math.floor(shards.length / GENERIC_SAMPLE_SHARDS));
+  const sample = shards.filter((_, i) => i % step === 0).slice(0, GENERIC_SAMPLE_SHARDS);
+
+  const results: { term: string; df: number }[] = [];
+  for (const term of terms) results.push({ term, df: await dfFraction(term, sample) });
+
+  return decideGeneric(results);
 }
 
 export async function searchEvents(q: string, o: SearchOpts = {}): Promise<SearchResult> {
@@ -213,8 +386,12 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   hits.length = 0;
   hits.push(...deduped);
 
+  // Scoped to the SAME shards the search itself read — a warning about --repo neo
+  // should be relative to neo's corpus, not the whole index.
+  const generic = o.warnGeneric === false ? undefined : (await checkGenericQuery(q, shards)) ?? undefined;
+
   return { hits, shards: searched, available: shards.length,
-           ms: Math.round(performance.now() - t0), total: hits.length };
+           ms: Math.round(performance.now() - t0), total: hits.length, generic };
 }
 
 export interface SemanticOpts extends Scope {
