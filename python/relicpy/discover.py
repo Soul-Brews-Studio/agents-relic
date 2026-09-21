@@ -226,8 +226,32 @@ def _walk_memory(root, since_ms, out, key, parser):
             out.append(Found(p, project, "memory", key, "", None, None, st[0], st[1], parser))
 
 
+def _walk_claude_home(home, since_ms, out, src_key, parser) -> None:
+    """Every `projects*` root inside ONE agent home, under one source and one bank.
+
+    The builtins name three roots inside ~/.claude by hand — and that is how
+    `projects-1sep-tue2026` went missing once already: it lived only in a sources.json
+    that got deleted, so a rebuild indexed two of three roots and reported success.
+    Enumerating the home removes the hand-maintained list, and a new snapshot directory
+    is picked up without a code change.
+
+    `projects` FIRST when present, so the live root is scanned before any snapshot and
+    a killed run has the most useful half.
+    """
+    try:
+        roots = [d for d in os.listdir(home)
+                 if (d == "projects" or d.startswith("projects-"))
+                 and os.path.isdir(os.path.join(home, d))]
+    except OSError:
+        return
+    roots.sort(key=lambda d: (d != "projects", d))
+    for r in roots:
+        _walk_claude(os.path.join(home, r), since_ms, out, src_key, parser)
+
+
 _WALKERS = {
-    "claude-tiers": _walk_claude, "flat": _walk_flat, "omp": _walk_omp,
+    "claude-tiers": _walk_claude, "claude-home": _walk_claude_home,
+    "flat": _walk_flat, "omp": _walk_omp,
     "vault": _walk_vault, "vaults": _walk_vaults, "memory": _walk_memory,
 }
 
