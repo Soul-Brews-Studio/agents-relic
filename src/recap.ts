@@ -24,6 +24,7 @@ export interface SessionRecap {
   roles: { role: string; n: number }[];
   asked: RecapTurn[];               // the human's turns, boilerplate removed
   askedOmitted: number;             // how many turns were dropped as boilerplate
+  askedTotal: number;               // how many there were before the tail was taken
   tools: { name: string; n: number }[];
   files: { path: string; n: number }[];
   endedWith: string;                // the last assistant turn
@@ -88,10 +89,23 @@ export function isHarnessTurn(t: string): boolean {
 
 const clean = (t: string) => t.replace(/\s+/g, " ").trim();
 
+/*
+ * How many asked-turns a recap shows when nobody said.
+ *
+ * There was no cap at all, and on a six-day session that printed 332 turns — roughly
+ * 6,000 tokens, opening with a question asked six days before the reader cares. The
+ * recent end is the end anyone means: a recap is read to answer "what just happened".
+ *
+ * 20 matches `tail`'s default window, so the two halves of a handoff line up.
+ * `--limit 0` still means all of it.
+ */
+export const RECAP_DEFAULT_LIMIT = 20;
+
 export async function sessionRecap(
   idOrPrefix: string,
   o: Scope & { limit?: number; allTiers?: boolean; chars?: number } = {},
 ): Promise<SessionRecap | null> {
+  const limit = o.limit ?? RECAP_DEFAULT_LIMIT;
   const found = await resolveSession(idOrPrefix, o);
   const rows = found?.rows ?? [];
   if (!rows.length) return null;
@@ -151,8 +165,13 @@ export async function sessionRecap(
     model: String(parent.model ?? ""), gitBranch: String((parent as any).git_branch ?? ""),
     transcripts: rows.length, events: events.length,
     roles: [...roles].sort((a, b) => b[1] - a[1]).map(([role, n]) => ({ role, n })),
-    asked: o.limit ? asked.slice(0, o.limit) : asked,
-    askedOmitted,
+    /*
+     * THE TAIL, NOT THE HEAD. `--limit 6` used to return the six OLDEST turns, which
+     * is the opposite of what limiting a recap means to anyone who types it — the
+     * first six turns of a long session are its setup, not its state.
+     */
+    asked: limit > 0 ? asked.slice(-limit) : asked,
+    askedOmitted, askedTotal: asked.length,
     tools: desc(tools).slice(0, 12),
     files: [...files].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([path, n]) => ({ path, n })),
     endedWith,

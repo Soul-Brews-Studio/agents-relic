@@ -281,7 +281,11 @@ async function recapTarget(arg: string | undefined): Promise<string> {
     console.error(`  relic now --all   lists what is running, anywhere`);
     process.exit(1);
   }
-  console.log(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
+  // not data. On stdout it lands inside `--json` output and makes it unparseable:
+  // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
+  // line was an arrow. Found by piping the new default into jq.
+  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
   return prev.id;
 }
 
@@ -309,9 +313,25 @@ async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   console.log(`  ${r.roles.map(x => `${x.role} ${fmt(x.n)}`).join(" · ")}`);
 
   if (r.asked.length) {
-    console.log(`\nWHAT WAS ASKED  (${fmt(r.asked.length)} turns` +
+    const trimmed = r.askedTotal - r.asked.length;
+    console.log(`\nWHAT WAS ASKED  (last ${fmt(r.asked.length)} of ${fmt(r.askedTotal)} turns` +
                 (r.askedOmitted ? `, ${fmt(r.askedOmitted)} harness turns omitted` : "") + `)\n`);
     for (const t of r.asked) console.log(`  ${localDateTime(t.ts).slice(11)}  ${t.text}`);
+    /*
+     * SAY HOW TO GET THE REST, IN A FORM THAT CAN BE RUN.
+     *
+     * The reader of a recap is usually a model, and a truncated list it cannot widen
+     * is worse than no list — it will either treat 20 turns as the whole session or
+     * burn a turn asking the human how to see more. One runnable line closes both.
+     * Printed only when something was actually withheld.
+     */
+    if (trimmed > 0) {
+      const id = r.sessionUuid.slice(0, 8);
+      console.log(`\n  ${fmt(trimmed)} earlier turns not shown.`);
+      console.log(`    relic recap ${id} --limit 60     more`);
+      console.log(`    relic recap ${id} --limit 0      all of them`);
+      console.log(`    relic tail  ${id} -n 20 --handoff  the same turns WITH my replies, for a /new`);
+    }
   } else if (r.askedOmitted) {
     // Saying WHY it is empty matters: "no turns" and "every turn was boilerplate" are
     // different facts and only one of them means the session had no human input.
@@ -791,7 +811,11 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
       process.exit(1);
     }
     file = prev.file;
-    console.log(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+    // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
+  // not data. On stdout it lands inside `--json` output and makes it unparseable:
+  // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
+  // line was an arrow. Found by piping the new default into jq.
+  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
