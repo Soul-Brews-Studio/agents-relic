@@ -280,9 +280,45 @@ def looks_like_id(s: str) -> bool:
 TRANSCRIPT_TIERS = ["session", "subagent", "workflow_agent"]
 
 
+def group_transcripts(rows: list[dict]) -> list[dict]:
+    """Fold a flat transcript list into one row per conversation TREE.
+
+    Ported from `groupTranscripts` in src/query.ts — see issue #46. Without this,
+    `sessions` counts FILES: one fan-out that spawned 11 workflow agents reads as 12
+    sessions, all sharing a uuid, and the listing fills with agent prompts instead of
+    the human's.
+
+    The parent row represents the group — the `session` tier row, falling back to the
+    earliest transcript in the tree so a session is never silently dropped when it was
+    indexed without its own parent file.
+
+    KEYED ON `(repo, session_uuid)`, NOT `session_uuid` ALONE. `session_uuid` is not a
+    key across shards: the three Claude roots overlap by 742 sessions on this machine's
+    index, so grouping on the uuid alone would fold two DIFFERENT people's sessions
+    (same uuid, different repo/bank) into one tree. `src/report.ts` already learned
+    this — its `groupSessions` keys on the pair — while `groupTranscripts` in
+    `src/query.ts` gets away with the uuid alone only because `listSessions` there
+    scopes to one shard set before grouping. This port does not make that assumption.
+    """
+    by: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        k = (str(r.get("repo") or ""), str(r.get("session_uuid") or r.get("file_path") or ""))
+        by.setdefault(k, []).append(r)
+    out: list[dict] = []
+    for group in by.values():
+        group.sort(key=lambda r: str(r.get("started_at") or ""))
+        parent = next((r for r in group if r.get("tier") == "session"), group[0])
+        out.append({
+            **parent,
+            "children": len(group) - 1,
+            "tree_events": sum(int(r.get("event_count") or 0) for r in group),
+        })
+    return out
+
+
 def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str] = None,
                   worktree: Optional[str] = None, limit: int = 40,
-                  tiers: Optional[list[str]] = None) -> dict:
+                  tiers: Optional[list[str]] = None, group: bool = True) -> dict:
     """Newest first, filtered on the session's OWN first timestamp — not file mtime.
 
     An old session that got one new line stays old, which is what someone asking
@@ -299,6 +335,15 @@ def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str
 
     So the unfiltered answer was off by 112x, and the daily histogram showed three
     enormous spikes that were vault INDEXING runs, not activity.
+
+    GROUPING, BY DEFAULT — see #46. A conversation is a TREE: one `session` transcript
+    plus whatever `subagent` and `workflow_agent` transcripts it spawned, all sharing a
+    uuid. Ungrouped, `sessions` counts files, so a fan-out that spawned 11 workflow
+    agents read as 12 sessions instead of 1 — measured on this index, 1,248 transcripts
+    collapse to 390 real conversations over 7 days. `group=False` (the CLI's
+    `--all-tiers`) returns one row per transcript instead, with `children` and
+    `tree_events` filled in trivially (0 / its own event_count) so callers can rely on
+    both fields either way.
     """
     rows: list[dict] = []
     for sh in pick_shards(scope):
@@ -319,9 +364,15 @@ def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str
         rows = [r for r in rows if (r.get("started_at") or "") <= hi]
     if worktree:
         rows = [r for r in rows if worktree in (r.get("worktree") or "")]
-    rows.sort(key=lambda r: r.get("started_at") or "", reverse=True)
     events = sum(int(r.get("event_count") or 0) for r in rows)
-    return {"rows": rows[:limit], "total": len(rows), "events": events}
+    if group:
+        grouped = group_transcripts(rows)
+    else:
+        grouped = [{**r, "children": 0, "tree_events": int(r.get("event_count") or 0)}
+                  for r in rows]
+    grouped.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    return {"rows": grouped[:limit], "total": len(grouped), "transcripts": len(rows),
+           "events": events}
 
 
 def find_session_by_id(session_id: str, scope: Scope) -> list[dict]:

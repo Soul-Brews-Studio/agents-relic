@@ -272,21 +272,23 @@ def cmd_banks(a: argparse.Namespace) -> int:
 def cmd_sessions(a) -> int:
     from .query import list_sessions, name_of
     r = list_sessions(_scope(a), since=a.since, until=a.until,
-                      worktree=a.worktree, limit=a.limit)
+                      worktree=a.worktree, limit=a.limit, group=not a.all_tiers)
     if a.count:
-        print(f"{r['total']} sessions · {r['events']:,} events")
+        print(f"{r['total']} sessions")
         return 0
     if _json(a):
-        print(json.dumps({"total": r["total"], "events": r["events"], "rows": r["rows"]},
+        print(json.dumps({"total": r["total"], "transcripts": r["transcripts"],
+                          "events": r["events"], "rows": r["rows"]},
                          indent=2, default=str))
         return 0
     if not r["total"]:
         print("no sessions match those filters")
         return 0
-    print(f"{r['total']:,} sessions · {r['events']:,} events\n")
+    print(f"{r['total']:,} sessions · {r['transcripts']:,} transcripts · {r['events']:,} events\n")
     for x in r["rows"]:
-        print(f"{_local(x.get('started_at') or '')}  {str(x.get('session_uuid'))[:8]}  "
-              f"{int(x.get('event_count') or 0):>6} ev  {x.get('repo', '')}"
+        kids = f" +{x['children']}" if x.get("children") else ""
+        print(f"{_local(x.get('started_at') or '')}  {str(x.get('session_uuid'))[:8]}{kids:<5}  "
+              f"{int(x.get('tree_events') or 0):>6} ev  {x.get('repo', '')}"
               f"{' [' + x['worktree'] + ']' if x.get('worktree') else ''}")
         print(f"    {' '.join(name_of(x).split())[:110]}")
     if r["total"] > len(r["rows"]):
@@ -850,7 +852,9 @@ def cmd_dig(a) -> int:
     third tier (workflow_agent) is one directory deeper than an obvious glob reaches.
     """
     from .query import list_sessions, name_of
-    r = list_sessions(_scope(a), since=a.since, limit=a.count)
+    # group=False — dig's contract is one row per TRANSCRIPT, "tier" and all, not a
+    # collapsed tree (see #46's groupTranscripts, which this deliberately opts out of).
+    r = list_sessions(_scope(a), since=a.since, limit=a.count, group=False)
     out = [{
         "sessionId": str(x.get("session_uuid"))[:12],
         "repoName": str(x.get("repo") or "").split("/")[-1],
@@ -931,6 +935,8 @@ def main(argv: list[str] | None = None) -> int:
     ss.add_argument("--since"); ss.add_argument("--until"); ss.add_argument("--worktree")
     ss.add_argument("--count", action="store_true")
     ss.add_argument("--limit", type=int, default=40)
+    ss.add_argument("--all-tiers", action="store_true",
+                    help="one row per transcript instead of one per session tree")
     ss.set_defaults(func=cmd_sessions)
 
     so = sub.add_parser("session", parents=[common],

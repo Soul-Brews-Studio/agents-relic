@@ -6,7 +6,7 @@ found by hand. A port that does not carry them forward gets to rediscover all of
 """
 
 from relicpy.models import DEFAULT_BANK
-from relicpy.query import dedupe_hits, group_by_bank, max_iso, session_id_of_path
+from relicpy.query import dedupe_hits, group_by_bank, group_transcripts, max_iso, session_id_of_path
 from relicpy.models import ShardStat
 from relicpy.repo import repo_key_of, shard_dir_for
 
@@ -155,3 +155,60 @@ class TestShardPaths:
         a = repo_key_of("/opt/Code/github.com/laris-co/neo-oracle")
         b = repo_key_of("/Users/someone/Code/github.com/laris-co/neo-oracle/wt/x")
         assert a == b == "github.com/laris-co/neo-oracle"
+
+
+class TestGroupTranscripts:
+    """Ported from `groupTranscripts` in src/query.ts — see issue #46.
+
+    Without this a session that spawned N children reads as N+1 unrelated rows, each
+    with its own event count, sorted into the list by their own timestamps.
+    """
+
+    def _row(self, repo, uuid, tier, started, events, file_path=None):
+        return {"repo": repo, "session_uuid": uuid, "tier": tier,
+               "started_at": started, "event_count": events,
+               "file_path": file_path or f"/x/{uuid}.jsonl"}
+
+    def test_a_parent_with_two_children_collapses_to_one_row(self):
+        rows = [
+            self._row("github.com/a/b", "u1", "session", "2026-09-01T00:00:00Z", 10),
+            self._row("github.com/a/b", "u1", "subagent", "2026-09-01T00:01:00Z", 3),
+            self._row("github.com/a/b", "u1", "workflow_agent", "2026-09-01T00:02:00Z", 5),
+        ]
+        out = group_transcripts(rows)
+        assert len(out) == 1
+        assert out[0]["children"] == 2
+        assert out[0]["tree_events"] == 18
+        assert out[0]["tier"] == "session"  # the parent row represents the group
+
+    def test_missing_parent_falls_back_to_the_earliest_child(self):
+        # Indexed without its own `session` row — a tree is never silently dropped.
+        rows = [
+            self._row("github.com/a/b", "u1", "subagent", "2026-09-01T00:05:00Z", 3),
+            self._row("github.com/a/b", "u1", "subagent", "2026-09-01T00:01:00Z", 4),
+        ]
+        out = group_transcripts(rows)
+        assert len(out) == 1
+        assert out[0]["children"] == 1
+        assert out[0]["started_at"] == "2026-09-01T00:01:00Z"
+
+    def test_unrelated_sessions_stay_separate(self):
+        rows = [
+            self._row("github.com/a/b", "u1", "session", "2026-09-01T00:00:00Z", 10),
+            self._row("github.com/a/b", "u2", "session", "2026-09-02T00:00:00Z", 7),
+        ]
+        out = group_transcripts(rows)
+        assert len(out) == 2
+        assert {r["children"] for r in out} == {0}
+
+    def test_same_uuid_different_repo_does_not_merge(self):
+        # session_uuid is not a key ACROSS shards — the caveat this issue calls out.
+        # Two different repos sharing a uuid (overlapping banks) must stay two trees,
+        # not one with a doubled event count.
+        rows = [
+            self._row("github.com/a/one", "same", "session", "2026-09-01T00:00:00Z", 10),
+            self._row("github.com/a/two", "same", "session", "2026-09-01T00:00:00Z", 20),
+        ]
+        out = group_transcripts(rows)
+        assert len(out) == 2
+        assert {r["tree_events"] for r in out} == {10, 20}
