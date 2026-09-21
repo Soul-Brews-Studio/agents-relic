@@ -19,7 +19,7 @@ const HOME = homedir();
 export interface SourceDef {
   key: string;
   path: string;
-  walk: "claude-tiers" | "flat" | "omp" | "vault" | "vaults" | "hermes" | "memory";   // how to find files under `path`
+  walk: "claude-tiers" | "claude-home" | "flat" | "omp" | "vault" | "vaults" | "hermes" | "memory";   // how to find files under `path`
   parser: Parser;
   enabled: boolean;                // default; overridable by config and --corpus
   note: string;
@@ -34,6 +34,59 @@ export interface SourceDef {
    * time. See uidOf in types.ts before changing anything here.
    */
   bank?: string;
+}
+
+/**
+ * AN AGENT HOME, declared in config — the axis the builtin sources get wrong.
+ *
+ * Claude Code takes its home from CLAUDE_CONFIG_DIR, and the binary is unambiguous
+ * about the rule (v2.1.278):
+ *
+ *     function s(){ return process.env.CLAUDE_CONFIG_DIR }
+ *     (s() ?? join(homedir(), ".claude")).normalize("NFC")
+ *
+ * ONE path, not a list, NFC-normalised. Codex does the same with CODEX_HOME. So a home
+ * is a single identity — and the right thing for a BANK to be.
+ *
+ * The builtins split one home across three banks (`projects`, `projects-archive`,
+ * `projects-1sep-tue2026` are all roots inside ~/.claude) while giving another whole
+ * home a single bank (`peer-projects`). That axis cannot express "index this other
+ * home", which is why ~/.claude-neo sat on this machine with real sessions and zero
+ * indexed rows.
+ *
+ * A declared home expands to ONE source per reading, each with its own bank, and the
+ * `claude-home` walk covers every `projects*` root inside it. That keeps one bank per
+ * home WITHOUT relaxing the duplicate-bank guard — two sources sharing a bank is the
+ * exact shape that guard exists to catch, and widening it to fit this would remove a
+ * check that already caught a real incident.
+ *
+ *   ~/.relic/sources.json
+ *   { "homes": [ { "key": "claude-neo", "path": "~/.claude-neo", "agent": "claude" },
+ *                { "key": "claude-nat", "path": "/Users/nat/.claude" } ] }
+ */
+export interface HomeDef { key: string; path: string; agent?: "claude" | "codex" }
+
+/** `~` is the only expansion — a home path is written by a human, in a JSON file. */
+function expandHome(p: string): string {
+  return p.startsWith("~/") ? join(HOME, p.slice(2)) : p;
+}
+
+/**
+ * The agent homes this machine's ENVIRONMENT points at, whether or not they are
+ * declared. Reported by `relic sources`, never acted on silently.
+ *
+ * A set CLAUDE_CONFIG_DIR is the case that must not be quiet: relic would index
+ * ~/.claude, find whatever is there, and print a clean summary for the wrong home.
+ */
+export function envHomes(): { agent: string; env: string; path: string; isDefault: boolean }[] {
+  const out = [];
+  const cc = process.env.CLAUDE_CONFIG_DIR;
+  if (cc) out.push({ agent: "claude", env: "CLAUDE_CONFIG_DIR", path: cc.normalize("NFC"),
+                     isDefault: cc.normalize("NFC") === join(HOME, ".claude") });
+  const cx = process.env.CODEX_HOME;
+  if (cx) out.push({ agent: "codex", env: "CODEX_HOME", path: cx,
+                     isDefault: cx === join(HOME, ".codex") });
+  return out;
 }
 
 /** A source's bank, defaulting to its key. The only place this fallback lives. */
@@ -232,6 +285,31 @@ export function loadSources(): SourceDef[] {
     for (const [k, v] of Object.entries(cfg.path ?? {})) {
       const s = out.find(x => x.key === k);
       if (s && typeof v === "string") { s.path = v; s.enabled = true; }
+    }
+    /*
+     * Homes expand BEFORE `add`, so an explicit `add` entry can still override one by
+     * key — the dup guard keeps the first match, and hand-written beats derived.
+     */
+    for (const h of cfg.homes ?? []) {
+      const key = String(h.key ?? "");
+      const path = expandHome(String(h.path ?? ""));
+      if (!key || !path) continue;
+      const agent = h.agent === "codex" ? "codex" : "claude";
+      if (agent === "codex") {
+        out.push({ key, path: join(path, "sessions"), walk: "flat", parser: parseCodex,
+                   enabled: h.enabled !== false, bank: key,
+                   note: `declared Codex home ${path}` });
+        continue;
+      }
+      // Transcripts: every `projects*` root inside the home, ONE source, ONE bank.
+      out.push({ key, path, walk: "claude-home", parser: parseClaude,
+                 enabled: h.enabled !== false, bank: key,
+                 note: `declared Claude home ${path} — all projects* roots` });
+      // Memory is a different KIND of thing, so a different bank, exactly as the
+      // builtin claude-memory is a second reading of ~/.claude/projects.
+      out.push({ key: `${key}-memory`, path: join(path, "projects"), walk: "memory",
+                 parser: parseMemory, enabled: h.enabled !== false, bank: `${key}-memory`,
+                 note: `declared Claude home ${path} — typed memory facts` });
     }
     for (const a of cfg.add ?? []) {
       out.push({
