@@ -625,6 +625,63 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * slash-command expansion and system reminders — it answers the wrong question while
  * looking like it answered the right one.
  */
+/**
+ * The session BEFORE this one, in this directory — no id required.
+ *
+ * A fresh session cannot be handed its predecessor's id: the whole point of /new is
+ * that nothing carries over. So the recovery prompt must not contain an id, or it
+ * goes stale the moment it is used once.
+ *
+ * FILESYSTEM, NOT THE INDEX. mtime is the only thing that knows which transcript was
+ * written last, and the index is always at least one run behind a live session.
+ *
+ * The current session is excluded by id from the host env when it is set, and by
+ * "youngest file" when it is not — a brand new session has usually already flushed a
+ * line by the time a human types, so without the exclusion `tail` would hand you your
+ * own empty transcript.
+ */
+async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
+  const { encodeProjectDir, sessionIdFromEnv, liveRoots } = await import("./live.js");
+  const { readdirSync, statSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const me = sessionIdFromEnv()?.id ?? "";
+  const enc = encodeProjectDir(cwd);
+  const found: { file: string; id: string; mtime: number }[] = [];
+  for (const root of liveRoots()) {
+    const dir = join(root, enc);
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith(".jsonl")) continue;
+        const id = name.slice(0, -6);
+        if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
+        try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); } catch {}
+      }
+    } catch { /* root without this project */ }
+  }
+  found.sort((a, b) => b.mtime - a.mtime);
+
+  /*
+   * NEWEST IS NOT THE SAME AS WORTH READING.
+   *
+   * Measured here: the newest non-self transcript in this directory was `b658931d`,
+   * a two-event stub — one "ok" and one "Ready. What task?". It is a fork point, not
+   * a session, and handing it back as "what happened last time" is worse than
+   * refusing, because it looks like an answer.
+   *
+   * So: newest first, but skip anything with no human turn left after the harness
+   * filter. Parsing stops at the first real hit, so the normal case costs one parse.
+   */
+  const { parserFor } = await import("./sources.js");
+  for (const c of found.slice(0, 8)) {
+    try {
+      const p = await parserFor(c.file)(c.file);
+      const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
+      if (human && p.events.length > 2) return { file: c.file, id: c.id };
+    } catch { /* unreadable: try the next */ }
+  }
+  return found[0] ?? null;      // nothing substantial — hand back the newest and say so
+}
+
 async function cmdTail(target: string, f: Record<string, string | boolean>) {
   const n = Number(f.n ?? f.limit ?? 10);
   const chars = f.chars !== undefined ? Number(f.chars) : 0;      // 0 = whole turn
@@ -635,7 +692,16 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   // A path is a path; anything else is an id to resolve. The index is used ONLY to
   // turn an id into a filename — never to supply the turns.
   let file = target;
-  if (!target.includes("/")) {
+  if (!target || target === "--last") {
+    const prev = await previousSessionFile(process.cwd());
+    if (!prev) {
+      console.error(`no earlier session found for ${process.cwd()}`);
+      console.error(`  relic now --all   lists what is running, anywhere`);
+      process.exit(1);
+    }
+    file = prev.file;
+    console.log(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
     if (!rows.length) {
@@ -1268,7 +1334,7 @@ if (!cmd || f.help) {
 if (cmd === "index") await cmdIndex(f);
 else if (cmd === "prune") await cmdPrune(f);
 else if (cmd === "report") await cmdReport(f);
-else if (cmd === "tail") { if (!pos[1]) { console.error("tail needs a session id or a file path"); process.exit(1); } await cmdTail(pos[1], f); }
+else if (cmd === "tail") await cmdTail(pos[1] ?? "", f);
 else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {
