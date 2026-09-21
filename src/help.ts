@@ -50,6 +50,10 @@ export function helpText(): string {
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   read    <file> [--prose]     whole transcript as readable conversation, any format
   tail    [id|prefix|file] [-n 10] [--chars N] [--role user] [--flat] [--harness]
+          [--handoff]          the block to paste as the next session's FIRST prompt:
+                               human turns only, time on the first and last line only,
+                               and the span/median-gap/longest-gap that say whether this
+                               was one hard-focused hour or a day of parallel work.
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
                                an id. Found by mtime, never the index.
@@ -81,7 +85,8 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
-  recap   <id|prefix> [--limit N] [--all-tiers] [--chars 140] [--json]
+  recap   [id|prefix] [--limit N] [--all-tiers] [--chars 140] [--json]
+                               NO ID = the session before this one, same as tail.
                                what HAPPENED in one session — the human's turns with
                                harness boilerplate stripped, the tools that ran, files
                                edited, and how it ended. A projection of indexed rows,

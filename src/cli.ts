@@ -14,7 +14,7 @@ import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn } from "./recap.js";
-import { localDateTime, localTime, zoneOffset } from "./time.js";
+import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
@@ -257,6 +257,34 @@ async function cmdPrune(f: Record<string, string | boolean>) {
 }
 
 // ---- search ----------------------------------------------------------------
+/*
+ * NO ARGUMENT MEANS THE SESSION BEFORE THIS ONE — the same rule `tail` uses.
+ *
+ * `relic tail` needs no id because the question "what was I just doing" is asked
+ * from inside a session that already knows where it is. `recap` is the same
+ * question with a different answer shape, and it was the only one still demanding
+ * an id, which broke the obvious pairing:
+ *
+ *   relic tail -n 20 --role user   # what the human asked
+ *   relic recap                    # what came of it
+ *
+ * One difference is real and is NOT papered over: tail reads the transcript from
+ * disk, recap reads the index. A session that ended seconds ago is in the file and
+ * not yet in the index, so a resolved id can still miss — the error below says so
+ * rather than reporting the session as nonexistent.
+ */
+async function recapTarget(arg: string | undefined): Promise<string> {
+  if (arg) return arg;
+  const prev = await previousSessionFile(process.cwd());
+  if (!prev) {
+    console.error(`no earlier session found for ${process.cwd()}`);
+    console.error(`  relic now --all   lists what is running, anywhere`);
+    process.exit(1);
+  }
+  console.log(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  return prev.id;
+}
+
 async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   const r = await sessionRecap(id, {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
@@ -265,7 +293,13 @@ async function cmdRecap(id: string, f: Record<string, string | boolean>) {
     allTiers: Boolean(f["all-tiers"]),
     chars: f.chars ? Number(f.chars) : undefined,
   });
-  if (!r) { console.error(`no session matched ${id}`); process.exit(1); }
+  if (!r) {
+    // recap reads the INDEX, so "no match" also covers "ran too recently to be in it".
+    console.error(`no session matched ${id}`);
+    console.error(`  if it only just ran, it is in the file but not the index yet:`);
+    console.error(`  relic index --corpus claude-live    (or: relic tail ${id}, which reads the file)`);
+    process.exit(1);
+  }
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
 
   console.log(`${r.name}`);
@@ -682,6 +716,36 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
   return found[0] ?? null;      // nothing substantial — hand back the newest and say so
 }
 
+/*
+ * The handoff block. One header carrying everything the next session would otherwise
+ * have to compute, then the human's words with nothing between them.
+ *
+ * Gaps are reported as MEDIAN and MAX, not mean. One six-hour overnight gap drags a
+ * mean so far that a hard-focus session and an all-day supervised one report the same
+ * number — the median survives the outlier, and the max IS the outlier, named.
+ */
+function printHandoff(title: string | undefined, tail: { ts?: string | null; text: string }[],
+                      total: number, chars: number) {
+  if (title) console.log(title);
+  const st = handoffStats(tail.map(e => e.ts));
+  if (st) {
+    // Drop the repeated date on the end ONLY when it is the same day. A 30-hour
+    // session printing "22:34 → 04:31" reads as six hours, and the span beside it
+    // then looks like a bug rather than the point.
+    const a = localDateTime(st.firstMs), b = localDateTime(st.lastMs);
+    const end = a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b;
+    console.log(`${tail.length} human turns of ${fmt(total)}  ·  ${a} → ${end}  ·  ` +
+                `${dur(st.spanMs)} span  ·  median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
+  } else {
+    console.log(`${tail.length} human turns of ${fmt(total)}  ·  no usable timestamps`);
+  }
+  console.log("");
+  for (const e of tail) {
+    const t = e.text.replace(/\s+/g, " ").trim();
+    console.log(`  ${t.length > chars ? t.slice(0, chars) + " …" : t}`);
+  }
+}
+
 async function cmdTail(target: string, f: Record<string, string | boolean>) {
   const n = Number(f.n ?? f.limit ?? 10);
   const chars = f.chars !== undefined ? Number(f.chars) : 0;      // 0 = whole turn
@@ -719,7 +783,26 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   try { parsed = await parserFor(file)(file); }
   catch (e) { console.error(`cannot read ${file}: ${String(e).slice(0, 160)}`); process.exit(1); }
 
-  const wantRole = f.role as string | undefined;
+  /*
+   * --handoff: the block you paste as the FIRST prompt of the next session.
+   *
+   * Everything here follows from one constraint — the reader is a fresh model with no
+   * context, and every token it spends re-deriving a fact is one it does not spend on
+   * the work. So relic derives them instead:
+   *
+   *   human turns only     what I said back is the session's output, not its intent,
+   *                        and the next session is about to produce its own.
+   *   time ONLY first+last a timestamp on every line is 20 repetitions of a fact that
+   *                        matters twice. The span is what carries meaning.
+   *   span, gaps, density  these ARE the intention signal. Twenty turns in eight
+   *                        minutes at a 15s median gap is one person driving one thing
+   *                        hard. Twenty turns over six hours with multi-hour gaps is
+   *                        supervision of work running in parallel. The next session
+   *                        should not infer that from a column of timestamps — it is
+   *                        arithmetic, and arithmetic belongs in the tool.
+   */
+  const handoff = Boolean(f.handoff);
+  const wantRole = (f.role as string | undefined) ?? (handoff ? "user" : undefined);
   const keepHarness = Boolean(f.harness);
   const rows = parsed.events.filter(e => {
     // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
@@ -766,6 +849,8 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   if (mode === "json")  { console.log(JSON.stringify({ file, title: parsed.title, turns: tail }, null, 2)); return; }
   if (mode === "jsonl") { for (const e of tail) console.log(JSON.stringify(e)); return; }
   if (mode === "plain") { for (const e of tail) console.log(`${e.seq}\t${e.role}\t${e.text.replace(/\s+/g, " ")}`); return; }
+
+  if (handoff) { printHandoff(parsed.title, tail, rows.length, chars || 220); return; }
 
   if (parsed.title) console.log(`${parsed.title}`);
   // Say what was filtered OUT. "10 turns" and "10 turns of 1,751" are different facts,
@@ -1516,7 +1601,7 @@ else if (cmd === "mcp") {
 }
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
-else if (cmd === "recap") { if (!pos[1]) { console.error("recap needs a session id or prefix"); process.exit(1); } await cmdRecap(pos[1], f); }
+else if (cmd === "recap") await cmdRecap(await recapTarget(pos[1]), f);
 else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
