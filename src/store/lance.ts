@@ -453,13 +453,30 @@ export class LanceStore {
     return { before, after: await pull(">", false, opts.after ?? 5) };
   }
 
-  async sessions(opts: { since?: string; until?: string; worktree?: string; limit?: number } = {}): Promise<SessionRow[]> {
+  async sessions(opts: { since?: string; until?: string; worktree?: string; limit?: number; tiers?: string[] } = {}): Promise<SessionRow[]> {
     const t = await this.existing("sessions");
     if (!t) return [];
     const where: string[] = [];
     if (opts.since)    where.push(`started_at >= ${sqlStr(opts.since)}`);
     if (opts.until)    where.push(`started_at <= ${sqlStr(opts.until)}`);
     if (opts.worktree) where.push(`worktree LIKE '%${opts.worktree.replace(/'/g, "''")}%'`);
+    /*
+     * TIER, BECAUSE `sessions` HOLDS ONE ROW PER INDEXED FILE — of any kind.
+     *
+     * A vault note is a row here, and the vault dwarfs everything else. Measured
+     * 2026-09-22 with --since 7d over the live index:
+     *
+     *     42,403  note        <- ψ/*.md, one row each
+     *        382  session     <- what anybody asking "how many sessions" means
+     *         34  memory
+     *          8  subagent
+     *
+     * So the unfiltered answer to "how many sessions this week" was off by 112x, and
+     * the daily histogram showed three enormous spikes that were vault INDEXING runs,
+     * not activity. The caller has to say which population it wants.
+     */
+    if (opts.tiers?.length)
+      where.push(`(${opts.tiers.map(x => `tier = ${sqlStr(x)}`).join(" OR ")})`);
     let q = t.query();
     if (where.length) q = q.where(where.join(" AND "));
     const rows = await q.toArray() as unknown as SessionRow[];

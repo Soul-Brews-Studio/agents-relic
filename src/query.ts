@@ -345,7 +345,15 @@ export interface SessionsOpts extends Scope {
   limit?: number; since?: string; until?: string; worktree?: string;
   /** false lists every transcript separately, children included. Default true. */
   group?: boolean;
+  /** Which `tier` values count. Defaults to TRANSCRIPT_TIERS — see store.sessions(). */
+  tiers?: string[];
 }
+
+/**
+ * The three tiers that are a CONVERSATION. `note` and `memory` are other kinds of
+ * thing that happen to share the table, and they outnumber conversations 100:1.
+ */
+export const TRANSCRIPT_TIERS = ["session", "subagent", "workflow_agent"];
 
 /** A session row plus what its children add up to. */
 export type SessionSummary = SessionRow & {
@@ -402,6 +410,7 @@ export async function listSessions(o: SessionsOpts = {}): Promise<SessionsResult
       const store = await LanceStore.open(sh.dir);
       for (const r of await store.sessions({
         since: toISO(o.since), until: toISO(o.until, true), worktree: o.worktree,
+        tiers: o.tiers ?? TRANSCRIPT_TIERS,
       })) rows.push({ ...r, repo: sh.key });
       searched++;
     } catch { /* skip unreadable shard */ }

@@ -605,6 +605,53 @@ schema makes them close enough to beat arrival order by a wide margin — but th
 ranking improvement, not a globally correct BM25. A true global ranking needs corpus
 statistics relic does not keep.
 
+### `report` — day by day, with the shape a list cannot show
+
+```bash
+relic report                          # last 7 days
+relic report --since 30d --tree       # + each session's transcript shape
+relic report --repo neo-oracle --per-repo 8
+```
+
+```
+2026-09-20  Sun  ──────────────  64 sessions · 169 transcripts · 19,495 ev
+  laris-co/neo-oracle                    29  12,510 ev
+    09:01  01a0b8e4 +2        151 ev  wt/neo-voice-bot-19sep-sat2026
+          use relic read from omp to claude code ? how many app we did
+    ... and 27 more in this repo (--per-repo N)
+  Soul-Brews-Studio/odin-oracle           23   2,254 ev
+```
+
+`sessions` is a **feed** — most recent N, newest first. A week is a different question:
+quiet days versus spikes, which repo owned a day, whether work sat in the main checkout
+or scattered across worktrees. `--limit 40` truncates that before the second day starts.
+
+Grouped **day → repo → worktree → session**, in the order the questions get asked.
+
+**The cap is per REPO, not per day.** Per-day was the first shape and it hid the answer:
+on a busy day one repo had 28 sessions and ate the whole budget, so every other repo
+touched that day rendered as `... and 60 more`. A report whose cap can exclude a whole
+repo cannot answer which repos a day belonged to.
+
+**Days are LOCAL, not UTC.** `iso.slice(0, 10)` is the obvious implementation and it is
+wrong: at UTC+07 a session at 01:30 local belongs to the previous UTC day, so it lands
+one row early on the only axis the report exists to show.
+
+**Transcript tiers only** — and that is the point. `sessions` holds one row per indexed
+*file* of any kind, and the vault outnumbers conversations 100:1. Measured 2026-09-22
+over `--since 7d`:
+
+| tier | rows |
+|---|---|
+| `note` | **42,403** — ψ/*.md, one row each |
+| `session` | 382 |
+| `memory` | 34 |
+| `subagent` | 8 |
+
+So the unfiltered answer to "how many sessions this week" was off by 112x, and the three
+enormous spikes in its daily histogram were vault *indexing* runs, not activity. `sessions`
+now filters the same way; pass `--all-tiers` for the raw population.
+
 ### `sessions` — list and count
 
 ```bash

@@ -10,6 +10,7 @@ import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
+import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -572,6 +573,58 @@ async function cmdSessions(f: Record<string, string | boolean>) {
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }
 
+// ---- report ----------------------------------------------------------------
+/**
+ * Day by day, with the shape a flat list cannot show.
+ *
+ * `sessions` is a feed — most recent N, newest first, one line each. A week is a
+ * different question: quiet days versus spikes, which repo owned a day, whether work
+ * sat in the main checkout or scattered across worktrees. `--limit 40` truncates that
+ * before the second day starts.
+ *
+ * Transcript tiers only by default, and that is not cosmetic. `sessions` holds one row
+ * per indexed FILE of any kind, and the vault outnumbers conversations 100:1 — an
+ * unfiltered week reported 42,827 "sessions", of which 42,403 were ψ notes. The three
+ * enormous daily spikes in that histogram were vault INDEXING runs, not activity.
+ */
+async function cmdReport(f: Record<string, string | boolean>) {
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
+  if (!pickShards(scope).length) { console.log("no shards match"); return; }
+
+  const since = (f.since as string) ?? "7d";
+  // group:false — one row per TRANSCRIPT. --tree needs every child's path, and the
+  // grouped summary keeps only a count.
+  const { rows, shards } = await listSessions({
+    ...scope, since, until: f.until as string, worktree: f.worktree as string,
+    group: false, limit: 1_000_000,
+    tiers: f["all-tiers"] ? undefined : undefined,
+  });
+  void shards;
+
+  const days = buildReport(rows as unknown as ReportRow[], nameOf);
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify(days, null, 2)); return; }
+  if (mode === "jsonl") { for (const d of days) console.log(JSON.stringify(d)); return; }
+  if (mode === "plain") {
+    for (const d of days) for (const s of d.sessions)
+      console.log([d.day, localTime(s.startedAt), s.id, s.repo, s.worktree, s.events, s.transcripts, s.name].join("\t"));
+    return;
+  }
+
+  const totS = days.reduce((a, d) => a + d.sessions.length, 0);
+  const totE = days.reduce((a, d) => a + d.events, 0);
+  const totT = days.reduce((a, d) => a + d.transcripts, 0);
+  console.log(`${fmt(totS)} sessions · ${fmt(totT)} transcripts · ${fmt(totE)} events` +
+              ` · ${days.length} day${days.length === 1 ? "" : "s"} · since ${since}` +
+              (f.repo ? ` · repo~${f.repo}` : "") + ` · times local UTC${zoneOffset()}`);
+  // Absence is a fact: a day with no sessions is missing from this list, not zero.
+  for (const line of renderReport(days, { tree: Boolean(f.tree), perRepo: Number(f["per-repo"] ?? 4) }))
+    console.log(line);
+  if (!days.length) console.log("\n  nothing in range — widen --since, or check `relic status` for index freshness");
+}
+
 // ---- status ----------------------------------------------------------------
 /*
  * EMBED — a second pass over an index that is already complete.
@@ -1081,6 +1134,11 @@ if (!cmd || f.help) {
   now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
+  report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
+                               day by day: which repo, which worktree, what it was
+                               called. --tree adds each session's transcript shape.
+                               Transcript tiers only — a sessions row can be a ψ note,
+                               which outnumber conversations 100:1.
   memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
                                sessions that produced it — which had one, which had none
   pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N] [--paths]
@@ -1130,6 +1188,7 @@ as text. See relic embed --dry-run before spending anything.`);
 
 if (cmd === "index") await cmdIndex(f);
 else if (cmd === "prune") await cmdPrune(f);
+else if (cmd === "report") await cmdReport(f);
 else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {
