@@ -1765,6 +1765,17 @@ else if (cmd === "mcp") {
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
 else if (cmd === "recap") await cmdRecap(await recapTarget(pos[1]), f);
+else if (cmd === "serve") {
+  const { serve } = await import("./serve.js");
+  await serve({
+    host: String(f.host ?? "127.0.0.1"),
+    port: Number(f.port ?? 4319),
+    // Flag first, then env. The env var is what a launchd/systemd unit can set without
+    // the token appearing in `ps` output, which the flag does.
+    token: (f.token ? String(f.token) : process.env.RELIC_TOKEN) || null,
+    origins: f.origin ? String(f.origin).split(",").map(x => x.trim()).filter(Boolean) : [],
+  });
+}
 else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
