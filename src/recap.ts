@@ -50,6 +50,19 @@ export function isHarnessTurn(t: string): boolean {
       || /^<local-command-(caveat|stdout)>/.test(t)
       || /^Caveat: The messages below were generated/.test(t)
       || /^<system-reminder>/.test(t)
+      /*
+       * Shell OUTPUT, not the human. When a `!`-prefixed command runs, the harness
+       * writes both the command and its output to the user channel:
+       *
+       *     <bash-input>ls</bash-input>        <- the human typed this: KEEP
+       *     <bash-stdout>ψ\nCLAUDE.md\n…      <- the machine answered:  DROP
+       *
+       * Dropping both would lose a real turn; keeping both puts a directory listing
+       * in "what was asked". Found by reading `relic tail --role user` on this
+       * session and seeing two `ls` listings in the human's last twelve turns.
+       */
+      || /^<bash-stdout>/.test(t)
+      || /^<bash-stderr>/.test(t)
       // The harness announcing a background task finished. Arrives as a user turn and
       // is never something a person typed.
       || /^<task-notification>/.test(t)
