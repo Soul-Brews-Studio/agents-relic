@@ -656,8 +656,11 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   const wantRole = f.role as string | undefined;
   const keepHarness = Boolean(f.harness);
   const rows = parsed.events.filter(e => {
-    if (wantRole) return e.role === wantRole;
-    if (e.role !== "user" && e.role !== "assistant") return false;
+    // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
+    // returned early on --role, so `--role user` — the flag people reach for to see
+    // what the HUMAN asked — was the one view that showed raw <bash-stdout> dumps and
+    // pasted skill bodies. Narrowing to the human is exactly when the filter matters.
+    if (wantRole ? e.role !== wantRole : e.role !== "user" && e.role !== "assistant") return false;
     if (!keepHarness && e.role === "user" && isHarnessTurn(e.text)) return false;
     return true;
   });
