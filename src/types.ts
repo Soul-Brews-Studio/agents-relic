@@ -7,6 +7,30 @@ export interface ParsedEvent {
   role: string;     // user | assistant | system | reasoning | tool_use | tool_result
   ts: string | null;
   text: string;
+  /**
+   * The cwd RECORDED ON THIS LINE, which is not always the session's first one.
+   *
+   * The source writes cwd per record; relic used to keep the first and stamp it on
+   * every event. Measured on session 2bb9b553: 3,867 events in `ansible-oracle` and
+   * 201 in `neo-oracle/wt/neo-arra-oracle-v4`, all filed under the first repo, so
+   * `--worktree neo-arra-oracle-v4` could not reach them at all.
+   *
+   * FINDABLE, NOT ATTRIBUTABLE — and the distinction is the whole design. The 201
+   * events stay in the shard their session was filed under; they only become
+   * reachable by cwd. Sharding per event would split 4 of 542 transcripts and force
+   * a union in `relic session <id>` on the other 538. Bad trade:
+   *
+   *     542 live transcripts · >1 cwd: 83 (15.3%) · >1 REPO: 4 (0.7%)
+   *
+   * Consequence to expect: on those 4, `cwd` disagrees with `repo_key`. Intended.
+   * Rows written before this keep the stamped value until a rebuild.
+   *
+   * OPTIONAL because only the Claude shape records cwd per line. Codex rollouts,
+   * vault notes, omp and hermes have one cwd for the whole file or none, so they
+   * leave it unset and the importer falls back to the file's. Typing it as required
+   * would force four shapes to write a value they do not have.
+   */
+  cwd?: string | null;
 }
 
 export interface ParsedFile {

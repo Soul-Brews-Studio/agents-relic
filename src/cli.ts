@@ -4,7 +4,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
 import { discover, parseSince, type Found, type PathOverride } from "./discover.js";
-import { detect, KNOWN_NON_JSONL } from "./sources.js";
+import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
@@ -22,6 +22,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
 function flags(argv: string[]) {
@@ -349,6 +350,8 @@ async function cmdSemantic(q: string, f: Record<string, string | boolean>,
     console.log(`${score}  ${h.repo}  ${h.source}/${h.tier}  ${h.role}  ${h.ts}` +
                 (dup ? `   (+${dup} identical cop${dup === 1 ? "y" : "ies"} elsewhere)` : ""));
     console.log(`  ${h.text.replace(/\s+/g, " ").trim().slice(0, 220)}`);
+    const eph = ephemeralNote(h.text, bankOfHit(h.repo));
+    if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
   }
 }
@@ -456,6 +459,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     const wt = h.worktree ? `  [${h.worktree}]` : "";
     console.log(`${h.repo.replace("github.com/", "")}${wt}  ${h.source}/${h.tier}  ${h.role} ${h.ts}`);
     console.log(`  ...${snip.replace(/\s+/g, " ").trim()}...`);
+    // Flagged against the WHOLE event text, not the 160-char snippet — the path that
+    // matters is usually a tool's output line, not the part that matched the query.
+    const eph = ephemeralNote(h.text, bankOfHit(h.repo));
+    if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
   }
 }
@@ -1154,6 +1161,28 @@ else if (cmd === "sources") {
     console.log(`  ${s.enabled ? "[on] " : "[off]"} ${s.key.padEnd(16)} ${s.present ? "present" : "MISSING"}  bank=${s.bank.padEnd(22)} ${s.path}\n         ${s.note}`);
   const banks = [...new Set(det.filter(s => s.enabled).map(s => s.bank))];
   console.log(`\n  ${banks.length} banks would be written: ${banks.join(" · ")}`);
+
+  /*
+   * WHAT THE ENVIRONMENT SAYS, versus what is configured.
+   *
+   * Claude Code reads its home from CLAUDE_CONFIG_DIR and Codex from CODEX_HOME — one
+   * path each, not a list. If either points somewhere relic has no source for, every
+   * command still succeeds over the DEFAULT home and prints a clean summary for the
+   * wrong agent's history. Reported, never acted on: silently following an env var
+   * would write another account's transcripts into a bank named for this one.
+   */
+  const envs = envHomes();
+  if (envs.length) {
+    console.log("\nagent homes this environment points at:");
+    for (const e of envs) {
+      const covered = det.some(s => s.enabled && s.path.startsWith(e.path));
+      const mark = e.isDefault ? "[default]" : covered ? "[covered] " : "[MISSING] ";
+      console.log(`  ${mark} ${e.env}=${e.path}`);
+      if (!e.isDefault && !covered)
+        console.log(`           no enabled source reads this home — declare it:\n` +
+                    `           ~/.relic/sources.json  { "homes": [{ "key": "<name>", "path": "${e.path}" }] }`);
+    }
+  }
   console.log("\nreal history that is NOT jsonl — needs a different reader:");
   for (const k of KNOWN_NON_JSONL) console.log(`  [--]  ${k.key.padEnd(16)} ${k.path}\n         ${k.note}`);
 }

@@ -288,6 +288,20 @@ class ParsedEvent(BaseModel):
     role: str
     ts: Optional[str] = None
     text: str
+    # The cwd RECORDED ON THIS LINE, which is not always the session's first one.
+    #
+    # Measured on session 2bb9b553: 3,867 events in `ansible-oracle` and 201 in
+    # `neo-oracle/wt/neo-arra-oracle-v4`, all filed under the first repo, so
+    # `--worktree neo-arra-oracle-v4` could not reach them at all.
+    #
+    # FINDABLE, NOT ATTRIBUTABLE. Those 201 events stay in the shard their session
+    # was filed under; they only become reachable by cwd. Sharding per event would
+    # split 4 of 542 transcripts and force a union in `relic session <id>` on the
+    # other 538 — a bad trade (542 transcripts, >1 cwd: 83 / 15.3%, >1 REPO: 4 / 0.7%).
+    #
+    # Optional because only the Claude shape records cwd per line; codex, vault, omp
+    # and hermes have one cwd per file or none, and the importer falls back.
+    cwd: Optional[str] = None
 
 
 ParsedFile.model_rebuild()

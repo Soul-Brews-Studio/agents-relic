@@ -169,6 +169,61 @@ a source is added.
 
 ---
 
+## Agent homes — `CLAUDE_CONFIG_DIR`, `CODEX_HOME`
+
+Claude Code takes its home from an env var, and the binary (v2.1.278) is unambiguous:
+
+```js
+function s(){ return process.env.CLAUDE_CONFIG_DIR }
+(s() ?? join(homedir(), ".claude")).normalize("NFC")
+```
+
+**One path, not a list**, NFC-normalised. Codex does the same with `CODEX_HOME`. So an
+agent home is a single identity — and that is the right thing for a bank to be.
+
+The builtin sources get this axis wrong, and it shows: `projects`, `projects-archive`
+and `projects-1sep-tue2026` are three banks for roots inside **one** home (`~/.claude`),
+while `peer-projects` is one bank for a whole **other** home. That model cannot say
+"index this other home", which is how `~/.claude-neo` sat on this machine with real
+sessions and zero indexed rows.
+
+Declare a home instead:
+
+```json
+{ "homes": [
+    { "key": "claude-neo", "path": "~/.claude-neo" },
+    { "key": "claude-nat", "path": "/Users/nat/.claude" },
+    { "key": "codex-alt",  "path": "~/.codex2", "agent": "codex" }
+] }
+```
+
+Each Claude home expands to two sources — transcripts (bank `<key>`, the `claude-home`
+walk covering **every** `projects*` root inside it) and typed memory (bank
+`<key>-memory`). A Codex home expands to one, over `<home>/sessions`.
+
+Enumerating `projects*` also removes a hand-maintained list, and that list has failed
+before: `projects-1sep-tue2026` lived only in a `sources.json` that got deleted, so a
+rebuild indexed two of three roots and reported success.
+
+**Why one source per reading rather than one per root:** two sources sharing a bank is
+exactly what the duplicate-source guard exists to catch, and it has caught a real
+incident. One home therefore gets one source whose walker covers its roots, not three
+sources pointed at one bank.
+
+**The env vars are reported, never followed.** `relic sources` prints what
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` point at and flags a home no enabled source reads:
+
+```
+agent homes this environment points at:
+  [MISSING]  CLAUDE_CONFIG_DIR=/Users/beta/.claude-neo
+           no enabled source reads this home — declare it:
+           ~/.relic/sources.json  { "homes": [{ "key": "<name>", "path": "…" }] }
+```
+
+Acting on it silently is the failure being avoided: relic would index the *default*
+home, find plenty, and print a clean summary for the wrong agent's history — and on a
+shared machine, write another account's transcripts into a bank named for this one.
+
 ## Sources
 
 Nine declared, six on by default. Each declares how to find its files, how to parse them,
@@ -452,6 +507,35 @@ skips a source whose root does not exist, so a typo'd path, an unknown corpus, o
 `--corpus` values would each produce a clean `scanned 0 files` and exit 0. `prune`
 refuses the flag outright — an overridden root is a different population, so every file
 under the source's real root would look deleted.
+
+### Ephemeral paths — flagged at read time, never at write time
+
+A hit that quotes `/private/tmp/claude-501/.../scratchpad/out.mp4` is answering
+correctly and pointing at a file a temp janitor deleted days ago. relic tags it:
+
+```
+  ⚠ ephemeral-path (claude-<pid> scratch root, recorded in bank peer-projects)
+    — this path was session-scoped and is probably gone
+```
+
+Measured on bank `projects`, 408,886 events: **23,818 (5.8%)** reference an ephemeral
+path. One event in seventeen.
+
+Two confidence tiers, because they are not the same evidence. `/claude-<pid>/` and
+`/scratchpad/` are **structural** — the pid is *in* the path, and the scratchpad is a
+directory the tooling itself tears down, so each carries its own proof. A bare `/tmp`
+prefix only **correlates**: a daemon configured to keep state there matches too. Same
+hierarchy as the blob detection in #37 — prefer the shape that proves itself over the
+prefix that merely suggests.
+
+The note names the **bank**, because relic indexes another account's corpus and another
+machine's. A path recorded under a different uid on a different host cannot be `stat`ed
+meaningfully from here, which is also why there is no live check — this is pure string
+work, no disk access.
+
+**Never at write time.** "we downloaded it to /tmp and transcoded it" is exactly what a
+later session needs to find. The transcript is the record of what happened; an ephemeral
+path in it is information, not noise.
 
 ### `prune` — the only command that removes rows
 

@@ -370,6 +370,24 @@ function walkMemory(root: string, sinceMs: number | null, out: Found[], srcKey: 
  */
 export interface PathOverride { key: string; path: string }
 
+/**
+ * Every `projects*` root inside ONE agent home, under one source and one bank.
+ *
+ * The builtins name three roots inside ~/.claude by hand — and that is how
+ * `projects-1sep-tue2026` went missing once already: it lived only in a sources.json
+ * that got deleted, so a rebuild indexed two of three roots and reported success.
+ * Enumerating the home removes the hand-maintained list, and a new snapshot directory
+ * is picked up without a code change.
+ *
+ * `projects` FIRST when present, so the live root is scanned before any snapshot and a
+ * killed run has the most useful half.
+ */
+export function walkClaudeHome(home: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  const roots = dirs(home).filter(d => d === "projects" || d.startsWith("projects-"));
+  roots.sort((a, b) => (a === "projects" ? -1 : b === "projects" ? 1 : a.localeCompare(b)));
+  for (const r of roots) walkClaude(join(home, r), sinceMs, out, srcKey, parser);
+}
+
 export function discover(only: string[] | null, sinceMs: number | null,
                          pathOverride: PathOverride | null = null): Found[] {
   const out: Found[] = [];
@@ -382,7 +400,8 @@ export function discover(only: string[] | null, sinceMs: number | null,
     if (!wanted || !existsSync(root)) continue;
     progressLine(`  scanning ${src.key}…`);
     const before = out.length;
-    if (src.walk === "memory") walkMemory(root, sinceMs, out, src.key, src.parser);
+    if (src.walk === "claude-home") walkClaudeHome(root, sinceMs, out, src.key, src.parser);
+    else if (src.walk === "memory") walkMemory(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "hermes") walkHermes(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "vaults") walkVaults(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "vault") walkVault(root, sinceMs, out, src.key, src.parser, 0, tick);

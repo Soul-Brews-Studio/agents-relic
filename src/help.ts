@@ -29,6 +29,14 @@ export function helpText(): string {
                                failures, skips shards this run never reached, and
                                REFUSES any shard losing more than --max-drop percent.
   search  <query> [--repo S] [--bank B] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
+                  BM25 FINDS TOPICS, NOT SPECIFIC FACTS. For "did I already do X",
+                  search the most UNIQUE literal string in the request — an id, a
+                  filename, an error string — not the topic words. Measured on 288
+                  real queries here: longer queries return 11x MORE hits than short
+                  ones (median 1,392 vs 123), because FTS ranks any document holding
+                  any term, so every extra word widens the candidate set.
+                    95,529 hits  "herdr pane run agent prompt recent-unwrapped"
+                         1 hit   "VoiceProcessingEnabled"
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
