@@ -102,6 +102,13 @@ export function helpText(): string {
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
   skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
+  serve   [--host 127.0.0.1] [--port 4319] [--token T] [--origin URL,URL]
+                               the MCP tools over HTTP at /mcp, for clients that are not
+                               a child process — a browser UI, another machine, another
+                               oracle. --host 0.0.0.0 binds EVERY interface (loopback,
+                               LAN and mesh at once) and REFUSES to start without a
+                               token: this serves the whole machine's session history.
+                               RELIC_TOKEN works too, and keeps it out of the ps table.
   probe   [--corpus claude-live] [--repo S] [--files 40] [--samples 3] [--json]
                                what the noise rules WOULD drop, with samples of each
                                rule's catches. Writes nothing. Run this after touching

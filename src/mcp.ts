@@ -498,18 +498,36 @@ const VERSION = (() => {
   } catch { return "0.0.0"; }
 })();
 
-const server = new Server({ name: "relic", version: VERSION }, { capabilities: { tools: {} } });
+/**
+ * A FRESH SERVER PER CALLER, not one module-level singleton.
+ *
+ * Over stdio there is exactly one client for the process's lifetime, so a singleton was
+ * fine. Over HTTP there are many, arriving concurrently, and an MCP Server carries
+ * per-connection state (initialization, the negotiated protocol version). Sharing one
+ * across sessions makes a second client's initialize stomp the first's.
+ *
+ * The TOOLS list and `run` are stateless and stay shared — only the Server wrapper is
+ * per-caller, and it is cheap.
+ */
+export function buildServer(): Server {
+  const server = new Server({ name: "relic", version: VERSION }, { capabilities: { tools: {} } });
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  try {
-    return { content: [{ type: "text", text: await run(req.params.name, req.params.arguments ?? {}) }] };
-  } catch (err) {
-    // A thrown handler kills the tool call with no explanation on the model's side.
-    // Return the message as content so the failure is legible and retryable.
-    return { content: [{ type: "text", text: `relic error: ${String(err)}` }], isError: true };
-  }
-});
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    try {
+      return { content: [{ type: "text", text: await run(req.params.name, req.params.arguments ?? {}) }] };
+    } catch (err) {
+      // A thrown handler kills the tool call with no explanation on the model's side.
+      // Return the message as content so the failure is legible and retryable.
+      return { content: [{ type: "text", text: `relic error: ${String(err)}` }], isError: true };
+    }
+  });
+  return server;
+}
 
-await server.connect(new StdioServerTransport());
+export { TOOLS };
+
+// Only when RUN as a script. Imported by serve.ts, this file must not grab stdio —
+// doing so would make `relic serve` hang waiting for a stdin client that never comes.
+if (import.meta.main) await buildServer().connect(new StdioServerTransport());
