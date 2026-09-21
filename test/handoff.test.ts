@@ -1,5 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { dur, handoffStats } from "../src/time.js";
+import { handoffBudget } from "../src/recap.js";
 
 /**
  * `relic tail --handoff` exists so the NEXT session is handed the pacing of this one
@@ -67,5 +68,28 @@ describe("dur", () => {
   test("a nonsense duration prints nothing rather than a nonsense number", () => {
     expect(dur(NaN)).toBe("");
     expect(dur(-1)).toBe("");
+  });
+});
+
+/*
+ * Why the asymmetry exists at all: this human's real turns include "go", "gogogo",
+ * "merge all" and "ok this cool!". Each is a decision about a proposal, and human-only
+ * output strands every one of them. The assistant comes back as context — smaller,
+ * because the next session is about to write its own answers.
+ */
+describe("handoffBudget", () => {
+  test("the human gets the full budget, the assistant about half", () => {
+    expect(handoffBudget("user", 220)).toBe(220);
+    expect(handoffBudget("assistant", 220)).toBe(110);
+  });
+
+  test("a floor of 60 — a shorter cut hides the proposal the human answered", () => {
+    expect(handoffBudget("assistant", 40)).toBe(60);
+    expect(handoffBudget("assistant", 100)).toBe(60);
+    expect(handoffBudget("assistant", 130)).toBe(65);
+  });
+
+  test("the human budget is never floored — an explicit --chars is obeyed", () => {
+    expect(handoffBudget("user", 40)).toBe(40);
   });
 });

@@ -13,7 +13,7 @@ import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { flags } from "./flags.js";
-import { isHarnessTurn } from "./recap.js";
+import { isHarnessTurn, handoffBudget } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -718,31 +718,58 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
 
 /*
  * The handoff block. One header carrying everything the next session would otherwise
- * have to compute, then the human's words with nothing between them.
+ * have to compute, then the conversation with nothing between the lines.
  *
- * Gaps are reported as MEDIAN and MAX, not mean. One six-hour overnight gap drags a
- * mean so far that a hard-focus session and an all-day supervised one report the same
- * number — the median survives the outlier, and the max IS the outlier, named.
+ * BOTH ROLES, ASYMMETRICALLY TRIMMED — and that asymmetry is the whole design.
+ *
+ * Human-only was the first version and it loses the thing it was built to carry. Half
+ * this human's turns are "go", "gogogo", "merge all", "ok this cool!" — each one a
+ * decision ABOUT a proposal that is not in the block. Read alone they are noise; beside
+ * the line they answer they are the entire plot. So the assistant comes back — its LAST
+ * word after each human turn, which is the conclusion rather than the "let me check
+ * that" the first one would be. The chain then reads both ways: under a human turn is
+ * what came of it, and above a human turn is what it was answering.
+ *
+ * It comes back SMALL. The assistant's turn is context for the human's, not content in
+ * its own right — the next session is about to produce its own answers and does not
+ * need this one's at length. Human turns get the full budget, assistant turns get
+ * roughly half, which is enough to recognise a proposal and not enough to drown it.
+ *
+ * Gaps are measured on the HUMAN turns only. Interleaving assistant timestamps would
+ * halve every gap and report a calm supervised day as frantic focus.
+ *
+ * MEDIAN and MAX, never mean. One overnight gap drags a mean so far that a hard-focus
+ * session and an all-day supervised one report the same number — the median survives
+ * the outlier, and the max IS the outlier, named.
  */
-function printHandoff(title: string | undefined, tail: { ts?: string | null; text: string }[],
+function printHandoff(title: string | undefined, tail: { role: string; ts?: string | null; text: string }[],
                       total: number, chars: number) {
+  const humans = tail.filter(e => e.role === "user");
+  const st = handoffStats(humans.map(e => e.ts));
+
   if (title) console.log(title);
-  const st = handoffStats(tail.map(e => e.ts));
+  const counts = `${humans.length} human turns of ${fmt(total)}`;
   if (st) {
     // Drop the repeated date on the end ONLY when it is the same day. A 30-hour
     // session printing "22:34 → 04:31" reads as six hours, and the span beside it
     // then looks like a bug rather than the point.
     const a = localDateTime(st.firstMs), b = localDateTime(st.lastMs);
     const end = a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b;
-    console.log(`${tail.length} human turns of ${fmt(total)}  ·  ${a} → ${end}  ·  ` +
-                `${dur(st.spanMs)} span  ·  median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
+    console.log(`${counts}  ·  ${a} → ${end}  ·  ${dur(st.spanMs)} span  ·  ` +
+                `median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
   } else {
-    console.log(`${tail.length} human turns of ${fmt(total)}  ·  no usable timestamps`);
+    console.log(`${counts}  ·  no usable timestamps`);
   }
   console.log("");
+
   for (const e of tail) {
     const t = e.text.replace(/\s+/g, " ").trim();
-    console.log(`  ${t.length > chars ? t.slice(0, chars) + " …" : t}`);
+    if (!t) continue;
+    const cut = handoffBudget(e.role, chars);
+    const body = t.length > cut ? t.slice(0, cut) + " …" : t;
+    // The human unmarked at the margin, the assistant indented under it: the block
+    // reads as what was asked, with what it was answering underneath.
+    console.log(e.role === "user" ? `  ${body}` : `      · ${body}`);
   }
 }
 
@@ -802,7 +829,7 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
    *                        arithmetic, and arithmetic belongs in the tool.
    */
   const handoff = Boolean(f.handoff);
-  const wantRole = (f.role as string | undefined) ?? (handoff ? "user" : undefined);
+  const wantRole = f.role as string | undefined;
   const keepHarness = Boolean(f.harness);
   const rows = parsed.events.filter(e => {
     // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version

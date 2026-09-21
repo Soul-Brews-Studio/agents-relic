@@ -51,9 +51,11 @@ export function helpText(): string {
   read    <file> [--prose]     whole transcript as readable conversation, any format
   tail    [id|prefix|file] [-n 10] [--chars N] [--role user] [--flat] [--harness]
           [--handoff]          the block to paste as the next session's FIRST prompt:
-                               human turns only, time on the first and last line only,
-                               and the span/median-gap/longest-gap that say whether this
-                               was one hard-focused hour or a day of parallel work.
+                               your turns in full, mine trimmed to half under them — "go"
+                               means nothing without the proposal it answered. Time on the
+                               first and last line ONLY, plus the span/median-gap/longest-gap
+                               that say whether this was one hard-focused hour or a day of
+                               parallel work. Add --role user for your turns alone.
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
                                an id. Found by mtime, never the index.

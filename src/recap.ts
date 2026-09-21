@@ -145,3 +145,15 @@ export async function sessionRecap(
     endedWith,
   };
 }
+
+/**
+ * How many characters a turn gets in `relic tail --handoff`.
+ *
+ * Asymmetric on purpose. The human's turn is the content; the assistant's is the
+ * context that makes "go" mean something, and context does not need the same room as
+ * content. Half, with a floor — below about 60 characters an assistant turn is cut
+ * before it says what it proposed, which is the one job it is there to do.
+ */
+export function handoffBudget(role: string, chars: number): number {
+  return role === "user" ? chars : Math.max(60, Math.round(chars / 2));
+}
