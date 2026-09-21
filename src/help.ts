@@ -87,8 +87,11 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
-  recap   [id|prefix] [--limit N] [--all-tiers] [--chars 140] [--json]
+  recap   [id|prefix] [--limit 20] [--all-tiers] [--chars 140] [--json]
                                NO ID = the session before this one, same as tail.
+                               Shows the LAST 20 asked turns; --limit 0 for all. The
+                               footer prints the command to widen it, so a model
+                               reading a truncated recap can fetch the rest itself.
                                what HAPPENED in one session — the human's turns with
                                harness boilerplate stripped, the tools that ran, files
                                edited, and how it ended. A projection of indexed rows,
