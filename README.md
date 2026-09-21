@@ -36,7 +36,7 @@ your repos.
      ~/.codex/sessions   11  G   codex                     141 M   225,747
      ~/.omp/…/sessions    32 M   omp                       9.6 M     6,180
      ~/.claude/…/memory   —       memory                    2.9 M       198
-     <ghq>/*/*/ψ/**.md    —       vaults                    464 M   124,044
+     <ghq>/*/*/ψ + wt   —       vaults                    464 M   124,044
      one oracle's ψ      —       vault                      21 M    10,271
      ~/.hermes             ?     hermes                    —       [off] SQLite
      ~/.omx-runs          39 M   omx-logs                  —       [off] ops logs
@@ -238,7 +238,7 @@ and which bank it writes.
 | `omp` | `omp` | JSONL, one dir per encoded cwd | on |
 | `claude-memory` | `memory` | `<project>/memory/*.md`, typed facts | on |
 | `oracle-vault` | `vault` | ONE oracle's `ψ/**.md` | off — path is per-machine |
-| `oracle-vaults` | `vaults` | EVERY `<org>/<repo>/ψ/**.md` under the ghq tree | off |
+| `oracle-vaults` | `vaults` | EVERY `<org>/<repo>/ψ/**.md` under the ghq tree, worktree vaults included | off |
 | `hermes` | `hermes` | **SQLite**, one DB per profile | off |
 | `omx-logs` | `omx-logs` | run logs — ops output, not conversation | off |
 
@@ -494,10 +494,11 @@ relic index --corpus oracle-vault --source-path /path/to/repo/wt/<slug>/ψ
 ```
 
 `sources.ts` documented this flag before it existed — the comment told you to run a
-command that fails. It exists now because a real vault needed it: **55 worktree vaults
-(`<repo>/wt/<slug>/ψ`) across 17 repos are real directories the `vaults` walker never
-descends into**, and 227 of one such vault's notes had index rows with no way to
-rebuild them.
+command that fails. It exists now because a real vault needed it: a worktree vault
+(`<repo>/wt/<slug>/ψ`) is a real directory, and one of them held 227 notes with index
+rows and no way to rebuild them. The `vaults` walker reaches those vaults now — this
+flag stays for the ones outside the ghq tree, and for pointing a source at a single
+vault by hand.
 
 It overrides **one** source's root for **one** run. The walker, parser and bank are
 unchanged — that is what makes the rows land where the rest of that source's rows
@@ -1413,7 +1414,7 @@ resolving symlinks, **116,849** notes in 43 s.
 relic index --corpus oracle-vaults
 ```
 
-Three things it has to get right, each of which fails silently:
+Four things it has to get right, each of which fails silently:
 
 - **A symlinked ψ is invisible** to `readdir` — `isDirectory()` is false for a symlink,
   and the `/psi` skill deliberately points a plain repo's ψ at a caretaker oracle's
@@ -1424,6 +1425,37 @@ Three things it has to get right, each of which fails silently:
   prevents this one, so the fix is the entry point only.
 - **A vault can contain another vault**, so dedup is by CONTAINMENT, not equality —
   111 of 116,952 files were emitted twice before that.
+- **A worktree carries a copy of the vault.** `<repo>/wt/<slug>/ψ` and
+  `<repo>/agents/<slug>/ψ` are real directories, not links back, so realpath cannot
+  collapse them — and a repo commits its vault, so each is a near-complete copy of the
+  main checkout's. Measured 2026-09-22: 109 of them, 96 distinct once resolved, holding
+  **194,863** notes — of which **738** exist nowhere else. See the dedupe rule below.
+
+### The rule that keeps a worktree vault from doubling the corpus
+
+Two notes are the same note when they share **the owning repo, the path inside the
+vault, and the byte size**. `repoKeyOf` collapses `<repo>/wt/<slug>` back to `<repo>`,
+which is what lets the two copies meet; size is in the key because a shared path is not
+a promise of shared content — of the 12,820 notes that exist at one path in two
+checkouts, 12,677 are byte-identical and **143 hold a worktree edit that never came
+back**.
+
+The repo-level vault is walked FIRST and wins every tie. That order is the rule, and it
+is not taste: `relic prune` deletes rows whose file discovery no longer yields, so a
+rule that demoted an already-indexed path would queue it for deletion.
+
+Both full runs below are real, not extrapolated — `--data-root` into a throwaway
+directory, so the live index was never touched.
+
+| walk | files discovered | events indexed | shards | run |
+|---|---|---|---|---|
+| repo-level ψ only (before) | 147,901 | 155,514 | 310 | 52.2 s |
+| + worktree vaults, no dedupe | 342,764 (**+131.8%**) | — | — | — |
+| + worktree vaults, deduped | 148,639 (**+0.50%**) | 156,529 | 312 | 61.6 s |
+
+The 738 notes that survive are 582 at a path the main checkout does not have and 156 at
+a shared path with different bytes. The two extra shards are repos whose only vault
+content lives in a worktree.
 
 ---
 

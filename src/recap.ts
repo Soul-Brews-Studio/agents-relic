@@ -24,6 +24,7 @@ export interface SessionRecap {
   roles: { role: string; n: number }[];
   asked: RecapTurn[];               // the human's turns, boilerplate removed
   askedOmitted: number;             // how many turns were dropped as boilerplate
+  askedTotal: number;               // how many there were before the tail was taken
   tools: { name: string; n: number }[];
   files: { path: string; n: number }[];
   endedWith: string;                // the last assistant turn
@@ -66,6 +67,19 @@ export function isHarnessTurn(t: string): boolean {
       // The harness announcing a background task finished. Arrives as a user turn and
       // is never something a person typed.
       || /^<task-notification>/.test(t)
+      /*
+       * ANOTHER AGENT REPORTING IN, not the human. A subagent's result is delivered
+       * on the user channel with this preamble, so a session that fans out to four
+       * workers collects a dozen of them.
+       *
+       * Found by running `relic tail --handoff` on the session that built it: 5 of
+       * 14 "human turns" were workers announcing PRs. They corrupt two things at
+       * once — the turn count, and the pacing. Agents report on agent time, so a
+       * 55-second median gap was measuring subagent latency and calling it the
+       * human's focus, which is the one number --handoff exists to get right.
+       */
+      || /^Another Claude session sent a message:/.test(t)
+      || /^<teammate-message\b/.test(t)
       // The resume prompt after a compaction. It IS in the user channel, but it is the
       // harness restarting the session, not a new instruction — and in a long-running
       // session it appears once per compaction, outnumbering real turns.
@@ -75,10 +89,23 @@ export function isHarnessTurn(t: string): boolean {
 
 const clean = (t: string) => t.replace(/\s+/g, " ").trim();
 
+/*
+ * How many asked-turns a recap shows when nobody said.
+ *
+ * There was no cap at all, and on a six-day session that printed 332 turns — roughly
+ * 6,000 tokens, opening with a question asked six days before the reader cares. The
+ * recent end is the end anyone means: a recap is read to answer "what just happened".
+ *
+ * 20 matches `tail`'s default window, so the two halves of a handoff line up.
+ * `--limit 0` still means all of it.
+ */
+export const RECAP_DEFAULT_LIMIT = 20;
+
 export async function sessionRecap(
   idOrPrefix: string,
   o: Scope & { limit?: number; allTiers?: boolean; chars?: number } = {},
 ): Promise<SessionRecap | null> {
+  const limit = o.limit ?? RECAP_DEFAULT_LIMIT;
   const found = await resolveSession(idOrPrefix, o);
   const rows = found?.rows ?? [];
   if (!rows.length) return null;
@@ -138,10 +165,52 @@ export async function sessionRecap(
     model: String(parent.model ?? ""), gitBranch: String((parent as any).git_branch ?? ""),
     transcripts: rows.length, events: events.length,
     roles: [...roles].sort((a, b) => b[1] - a[1]).map(([role, n]) => ({ role, n })),
-    asked: o.limit ? asked.slice(0, o.limit) : asked,
-    askedOmitted,
+    /*
+     * THE TAIL, NOT THE HEAD. `--limit 6` used to return the six OLDEST turns, which
+     * is the opposite of what limiting a recap means to anyone who types it — the
+     * first six turns of a long session are its setup, not its state.
+     */
+    asked: limit > 0 ? asked.slice(-limit) : asked,
+    askedOmitted, askedTotal: asked.length,
     tools: desc(tools).slice(0, 12),
     files: [...files].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([path, n]) => ({ path, n })),
     endedWith,
   };
+}
+
+/**
+ * How many characters a turn gets in `relic tail --handoff`.
+ *
+ * Asymmetric on purpose. The human's turn is the content; the assistant's is the
+ * context that makes "go" mean something, and context does not need the same room as
+ * content. Half, with a floor — below about 60 characters an assistant turn is cut
+ * before it says what it proposed, which is the one job it is there to do.
+ */
+export function handoffBudget(role: string, chars: number): number {
+  return role === "user" ? chars : Math.max(60, Math.round(chars / 2));
+}
+
+/**
+ * A hidden turn that starts a NEW exchange, rather than one caused by the human's.
+ *
+ * Both kinds are stripped from what a reader sees, but they mean opposite things for
+ * pairing, and conflating them loses a reply either way:
+ *
+ *   caused by the human    <bash-input>ls</bash-input>   the human typed this
+ *                          <bash-stdout>…                the machine answered
+ *                          "here is what that listed"    STILL the human's exchange
+ *
+ *   independent inbound    <teammate-message …>          a worker reporting in
+ *                          "PR #52 — vaults finished"    NOT the human's exchange
+ *
+ * Break on the second kind only. Breaking on both orphaned every reply that followed a
+ * bash-stdout or a skill body; breaking on neither paired "suggest me" with a PR
+ * report it had nothing to do with. Both were seen on one real session.
+ */
+export function isInboundTurn(t: string): boolean {
+  return /^Another Claude session sent a message:/.test(t)
+      || /^<teammate-message\b/.test(t)
+      || /^<task-notification>/.test(t)
+      || /^Continue from where you left off\.?$/.test(t.trim())
+      || /^This session is being continued from a previous conversation/.test(t);
 }

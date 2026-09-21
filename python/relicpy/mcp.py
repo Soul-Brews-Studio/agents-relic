@@ -221,10 +221,12 @@ def run(name: str, a: dict) -> str:
                           worktree=a.get("worktree"), limit=int(a.get("limit") or 40))
         if not r["total"]:
             return "no sessions match those filters"
-        L = [f"{r['total']:,} sessions · {r['events']:,} events", ""]
+        L = [f"{r['total']:,} sessions · {r['transcripts']:,} transcripts · "
+             f"{r['events']:,} events", ""]
         for x in r["rows"]:
-            L.append(f"{local_date_time(x.get('started_at'))}  {str(x.get('session_uuid'))[:8]}  "
-                     f"{int(x.get('event_count') or 0):>6} ev  {x.get('repo','')}")
+            kids = f" +{x['children']}" if x.get("children") else ""
+            L.append(f"{local_date_time(x.get('started_at'))}  {str(x.get('session_uuid'))[:8]}{kids}  "
+                     f"{int(x.get('tree_events') or 0):>6} ev  {x.get('repo','')}")
             L.append(f"    {' '.join(name_of(x).split())[:110]}")
         return "\n".join(L)
 

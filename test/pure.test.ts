@@ -4,7 +4,7 @@ import { encodeProjectDir, encodeOmpDir } from "../src/live.js";
 import { locationOf, shardDirFor, DEFAULT_BANK } from "../src/repo.js";
 import { classify } from "../src/noise.js";
 import { nameOf, looksLikeId, toISO, dedupeHits, groupByBank, maxISO,
-         sessionIdOfPath } from "../src/query.js";
+         sessionIdOfPath, contentTerms, decideGeneric } from "../src/query.js";
 import { buildTree, renderTree, commonPrefix } from "../src/tree.js";
 import { kindOf } from "../src/discover.js";
 
@@ -400,5 +400,72 @@ describe("kind vs tier — one column was holding two axes", () => {
     // collide with that, or old-shard fallback logic starts firing on new rows.
     expect(kindOf("something-new", "claude-live")).toBe("transcript");
     expect(kindOf("session", "claude-live")).not.toBe("");
+  });
+});
+
+describe("contentTerms — the generic-query warning's input, issue #32", () => {
+  test("drops stopwords, punctuation, and short tokens", () => {
+    expect(contentTerms("fix the bug in the search function")).toEqual(["fix", "bug", "search", "function"]);
+  });
+
+  test("stopwords match what the FTS index itself does — searching 'the' returns 0", () => {
+    // Measured on the live index: t.search("the"/"in", "fts") comes back with 0 hits
+    // because the tokenizer drops them, so counting them toward rarity would read
+    // every stopword as "specific" — the opposite of what the index says about them.
+    expect(contentTerms("the in of")).toEqual([]);
+  });
+
+  test("dedupes case-insensitively, keeps first casing, preserves order", () => {
+    expect(contentTerms("Herdr herdr HERDR pane")).toEqual(["Herdr", "pane"]);
+  });
+
+  test("a single rare identifier is untouched", () => {
+    expect(contentTerms("VoiceProcessingEnabled")).toEqual(["VoiceProcessingEnabled"]);
+  });
+});
+
+describe("decideGeneric — the threshold, measured on the live index (query.ts has the full data)", () => {
+  // GENERIC_RARE_DF = 0.15, GENERIC_MIN_TERMS = 2. The gap it sits in, measured with
+  // a 40-shard stratified sample / probe limit 3 on this repo's live 1,136-shard
+  // index: rare identifiers clustered at 0.00-0.10 (VoiceProcessingEnabled,
+  // structured_output_mode, devicectl, relic, herdr, inserts); common English words
+  // clustered at 0.30-0.72 (ambiguous, merge, facebook, search, run, agent, prompt).
+
+  test("fires — the issue's own example: every term common, no anchor", () => {
+    // "herdr pane run agent prompt recent-unwrapped" — nazt's measured worst case,
+    // 95,529 hits, every remaining term (after 'herdr' itself, also common here) >= 0.55.
+    const r = decideGeneric([
+      { term: "pane", df: 0.65 }, { term: "run", df: 0.72 },
+      { term: "agent", df: 0.70 }, { term: "prompt", df: 0.63 },
+      { term: "recent-unwrapped", df: 0.55 },
+    ]);
+    expect(r.warn).toBe(true);
+    expect(r.rarest).toBe("recent-unwrapped");
+  });
+
+  test("does NOT fire — one term anchors the query, same as a single rare identifier would", () => {
+    // "ambiguous merge inserts" — inserts=0.10 is below the rare cutoff, so BM25 has
+    // something to anchor on even though the other two terms are common.
+    const r = decideGeneric([
+      { term: "ambiguous", df: 0.38 }, { term: "merge", df: 0.57 }, { term: "inserts", df: 0.10 },
+    ]);
+    expect(r.warn).toBe(false);
+    expect(r.rarest).toBe("inserts");
+  });
+
+  test("does NOT fire — a single rare identifier, however narrow the corpus check would run", () => {
+    const r = decideGeneric([{ term: "VoiceProcessingEnabled", df: 0.00 }]);
+    // Below GENERIC_MIN_TERMS (2) regardless of df — one term is already maximally
+    // narrow, so there is nothing to warn about.
+    expect(r.warn).toBe(false);
+  });
+
+  test("empty input never warns", () => {
+    expect(decideGeneric([]).warn).toBe(false);
+  });
+
+  test("boundary: df exactly at the cutoff counts as rare (anchors), not generic", () => {
+    const r = decideGeneric([{ term: "a", df: 0.15 }, { term: "b", df: 0.9 }]);
+    expect(r.warn).toBe(false);
   });
 });

@@ -19,8 +19,8 @@ export function helpText(): string {
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--keep-noise] [--dry-run] [--prune]
           [--source-path PATH]   run ONE --corpus against a root it does not normally
-                               walk — same walker, parser and bank. For a vault the
-                               vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
+                               walk — same walker, parser and bank. For a vault
+                               outside the ghq tree the vaults walker enumerates.
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.
@@ -44,12 +44,21 @@ export function helpText(): string {
                   BM25. A separate MODE, never blended: measured here, FTS wins
                   known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.
                   [--overfetch 4] [--device mps]
+                  [--no-warn]  suppress the generic-query warning: fires when EVERY
+                  term you typed is common across the scoped corpus, meaning no term
+                  can anchor a search — never blocks the search or changes ranking.
   show    <file> --seq N [--before 2] [--after 2]
   session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
                                --tree shows the SHAPE: which agents shared a workflow run
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   read    <file> [--prose]     whole transcript as readable conversation, any format
   tail    [id|prefix|file] [-n 10] [--chars N] [--role user] [--flat] [--harness]
+          [--handoff]          the block to paste as the next session's FIRST prompt:
+                               your turns in full, mine trimmed to half under them — "go"
+                               means nothing without the proposal it answered. Time on the
+                               first and last line ONLY, plus the span/median-gap/longest-gap
+                               that say whether this was one hard-focused hour or a day of
+                               parallel work. Add --role user for your turns alone.
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
                                an id. Found by mtime, never the index.
@@ -81,7 +90,11 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
-  recap   <id|prefix> [--limit N] [--all-tiers] [--chars 140] [--json]
+  recap   [id|prefix] [--limit 20] [--all-tiers] [--chars 140] [--json]
+                               NO ID = the session before this one, same as tail.
+                               Shows the LAST 20 asked turns; --limit 0 for all. The
+                               footer prints the command to widen it, so a model
+                               reading a truncated recap can fetch the rest itself.
                                what HAPPENED in one session — the human's turns with
                                harness boilerplate stripped, the tools that ran, files
                                edited, and how it ended. A projection of indexed rows,
