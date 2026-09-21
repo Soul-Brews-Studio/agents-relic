@@ -13,7 +13,7 @@ import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { flags } from "./flags.js";
-import { isHarnessTurn, handoffBudget } from "./recap.js";
+import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -831,15 +831,32 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   const handoff = Boolean(f.handoff);
   const wantRole = f.role as string | undefined;
   const keepHarness = Boolean(f.harness);
-  const rows = parsed.events.filter(e => {
-    // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
-    // returned early on --role, so `--role user` — the flag people reach for to see
-    // what the HUMAN asked — was the one view that showed raw <bash-stdout> dumps and
-    // pasted skill bodies. Narrowing to the human is exactly when the filter matters.
-    if (wantRole ? e.role !== wantRole : e.role !== "user" && e.role !== "assistant") return false;
-    if (!keepHarness && e.role === "user" && isHarnessTurn(e.text)) return false;
-    return true;
-  });
+  /*
+   * A DROPPED TURN IS STILL A BOUNDARY.
+   *
+   * Harness turns are hidden, not deleted, because pairing needs to know they were
+   * there. Filtering them out of the array entirely lets an assistant message that
+   * answered a subagent report drift upward and pair with the human turn before it:
+   * running --handoff on the session that built this showed "suggest me" answered by
+   * a PR report it had nothing to do with. The reply had crossed a turn that was no
+   * longer in the list.
+   *
+   * So: `hidden` marks what the reader must not see, and the pairing below treats any
+   * user-channel turn — hidden or not — as the end of an exchange.
+   */
+  const marked = parsed.events
+    .filter(e => (wantRole ? e.role === wantRole : e.role === "user" || e.role === "assistant"))
+    .map(e => ({
+      // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
+      // returned early on --role, so `--role user` — the flag people reach for to see
+      // what the HUMAN asked — was the one view that showed raw <bash-stdout> dumps
+      // and pasted skill bodies. Narrowing to the human is exactly when it matters.
+      e,
+      hidden: !keepHarness && e.role === "user" && isHarnessTurn(e.text),
+      // Only an INBOUND hidden turn ends an exchange. See isInboundTurn().
+      breaks: e.role === "user" && (!isHarnessTurn(e.text) || isInboundTurn(e.text)),
+    }));
+  const rows = marked.filter(m => !m.hidden).map(m => m.e);
   /*
    * EXCHANGES BY DEFAULT, not messages.
    *
@@ -858,11 +875,15 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   let tail: typeof rows;
   if (!wantRole && !f.flat) {
     const pairs: typeof rows = [];
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].role !== "user") continue;
+    for (let i = 0; i < marked.length; i++) {
+      if (marked[i].hidden || marked[i].e.role !== "user") continue;
       let last: (typeof rows)[number] | null = null;
-      for (let j = i + 1; j < rows.length && rows[j].role !== "user"; j++) last = rows[j];
-      pairs.push(rows[i]);
+      // Stop at the next turn that BREAKS the exchange — a visible human turn, or a
+      // hidden inbound one. A hidden turn the human's own turn caused does not break.
+      for (let j = i + 1; j < marked.length && !marked[j].breaks; j++) {
+        if (!marked[j].hidden) last = marked[j].e;
+      }
+      pairs.push(marked[i].e);
       if (last) pairs.push(last);
     }
     // n counts EXCHANGES, so take 2n messages — that is what the flag means to read.

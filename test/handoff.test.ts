@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { dur, handoffStats } from "../src/time.js";
-import { handoffBudget } from "../src/recap.js";
+import { handoffBudget, isHarnessTurn, isInboundTurn } from "../src/recap.js";
 
 /**
  * `relic tail --handoff` exists so the NEXT session is handed the pacing of this one
@@ -91,5 +91,45 @@ describe("handoffBudget", () => {
 
   test("the human budget is never floored — an explicit --chars is obeyed", () => {
     expect(handoffBudget("user", 40)).toBe(40);
+  });
+});
+
+/*
+ * Both of these were real failures, found by running --handoff on the session that
+ * built it — first every reply after a bash-stdout vanished, then "suggest me" was
+ * answered by a PR report it had nothing to do with.
+ */
+describe("isInboundTurn", () => {
+  const INBOUND = [
+    ["a worker reporting in", "Another Claude session sent a message: <teammate-message teammate_id=\"noise\">"],
+    ["a bare teammate message", "<teammate-message teammate_id=\"vaults\">PR #52</teammate-message>"],
+    ["a background task finishing", "<task-notification> <task-id>af52c74</task-id>"],
+    ["the compaction resume prompt", "Continue from where you left off."],
+  ] as const;
+  for (const [what, text] of INBOUND)
+    test(`${what} starts a new exchange`, () => {
+      expect(isInboundTurn(text)).toBe(true);
+      expect(isHarnessTurn(text)).toBe(true);   // hidden from the reader either way
+    });
+
+  /*
+   * The other half, and the reason this is not just isHarnessTurn. These are caused
+   * BY the human's turn, so the assistant message after them still belongs to it.
+   */
+  const CAUSED = [
+    ["shell output from a ! command", "<bash-stdout>\u03c8\nCLAUDE.md"],
+    ["the skill body the harness pastes", "Base directory for this skill: /Users/x/.claude/skills/dig"],
+    ["slash-command expansion", "<command-message>dig</command-message>"],
+    ["a system reminder", "<system-reminder>Codebase instructions</system-reminder>"],
+  ] as const;
+  for (const [what, text] of CAUSED)
+    test(`${what} is hidden but does NOT break the exchange`, () => {
+      expect(isHarnessTurn(text)).toBe(true);
+      expect(isInboundTurn(text)).toBe(false);
+    });
+
+  test("a real human turn is neither", () => {
+    expect(isHarnessTurn("merge it")).toBe(false);
+    expect(isInboundTurn("merge it")).toBe(false);
   });
 });
