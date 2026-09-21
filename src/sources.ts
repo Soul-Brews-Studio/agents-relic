@@ -208,6 +208,11 @@ export const BUILTIN: SourceDef[] = [
     // path. Measured on this machine: 413 repos carry a ψ, 386 distinct after
     // resolving symlinks — against the one that `oracle-vault` can name.
     //
+    // Worktree vaults (`<repo>/wt/<slug>/ψ`, `<repo>/agents/<slug>/ψ`) are walked too,
+    // and deduped against the repo's main checkout — a worktree is a second checkout of
+    // a repo that commits its vault, so walking them without a rule adds 194,863 notes
+    // of which 738 are new. See walkVaults in discover.ts for the rule.
+    //
     // Off by default and deliberately so: it reads a tree this tool does not own, and
     // on a machine with a different layout the glob finds nothing rather than
     // something wrong. Point it at the host of a ghq root — the level holding <org>/
@@ -225,7 +230,7 @@ export const BUILTIN: SourceDef[] = [
     // content, so the answer stays right either way.
     key: "oracle-vaults", path: join(ghqRoot(), "github.com"),
     walk: "vaults", parser: parseVault, enabled: false, bank: "vaults",
-    note: "EVERY <org>/<repo>/ψ under the ghq tree — symlinks resolved, realpath-deduped",
+    note: "EVERY <org>/<repo>/ψ under the ghq tree, worktrees included — symlinks resolved, realpath-deduped",
   },
   {
     // Claude Code's OWN memory — durable typed facts the agent chose to keep, each

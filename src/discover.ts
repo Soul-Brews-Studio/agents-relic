@@ -2,6 +2,7 @@ import { readdirSync, statSync, existsSync, lstatSync, realpathSync } from "node
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { bankOf, loadSources } from "./sources.js";
+import { repoKeyOf } from "./repo.js";
 import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
 
@@ -189,6 +190,18 @@ function walkOmp(root: string, sinceMs: number | null, out: Found[], srcKey: str
 }
 
 /**
+ * Two hooks, at two points, because they answer two different questions.
+ *
+ * `keep` is the DEDUPE veto: it sees every note the walk reaches and says whether this
+ * copy of it is worth a row. `found` is the progress tick and fires only for notes that
+ * actually landed, so the number it reports stays a count of results.
+ */
+interface VaultHooks {
+  keep?: (file: string, size: number) => boolean;
+  found?: () => void;
+}
+
+/**
  * Oracle vault: `<repo>/ψ/**.md`.
  *
  * Bounded by extension and by an explicit skip list, NOT by depth — the vault nests
@@ -197,19 +210,140 @@ function walkOmp(root: string, sinceMs: number | null, out: Found[], srcKey: str
  * because lab subprojects inside the vault carry both, and vendored markdown is
  * 280 files of other people's READMEs, not vault content.
  */
-function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser, depth = 0, onFound?: () => void) {
+function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser, depth = 0, hooks: VaultHooks = {}) {
   if (depth > 12) return;                     // pathological-symlink guard, not a scope limit
   for (const f of files(root, ".md")) {
     const p = join(root, f);
     const st = statOf(p);
-    if (!st || (sinceMs && st.mtime * 1000 < sinceMs)) continue;
+    if (!st) continue;
+    /*
+     * The veto runs BEFORE `--since`, deliberately.
+     *
+     * A worktree is a fresh checkout, so git stamps every note in it with the moment
+     * the worktree was cut. Under `--since 7d` the COPIES look new and the ORIGINALS
+     * look old — the exact inversion that would make a narrowed run index the
+     * duplicates it is supposed to suppress. The veto has to see the whole vault
+     * before it can say "already have this one".
+     */
+    if (hooks.keep && !hooks.keep(p, st.size)) continue;
+    if (sinceMs && st.mtime * 1000 < sinceMs) continue;
     out.push({ path: p, projectDir: srcKey, tier: "note", source: srcKey,
       workflowRunId: null, agentId: null, ...st, parser });
+    hooks.found?.();
   }
   for (const d of dirs(root)) {
     if (d === "node_modules" || d === ".git") continue;
-    walkVault(join(root, d), sinceMs, out, srcKey, parser, depth + 1, onFound);
+    walkVault(join(root, d), sinceMs, out, srcKey, parser, depth + 1, hooks);
   }
+}
+
+const PSI = "\u03c8";
+
+/** `<org>/<repo>/ψ` — the vault a repo keeps in its main checkout. */
+function repoVaultPaths(root: string): string[] {
+  const out: string[] = [];
+  for (const org of dirs(root)) {
+    const orgPath = join(root, org);
+    for (const repo of dirs(orgPath)) out.push(join(orgPath, repo, PSI));
+  }
+  return out;
+}
+
+/**
+ * The SAME repo, checked out again: `<repo>/wt/<slug>/ψ` and `<repo>/agents/<slug>/ψ`.
+ *
+ * TWO NAMES, not "whatever is at that level". `contextOf` in repo.ts already reads
+ * exactly these two as a worktree segment, and the level itself is not safe to take —
+ * measured on this machine 2026-09-22, every directory at `<repo>/<X>/<slug>/ψ`:
+ *
+ *   60  wt/<slug>/ψ
+ *   49  agents/<slug>/ψ
+ *   14  one-offs — an incubated subproject's own checkout, a nested app
+ *
+ * Those 14 are OTHER repos that happen to live inside this one. Walking the level
+ * would file their notes under the containing repo's key, which is the wrong answer
+ * stored permanently rather than a missing one that can still be found.
+ */
+const WORKTREE_DIRS = ["wt", "agents"];
+
+function worktreeVaultPaths(root: string): string[] {
+  const out: string[] = [];
+  for (const org of dirs(root)) {
+    const orgPath = join(root, org);
+    for (const repo of dirs(orgPath)) {
+      for (const wt of WORKTREE_DIRS) {
+        const wtPath = join(orgPath, repo, wt);
+        for (const slug of dirs(wtPath)) out.push(join(wtPath, slug, PSI));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Candidate paths -> the directories they actually name.
+ *
+ * lstat first: existsSync FOLLOWS the link, so a dead one is already false — but a
+ * live one must be resolved before `dirs()` refuses to see it. 40 of this machine's
+ * 421 repo-level ψ point at a path that does not exist here, and they drop out here.
+ */
+function resolveVaults(paths: string[]): string[] {
+  const out: string[] = [];
+  for (const p of paths) {
+    try { lstatSync(p); out.push(realpathSync(p)); }
+    catch { /* missing, or a dead symlink — contributes nothing */ }
+  }
+  return out;
+}
+
+/*
+ * A VAULT CAN CONTAIN ANOTHER VAULT, and equality-dedup does not catch it.
+ *
+ * `ψ/incubate/<org>/<repo>/origin` is a real checkout living inside a vault, and
+ * that checkout has its own ψ. Both are enumerated: the outer one emits the inner
+ * one's notes while recursing, and then the inner one is walked again on its own.
+ * Measured before this: 111 files emitted twice out of 116,952.
+ *
+ * Sorting by length puts every container ahead of anything it contains, so one
+ * forward pass decides it. The trailing separator matters — without it, a sibling
+ * named `ψ-old` would be treated as living inside `ψ`.
+ *
+ * `already` carries the roots an earlier pass kept, so the worktree pass is judged
+ * against the repo-level vaults as well as against itself.
+ */
+function outermost(cands: string[], already: string[] = []): string[] {
+  const kept = [...already];
+  const fresh: string[] = [];
+  for (const real of [...cands].sort((a, b) => a.length - b.length)) {
+    if (kept.some(k => real === k || real.startsWith(k + "/"))) continue;
+    kept.push(real);
+    fresh.push(real);
+  }
+  return fresh;
+}
+
+/**
+ * WHAT MAKES TWO FILES THE SAME NOTE — the rule this whole walk turns on.
+ *
+ * The owning repo, the note's path INSIDE its vault, and its byte size. A worktree
+ * vault is a second checkout of one repo, so the note at `ψ/memory/x.md` in the
+ * worktree is the note at `ψ/memory/x.md` in the main checkout; the absolute paths
+ * differ and nothing else does.
+ *
+ * `repoKeyOf` collapses `<repo>/wt/<slug>` back to `<repo>`, which is what lets the
+ * two sides meet. Its fallback is the vault root itself — a vault outside a
+ * `github.com/<org>/<repo>` path has no twin to collide with, so it keeps everything.
+ *
+ * SIZE IS IN THE KEY because a shared path is not a promise of shared content:
+ * measured over the 12,820 notes that exist at one path in two checkouts, 12,677 are
+ * byte-identical and 143 are not — a worktree holding an edit that never came back.
+ * Hashing every byte would settle those 143 exactly and cost a full read of 194,863
+ * files that discovery currently only stats; size settles 143 of 143 for free, because
+ * `statOf` has already read it. It is the cheap key that happens to be the right one
+ * HERE, where the two copies come from the same commit or from an edit to it.
+ */
+function noteKey(vault: string, file: string, size: number): string {
+  return `${repoKeyOf(vault) ?? vault}\u0000${file.slice(vault.length + 1)}\u0000${size}`;
 }
 
 /**
@@ -239,46 +373,54 @@ function walkVault(root: string, sinceMs: number | null, out: Found[], srcKey: s
  *    this machine. existsSync on a broken symlink is false, so this falls out of the
  *    resolve — but only if the resolve is attempted at all.
  *
- * Worktrees need no special case: they live at <org>/<repo>/wt/<name>, one level
- * below what this enumerates.
+ * 5. WORKTREE VAULTS EXIST, AND THEY ARE MOSTLY COPIES. This used to read "worktrees
+ *    need no special case — they live one level below what this enumerates", and that
+ *    sentence hid 109 of them. They are real directories, not links back, so realpath
+ *    cannot collapse them; a repo commits its vault, so every worktree carries a
+ *    near-complete copy of it. Measured on this machine 2026-09-22:
+ *
+ *      109  ψ under wt/ and agents/ — 96 distinct once resolved, since 4 link into
+ *           another repo's worktree and 9 are already reached through some repo's
+ *           root ψ symlink
+ *
+ *      147,901  files the repo-level walk yields today
+ *      342,764  what a wider walk with no rule yields          +131.8%
+ *      148,639  what this yields                               +  0.50%
+ *
+ *    So the walk widens and `noteKey` decides. The two passes are ordered, and the
+ *    order IS the rule: the repo-level vault goes first and wins every tie, so nothing
+ *    discovered before this change is discovered any less. That matters beyond taste —
+ *    `relic prune` deletes rows whose file discovery no longer reaches, so a rule that
+ *    demoted an already-indexed path would queue it for deletion.
  */
-function walkVaults(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+export function walkVaults(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
   // Resolve every candidate FIRST, then walk. Two passes because the dedup below is
   // containment, not equality, and containment needs the full set before it can
   // decide — which is only knowable once everything is resolved.
-  const resolved: string[] = [];
-  for (const org of dirs(root)) {
-    const orgPath = join(root, org);
-    for (const repo of dirs(orgPath)) {
-      const psi = join(orgPath, repo, "\u03c8");
-      try {
-        // lstat first: existsSync FOLLOWS the link, so a dead one is already false —
-        // but a live one must be resolved before `dirs()` refuses to see it.
-        lstatSync(psi);
-        resolved.push(realpathSync(psi));
-      } catch { /* missing, or a dead symlink — contributes nothing */ }
-    }
+  const repos = outermost(resolveVaults(repoVaultPaths(root)));
+  const seen = new Set<string>();
+  for (const vault of repos) {
+    walkVault(vault, sinceMs, out, srcKey, parser, 0, {
+      keep: (p, size) => { seen.add(noteKey(vault, p, size)); return true; },
+    });
   }
 
   /*
-   * A VAULT CAN CONTAIN ANOTHER VAULT, and equality-dedup does not catch it.
-   *
-   * `ψ/incubate/<org>/<repo>/origin` is a real checkout living inside a vault, and
-   * that checkout has its own ψ. Both are enumerated: the outer one emits the inner
-   * one's notes while recursing, and then the inner one is walked again on its own.
-   * Measured before this: 111 files emitted twice out of 116,952.
-   *
-   * Sorting by length puts every container ahead of anything it contains, so one
-   * forward pass decides it. The trailing separator matters — without it, a sibling
-   * named `ψ-old` would be treated as living inside `ψ`.
+   * Sorted, because "first one wins" is only a rule if the order is fixed. Two
+   * worktrees of one repo can both hold a note the main checkout does not, and
+   * whichever is walked first is the copy that gets the row — by path, every run.
    */
-  resolved.sort((a, b) => a.length - b.length);
-  const kept: string[] = [];
-  for (const real of resolved) {
-    if (kept.some(k => real === k || real.startsWith(k + "/"))) continue;
-    kept.push(real);
+  const worktrees = outermost(resolveVaults(worktreeVaultPaths(root)), repos).sort();
+  for (const vault of worktrees) {
+    walkVault(vault, sinceMs, out, srcKey, parser, 0, {
+      keep: (p, size) => {
+        const k = noteKey(vault, p, size);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      },
+    });
   }
-  for (const real of kept) walkVault(real, sinceMs, out, srcKey, parser);
 }
 
 /**
@@ -404,7 +546,7 @@ export function discover(only: string[] | null, sinceMs: number | null,
     else if (src.walk === "memory") walkMemory(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "hermes") walkHermes(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "vaults") walkVaults(root, sinceMs, out, src.key, src.parser);
-    else if (src.walk === "vault") walkVault(root, sinceMs, out, src.key, src.parser, 0, tick);
+    else if (src.walk === "vault") walkVault(root, sinceMs, out, src.key, src.parser, 0, { found: tick });
     else if (src.walk === "omp") walkOmp(root, sinceMs, out, src.key, src.parser);
     else if (src.walk === "flat") walkFlat(root, sinceMs, out, src.key, src.parser);
     else walkClaude(root, sinceMs, out, src.key, src.parser);

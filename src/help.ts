@@ -19,8 +19,8 @@ export function helpText(): string {
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run] [--prune]
           [--source-path PATH]   run ONE --corpus against a root it does not normally
-                               walk — same walker, parser and bank. For a vault the
-                               vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
+                               walk — same walker, parser and bank. For a vault
+                               outside the ghq tree the vaults walker enumerates.
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.
