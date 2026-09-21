@@ -49,6 +49,11 @@ export function helpText(): string {
                                --tree shows the SHAPE: which agents shared a workflow run
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
   read    <file> [--prose]     whole transcript as readable conversation, any format
+  tail    <id|prefix|file> [-n 10] [--chars N] [--role user] [--harness]
+                               the LAST N turns — what was I just doing. Takes a
+                               session ID, reads the FILE not the index (so it is
+                               never stale), and strips harness turns by default:
+                               55 of 63 user-channel turns were the tooling itself.
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now|live [--all] [--window 300]  what is running RIGHT NOW — this session, its agents
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers

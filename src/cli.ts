@@ -12,6 +12,8 @@ import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
+import { flags } from "./flags.js";
+import { isHarnessTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -25,20 +27,6 @@ import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
-function flags(argv: string[]) {
-  const f: Record<string, string | boolean> = {};
-  const pos: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith("--")) {
-      const [k, v] = a.slice(2).split("=");
-      if (v !== undefined) f[k] = v;
-      else if (argv[i + 1] && !argv[i + 1].startsWith("--")) f[k] = argv[++i];
-      else f[k] = true;
-    } else pos.push(a);
-  }
-  return { f, pos };
-}
 const fmt = (n: number) => n.toLocaleString("en-US");
 
 /**
@@ -614,6 +602,102 @@ async function cmdSessions(f: Record<string, string | boolean>) {
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }
 
+// ---- tail ------------------------------------------------------------------
+/**
+ * The last N turns of a session — the thing `read | tail` was being used for.
+ *
+ * Three commands nearly did this and none of them did:
+ *   recap <id>        a SUMMARY — what was asked, what ran, how it ended
+ *   read  <file>      the WHOLE transcript, and it needs a path, not an id
+ *   show  <file>      raw JSON around one seq, and you must know the last seq
+ *
+ * So the working recipe was two commands and a pipe:
+ *     F=$(relic session <id> --plain | head -1); relic read "$F" --prose | tail -40
+ *
+ * READS THE FILE, NEVER THE INDEX. "What was I just doing" is the one question where
+ * a stale answer is worst, and the index is always at least one run behind the live
+ * session — measured while building this, the current turn was in the file and not in
+ * the index. That is also why no staleness warning is needed here.
+ *
+ * HARNESS TURNS ARE STRIPPED BY DEFAULT, reusing recap's filter. The user channel is
+ * not the human: measured on the session this was built against, 55 of 63 user-channel
+ * turns were the tooling describing itself. An unfiltered "last 10 turns" is mostly
+ * slash-command expansion and system reminders — it answers the wrong question while
+ * looking like it answered the right one.
+ */
+async function cmdTail(target: string, f: Record<string, string | boolean>) {
+  const n = Number(f.n ?? f.limit ?? 10);
+  const chars = f.chars !== undefined ? Number(f.chars) : 0;      // 0 = whole turn
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
+
+  // A path is a path; anything else is an id to resolve. The index is used ONLY to
+  // turn an id into a filename — never to supply the turns.
+  let file = target;
+  if (!target.includes("/")) {
+    const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
+    const rows: any[] = res?.rows ?? [];
+    if (!rows.length) {
+      console.error(`no session matches ${target}`);
+      console.error(`  relic now --all   lists what is running; relic report --since 7d  what ran lately`);
+      process.exit(1);
+    }
+    // The PARENT transcript: a subagent's tail answers what an agent said to itself.
+    const parent = rows.find((r: any) => r.tier === "session") ?? rows[0];
+    file = String(parent.file_path);
+  }
+
+  const { parserFor } = await import("./sources.js");
+  let parsed;
+  try { parsed = await parserFor(file)(file); }
+  catch (e) { console.error(`cannot read ${file}: ${String(e).slice(0, 160)}`); process.exit(1); }
+
+  const wantRole = f.role as string | undefined;
+  const keepHarness = Boolean(f.harness);
+  const rows = parsed.events.filter(e => {
+    if (wantRole) return e.role === wantRole;
+    if (e.role !== "user" && e.role !== "assistant") return false;
+    if (!keepHarness && e.role === "user" && isHarnessTurn(e.text)) return false;
+    return true;
+  });
+  const tail = rows.slice(-Math.max(1, n));
+  const omitted = rows.length - tail.length;
+
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify({ file, title: parsed.title, turns: tail }, null, 2)); return; }
+  if (mode === "jsonl") { for (const e of tail) console.log(JSON.stringify(e)); return; }
+  if (mode === "plain") { for (const e of tail) console.log(`${e.seq}\t${e.role}\t${e.text.replace(/\s+/g, " ")}`); return; }
+
+  if (parsed.title) console.log(`${parsed.title}`);
+  // Say what was filtered OUT. "10 turns" and "10 turns of 1,751" are different facts,
+  // and so is "harness turns hidden" — the reader has to know what they are not seeing.
+  /*
+   * NAME THE ROLE MIX, because "last 10 turns" is not what people expect.
+   *
+   * One exchange emits many assistant messages — narration between tool calls — so a
+   * chronological tail of a busy session is almost entirely assistant. That is
+   * correct and unhelpful; saying so points the reader at `--role user`, which is
+   * what "what did I last ask" actually needs.
+   */
+  const mix = tail.reduce((m, e) => m.set(e.role, (m.get(e.role) ?? 0) + 1), new Map<string, number>());
+  const mixed = [...mix].map(([r, c]) => `${c} ${r}`).join(" · ");
+  console.log(`last ${tail.length} of ${fmt(rows.length)} turns  (${mixed})` +
+              (keepHarness ? " (harness included)" : "") +
+              `  ·  ${fmt(parsed.events.length)} events in file  ·  read from disk, not the index`);
+  if (!wantRole && !mix.get("user"))
+    console.log(`  note: no human turns in this window — one exchange emits many assistant messages.` +
+                `  relic tail ${target} --role user  for what was asked.`);
+  console.log("");
+  for (const e of tail) {
+    console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}`);
+    const text = chars > 0 ? e.text.slice(0, chars) + (e.text.length > chars ? " …" : "") : e.text;
+    console.log(text.replace(/^/gm, "  "));
+    console.log();
+  }
+  if (omitted > 0) console.log(`${fmt(omitted)} earlier turns not shown (-n N)`);
+}
+
 // ---- report ----------------------------------------------------------------
 /**
  * Day by day, with the shape a flat list cannot show.
@@ -1152,6 +1236,7 @@ if (!cmd || f.help) {
 if (cmd === "index") await cmdIndex(f);
 else if (cmd === "prune") await cmdPrune(f);
 else if (cmd === "report") await cmdReport(f);
+else if (cmd === "tail") { if (!pos[1]) { console.error("tail needs a session id or a file path"); process.exit(1); } await cmdTail(pos[1], f); }
 else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {

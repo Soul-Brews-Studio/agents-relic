@@ -984,6 +984,44 @@ the single thing the view exists to show. Bars compare within a run, never acros
 `journal.jsonl` rows are dropped: a workflow directory holds one, it has no events and no
 clock, and it renders as a zero-length bar at the origin of every group.
 
+### `tail` — the last N turns, which is "what was I just doing"
+
+```bash
+relic tail 04d1d650                 # last 10 turns
+relic tail 04d1d650 --role user     # last 10 things the HUMAN asked
+relic tail 04d1d650 -n 3 --chars 200
+```
+
+Three commands nearly did this and none of them did: `recap <id>` is a *summary*,
+`read <file>` is the *whole* transcript and needs a path rather than an id, and
+`show <file> --seq N` prints raw JSON around a seq you must already know. So the
+working recipe was two commands and a pipe:
+
+```bash
+F=$(relic session <id> --plain | head -1); relic read "$F" --prose | tail -40
+```
+
+**Reads the file, never the index.** "What was I just doing" is the one question where
+a stale answer is worst, and the index is always at least one run behind a live
+session — while building this, the current turn was in the file and not in the index.
+No staleness warning is needed here for the same reason.
+
+**Harness turns are stripped by default**, reusing `recap`'s filter. The user channel is
+not the human: measured on one session, **55 of 63** user-channel turns were the tooling
+describing itself. `--harness` keeps them.
+
+**It names the role mix, because "last 10 turns" is not what people expect.** One
+exchange emits many assistant messages — narration between tool calls — so a
+chronological tail of a busy session is almost entirely assistant:
+
+```
+last 3 of 1,635 turns  (3 assistant)  ·  6,417 events in file  ·  read from disk, not the index
+  note: no human turns in this window — one exchange emits many assistant messages.
+        relic tail 04d1d650 --role user  for what was asked.
+```
+
+That is correct and unhelpful, so it says so and points at the view that answers.
+
 ### `show` — read the surrounding conversation
 
 ```bash
