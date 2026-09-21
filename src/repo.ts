@@ -43,6 +43,8 @@ export function repoKeyOf(cwd: string | null): string | null {
  * only from the import path where the filesystem is already in play.
  */
 let repoIndexCache: Map<string, string[]> | null = null;
+/** Both caches are one fact about this machine — reset them together or they drift. */
+export function resetRepoIndex(): void { repoIndexCache = null; canonCache = null; }
 export function repoIndex(): Map<string, string[]> {
   if (repoIndexCache) return repoIndexCache;
   const out = new Map<string, string[]>();
@@ -85,9 +87,51 @@ function uniqueRepo(name: string): string | null {
  * So most of `_unresolved` is right and stays. These two are checkouts OF a repo whose
  * identity is in the path, just not as a `github.com/<org>/<repo>` triple.
  */
+/**
+ * The ghq tree's OWN spelling of a repo key, case-corrected.
+ *
+ * `repoKeyOf` echoes whatever casing the session's cwd used, so one repo acquires
+ * several keys and `--repo` — which filters the column exactly — reaches a fraction of
+ * its own history. Measured on the live index before this:
+ *
+ *     2,849 events in one shard, 3 distinct repo_key
+ *       2,720  github.com/laris-co/DustBoy-Oracle
+ *         119  github.com/laris-co/Dustboy-Oracle
+ *          10  github.com/laris-co/dustboy-oracle
+ *
+ * `relic search --repo Dustboy-Oracle` reached 119 of 2,849 and reported success.
+ *
+ * ON macOS THE DIRECTORY HID IT. All three spellings resolved to inode 520201074 —
+ * one directory, three keys inside. A case-sensitive filesystem splits it for real:
+ * three shard directories, a third of the history in each. white.local is Ubuntu.
+ *
+ * NOT in repoKeyOf(), which is pure by design — a path in, a key out, no filesystem.
+ * Canonicalising needs to know what exists on this machine, so it lives here with the
+ * other index-backed fallbacks.
+ */
+let canonCache: Map<string, string> | null = null;
+export function canonicalRepoKey(key: string): string {
+  if (!canonCache) {
+    canonCache = new Map();
+    for (const keys of repoIndex().values())
+      for (const k of keys) {
+        // Exact wins over case-folded: on a case-sensitive filesystem two repos CAN
+        // differ only by case, and silently folding them together would be a worse
+        // bug than the one this fixes.
+        canonCache.set(k, k);
+        const lc = k.toLowerCase();
+        if (!canonCache.has(lc)) canonCache.set(lc, k);
+      }
+  }
+  return canonCache.get(key) ?? canonCache.get(key.toLowerCase()) ?? key;
+}
+
 export function resolveRepoKey(cwd: string | null): string | null {
   const direct = repoKeyOf(cwd);
-  if (direct || !cwd) return direct;
+  // A repo this machine does not have falls through unchanged — peer roots carry paths
+  // from another host, and inventing a spelling for them would be worse than echoing.
+  if (direct) return canonicalRepoKey(direct);
+  if (!cwd) return direct;
   const parts = cwd.split("/").filter(Boolean);
 
   // herdr's GLOBAL worktree root: ~/.herdr/worktrees/<repo>/<space>/...

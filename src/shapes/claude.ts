@@ -39,7 +39,12 @@ export const parseClaude: Parser = async (filePath) => {
 
     // cwd comes from the session's own field, never decoded from the directory name:
     // the encoding maps BOTH "/" and "." to "-", so it is lossy and not reversible.
-    if (!cwd) cwd = str(rec.cwd);
+    //
+    // `cwd` (first seen) still identifies the SESSION and picks its shard. `lineCwd`
+    // is what this record actually said, and rides on the event — a session that
+    // changes repos mid-flight had 201 events unreachable by cwd before this.
+    const lineCwd = str(rec.cwd);
+    if (!cwd) cwd = lineCwd;
     if (!/^[0-9a-f-]{36}$/.test(sessionUuid)) sessionUuid = str(rec.sessionId) ?? sessionUuid;
 
     const ts = str(rec.timestamp);
@@ -72,7 +77,7 @@ export const parseClaude: Parser = async (filePath) => {
     if (!description && role === "user") description = truncate(text, 200);
     events.push({
       uid: uidOf("claude", fileKey, seq),   // path-independent by design
-      seq, role, ts, text: truncate(text),
+      seq, role, ts, text: truncate(text), cwd: lineCwd,
     });
   }
 

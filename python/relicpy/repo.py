@@ -109,6 +109,48 @@ PROJECT_CONTAINERS = {"lab", "soul-brews-studio", "learn", "demos"}
 _SIBLING = re.compile(r"^.*?\.(wt-.*|omx-worktrees|worktrees)$")
 
 
+_canon_cache: Optional[dict] = None
+
+
+def canonical_repo_key(key: str) -> str:
+    """The ghq tree's OWN spelling of a repo key, case-corrected.
+
+    `repo_key_of` echoes whatever casing the session's cwd used, so one repo acquires
+    several keys and `--repo` — which filters the column exactly — reaches a fraction
+    of its own history. Measured on the live index before this:
+
+        2,849 events in one shard, 3 distinct repo_key
+          2,720  github.com/laris-co/DustBoy-Oracle
+            119  github.com/laris-co/Dustboy-Oracle
+             10  github.com/laris-co/dustboy-oracle
+
+    ON macOS THE DIRECTORY HID IT — all three resolved to inode 520201074, one
+    directory with three keys inside. A case-sensitive filesystem splits it for real:
+    three shard directories, a third of the history in each. white.local is Ubuntu.
+
+    NOT in repo_key_of(), which is pure by design — a path in, a key out, no
+    filesystem. Canonicalising needs to know what exists on this machine.
+    """
+    global _canon_cache
+    if _canon_cache is None:
+        _canon_cache = {}
+        for keys in repo_index().values():
+            for k in keys:
+                # Exact wins over case-folded: on a case-sensitive filesystem two repos
+                # CAN differ only by case, and silently folding them together would be
+                # a worse bug than the one this fixes.
+                _canon_cache[k] = k
+                _canon_cache.setdefault(k.lower(), k)
+    return _canon_cache.get(key) or _canon_cache.get(key.lower()) or key
+
+
+def reset_repo_index() -> None:
+    """Both caches are one fact about this machine — reset together or they drift."""
+    global _repo_index_cache, _canon_cache
+    _repo_index_cache = None
+    _canon_cache = None
+
+
 _repo_index_cache: Optional[dict] = None
 
 
@@ -166,7 +208,12 @@ def resolve_repo_key(cwd: Optional[str]) -> Optional[str]:
        16  /tmp/claude-<uid>/-<encoded>/...     recoverable
     """
     direct = repo_key_of(cwd)
-    if direct or not cwd:
+    # A repo this machine does not have falls through unchanged — peer roots carry
+    # paths from another host, and inventing a spelling for them would be worse than
+    # echoing. See canonical_repo_key.
+    if direct:
+        return canonical_repo_key(direct)
+    if not cwd:
         return direct
     parts = [x for x in cwd.split("/") if x]
 
