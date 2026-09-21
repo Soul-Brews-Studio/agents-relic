@@ -18,7 +18,7 @@ import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
-         statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
+         statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
@@ -361,7 +361,17 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
   if (!pickShards(scope).length) {
     const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
-    console.log(`no shards found in  ${where}\n`);
+    /*
+     * "NOT INDEXED" AND "NO MATCHES" ARE DIFFERENT FACTS, and this message covered
+     * both. The narrower the filter, the likelier it selects a slice that is entirely
+     * un-indexed — and the more authoritative the empty answer looks.
+     */
+    const named = ["repo", "bank", "worktree"].filter(k => f[k]).map(k => `--${k} ${f[k]}`).join(" ");
+    console.log(`no shards ${named ? `match ${named}` : `found`} in  ${where}\n`);
+    if (named) {
+      console.log(`  This is NOT "no matches" — nothing for that filter is in the index at all.`);
+      console.log(`  Check what is on disk but unindexed:   relic pending${f.repo ? ` --repo ${f.repo}` : ""}`);
+    }
     console.log(`  index one first:   relic index --since 7d${dataRoot ? ` --data-root ${dataRoot}` : ""}`);
     if (!dataRoot) console.log(`  or point elsewhere: relic search ... --data-root /path/to/index`);
     return;
@@ -415,8 +425,31 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
   if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`); return; }
   const narrowed = !f["all-tiers"] && !f.tier;
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms` +
-    (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : "") + "\n");
+  /*
+   * HOW OLD IS THE INDEX BEHIND THIS ANSWER.
+   *
+   * A ranked list from a stale index is worse than an empty one — confident,
+   * relevant-looking, and silently scoped to whatever happened to be indexed. Scoped
+   * to the shards that actually produced hits: that is the relevant population, and
+   * freshness() full-scans two columns per shard (9.1 ms measured), so asking all
+   * 1,136 would cost 10.3 s against a 1 s search.
+   */
+  const byKey = new Map(pickShards(scope).map(sh => [sh.key, sh.dir]));
+  const fresh = await answerFreshness(
+    [...new Set(hits.slice(0, limit).map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
+  const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
+  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+    (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
+  // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
+  if (fresh && fresh.ageSec > 86_400) {
+    // NOT `--corpus claude-live`: the stale shards may be any bank, and naming the
+    // wrong corpus sends the reader to re-index something that was already current.
+    const scoped = [f.repo ? `--repo ${f.repo}` : "", f.bank ? `--bank ${f.bank}` : ""].filter(Boolean).join(" ");
+    console.log(`  \u26A0 the shards that answered were last indexed ${humanAge(fresh.ageSec)} ago —` +
+                ` newer sessions are NOT in these results.`);
+    console.log(`     relic index${scoped ? ` ${scoped}` : ""}   ·   relic status  names which bank is behind`);
+  }
+  console.log("");
   for (const h of hits.slice(0, limit)) {
     const i = h.text.toLowerCase().indexOf(q.toLowerCase());
     const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);

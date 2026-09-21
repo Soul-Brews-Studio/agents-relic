@@ -547,6 +547,42 @@ Filters stack:
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
 
+### Staleness, because a stale hit looks exactly like a fresh one
+
+```
+10 of 703 match(es) for prune ceiling · 1136 shards · 376 ms  ·  indexed 77.6h ago
+  ⚠ the shards that answered were last indexed 77.6h ago — newer sessions are NOT in these results.
+     relic index --bank projects-archive   ·   relic status  names which bank is behind
+```
+
+An empty result announces itself. **A ranked list from a stale index does not** — it is
+confident, relevant-looking, and silently scoped to whatever happened to be indexed. The
+header used to report shard count and latency, neither of which changes how you read the
+results.
+
+**Scoped to the shards that produced hits.** That is the relevant population — *how
+current is what answered me* — and it is the only affordable one: `freshness()`
+full-scans two columns per shard at **9.1 ms**, so asking all 1,136 costs **10.3 s**
+against a 1 s search. Over hit shards it measured **92 ms, 2.3% overhead**.
+
+The cheap alternative was measured and rejected. Shard directory mtime covers all 1,136
+shards in **4 ms** — 2,575× faster — but over 60 shards, 18 read *older* than
+`imported_at` (safe: over-reports staleness) and **1 read newer by 3 hours**, which is
+the direction that calls a stale index fresh. A staleness warning that can under-report
+is worse than none, because it gets trusted.
+
+**"Not indexed" and "no matches" are different facts.** With a `--repo` / `--bank` /
+`--worktree` filter that matches no shard, the narrower the filter the likelier it
+selects a slice that is entirely un-indexed — and the more authoritative the empty
+answer looks:
+
+```
+no shards match --repo arra-oracle-v4 in  /Users/beta/.relic
+
+  This is NOT "no matches" — nothing for that filter is in the index at all.
+  Check what is on disk but unindexed:   relic pending --repo arra-oracle-v4
+```
+
 ### Fan-out cost, and what it is not
 
 An unfiltered search asks all 817 shards. They are queried concurrently, capped at
