@@ -664,7 +664,36 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
     if (!keepHarness && e.role === "user" && isHarnessTurn(e.text)) return false;
     return true;
   });
-  const tail = rows.slice(-Math.max(1, n));
+  /*
+   * EXCHANGES BY DEFAULT, not messages.
+   *
+   * A chronological tail of a busy session is almost entirely assistant — one
+   * exchange emits many assistant messages, the narration between tool calls. Asking
+   * for "the last 15 turns" and getting 15 of my own progress notes answers nothing
+   * about what happened.
+   *
+   * An exchange is: the human's turn, plus the LAST thing I said before they spoke
+   * again. The last one, not the first — the first is "let me check that", the last
+   * is the conclusion. That pair is the unit a reader means by "a turn".
+   *
+   * --flat restores the raw message tail; --role already bypasses pairing, because
+   * asking for one role means you want that role's messages.
+   */
+  let tail: typeof rows;
+  if (!wantRole && !f.flat) {
+    const pairs: typeof rows = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].role !== "user") continue;
+      let last: (typeof rows)[number] | null = null;
+      for (let j = i + 1; j < rows.length && rows[j].role !== "user"; j++) last = rows[j];
+      pairs.push(rows[i]);
+      if (last) pairs.push(last);
+    }
+    // n counts EXCHANGES, so take 2n messages — that is what the flag means to read.
+    tail = pairs.slice(-Math.max(2, n * 2));
+  } else {
+    tail = rows.slice(-Math.max(1, n));
+  }
   const omitted = rows.length - tail.length;
 
   const mode = outFmt(f);
@@ -688,9 +717,9 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   console.log(`last ${tail.length} of ${fmt(rows.length)} turns  (${mixed})` +
               (keepHarness ? " (harness included)" : "") +
               `  ·  ${fmt(parsed.events.length)} events in file  ·  read from disk, not the index`);
-  if (!wantRole && !mix.get("user"))
+  if (!wantRole && f.flat && !mix.get("user"))
     console.log(`  note: no human turns in this window — one exchange emits many assistant messages.` +
-                `  relic tail ${target} --role user  for what was asked.`);
+                `  drop --flat for exchanges, or --role user for what was asked.`);
   console.log("");
   for (const e of tail) {
     console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}`);
