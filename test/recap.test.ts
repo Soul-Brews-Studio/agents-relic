@@ -21,6 +21,8 @@ describe("isHarnessTurn", () => {
     ["a local command's caveat", "<local-command-caveat>Caveat: the messages below"],
     ["a system reminder", "<system-reminder>Codebase instructions</system-reminder>"],
     ["a Codex host preamble", "<recommended_plugins> Here is a list"],
+    ["a subagent reporting its result", "Another Claude session sent a message: <teammate-message teammate_id=\"noise\">"],
+    ["a teammate message with no preamble", "<teammate-message teammate_id=\"vaults\" color=\"green\">PR #52 open</teammate-message>"],
   ] as const;
   for (const [what, text] of HARNESS)
     test(`omits ${what}`, () => expect(isHarnessTurn(text)).toBe(true));

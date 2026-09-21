@@ -66,6 +66,19 @@ export function isHarnessTurn(t: string): boolean {
       // The harness announcing a background task finished. Arrives as a user turn and
       // is never something a person typed.
       || /^<task-notification>/.test(t)
+      /*
+       * ANOTHER AGENT REPORTING IN, not the human. A subagent's result is delivered
+       * on the user channel with this preamble, so a session that fans out to four
+       * workers collects a dozen of them.
+       *
+       * Found by running `relic tail --handoff` on the session that built it: 5 of
+       * 14 "human turns" were workers announcing PRs. They corrupt two things at
+       * once — the turn count, and the pacing. Agents report on agent time, so a
+       * 55-second median gap was measuring subagent latency and calling it the
+       * human's focus, which is the one number --handoff exists to get right.
+       */
+      || /^Another Claude session sent a message:/.test(t)
+      || /^<teammate-message\b/.test(t)
       // The resume prompt after a compaction. It IS in the user channel, but it is the
       // harness restarting the session, not a new instruction — and in a long-running
       // session it appears once per compaction, outnumbering real turns.
@@ -144,4 +157,41 @@ export async function sessionRecap(
     files: [...files].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([path, n]) => ({ path, n })),
     endedWith,
   };
+}
+
+/**
+ * How many characters a turn gets in `relic tail --handoff`.
+ *
+ * Asymmetric on purpose. The human's turn is the content; the assistant's is the
+ * context that makes "go" mean something, and context does not need the same room as
+ * content. Half, with a floor — below about 60 characters an assistant turn is cut
+ * before it says what it proposed, which is the one job it is there to do.
+ */
+export function handoffBudget(role: string, chars: number): number {
+  return role === "user" ? chars : Math.max(60, Math.round(chars / 2));
+}
+
+/**
+ * A hidden turn that starts a NEW exchange, rather than one caused by the human's.
+ *
+ * Both kinds are stripped from what a reader sees, but they mean opposite things for
+ * pairing, and conflating them loses a reply either way:
+ *
+ *   caused by the human    <bash-input>ls</bash-input>   the human typed this
+ *                          <bash-stdout>…                the machine answered
+ *                          "here is what that listed"    STILL the human's exchange
+ *
+ *   independent inbound    <teammate-message …>          a worker reporting in
+ *                          "PR #52 — vaults finished"    NOT the human's exchange
+ *
+ * Break on the second kind only. Breaking on both orphaned every reply that followed a
+ * bash-stdout or a skill body; breaking on neither paired "suggest me" with a PR
+ * report it had nothing to do with. Both were seen on one real session.
+ */
+export function isInboundTurn(t: string): boolean {
+  return /^Another Claude session sent a message:/.test(t)
+      || /^<teammate-message\b/.test(t)
+      || /^<task-notification>/.test(t)
+      || /^Continue from where you left off\.?$/.test(t.trim())
+      || /^This session is being continued from a previous conversation/.test(t);
 }

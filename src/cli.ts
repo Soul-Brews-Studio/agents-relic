@@ -13,8 +13,8 @@ import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { flags } from "./flags.js";
-import { isHarnessTurn } from "./recap.js";
-import { localDateTime, localTime, zoneOffset } from "./time.js";
+import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
+import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
@@ -257,6 +257,34 @@ async function cmdPrune(f: Record<string, string | boolean>) {
 }
 
 // ---- search ----------------------------------------------------------------
+/*
+ * NO ARGUMENT MEANS THE SESSION BEFORE THIS ONE — the same rule `tail` uses.
+ *
+ * `relic tail` needs no id because the question "what was I just doing" is asked
+ * from inside a session that already knows where it is. `recap` is the same
+ * question with a different answer shape, and it was the only one still demanding
+ * an id, which broke the obvious pairing:
+ *
+ *   relic tail -n 20 --role user   # what the human asked
+ *   relic recap                    # what came of it
+ *
+ * One difference is real and is NOT papered over: tail reads the transcript from
+ * disk, recap reads the index. A session that ended seconds ago is in the file and
+ * not yet in the index, so a resolved id can still miss — the error below says so
+ * rather than reporting the session as nonexistent.
+ */
+async function recapTarget(arg: string | undefined): Promise<string> {
+  if (arg) return arg;
+  const prev = await previousSessionFile(process.cwd());
+  if (!prev) {
+    console.error(`no earlier session found for ${process.cwd()}`);
+    console.error(`  relic now --all   lists what is running, anywhere`);
+    process.exit(1);
+  }
+  console.log(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  return prev.id;
+}
+
 async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   const r = await sessionRecap(id, {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
@@ -265,7 +293,13 @@ async function cmdRecap(id: string, f: Record<string, string | boolean>) {
     allTiers: Boolean(f["all-tiers"]),
     chars: f.chars ? Number(f.chars) : undefined,
   });
-  if (!r) { console.error(`no session matched ${id}`); process.exit(1); }
+  if (!r) {
+    // recap reads the INDEX, so "no match" also covers "ran too recently to be in it".
+    console.error(`no session matched ${id}`);
+    console.error(`  if it only just ran, it is in the file but not the index yet:`);
+    console.error(`  relic index --corpus claude-live    (or: relic tail ${id}, which reads the file)`);
+    process.exit(1);
+  }
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
 
   console.log(`${r.name}`);
@@ -682,6 +716,63 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
   return found[0] ?? null;      // nothing substantial — hand back the newest and say so
 }
 
+/*
+ * The handoff block. One header carrying everything the next session would otherwise
+ * have to compute, then the conversation with nothing between the lines.
+ *
+ * BOTH ROLES, ASYMMETRICALLY TRIMMED — and that asymmetry is the whole design.
+ *
+ * Human-only was the first version and it loses the thing it was built to carry. Half
+ * this human's turns are "go", "gogogo", "merge all", "ok this cool!" — each one a
+ * decision ABOUT a proposal that is not in the block. Read alone they are noise; beside
+ * the line they answer they are the entire plot. So the assistant comes back — its LAST
+ * word after each human turn, which is the conclusion rather than the "let me check
+ * that" the first one would be. The chain then reads both ways: under a human turn is
+ * what came of it, and above a human turn is what it was answering.
+ *
+ * It comes back SMALL. The assistant's turn is context for the human's, not content in
+ * its own right — the next session is about to produce its own answers and does not
+ * need this one's at length. Human turns get the full budget, assistant turns get
+ * roughly half, which is enough to recognise a proposal and not enough to drown it.
+ *
+ * Gaps are measured on the HUMAN turns only. Interleaving assistant timestamps would
+ * halve every gap and report a calm supervised day as frantic focus.
+ *
+ * MEDIAN and MAX, never mean. One overnight gap drags a mean so far that a hard-focus
+ * session and an all-day supervised one report the same number — the median survives
+ * the outlier, and the max IS the outlier, named.
+ */
+function printHandoff(title: string | undefined, tail: { role: string; ts?: string | null; text: string }[],
+                      total: number, chars: number) {
+  const humans = tail.filter(e => e.role === "user");
+  const st = handoffStats(humans.map(e => e.ts));
+
+  if (title) console.log(title);
+  const counts = `${humans.length} human turns of ${fmt(total)}`;
+  if (st) {
+    // Drop the repeated date on the end ONLY when it is the same day. A 30-hour
+    // session printing "22:34 → 04:31" reads as six hours, and the span beside it
+    // then looks like a bug rather than the point.
+    const a = localDateTime(st.firstMs), b = localDateTime(st.lastMs);
+    const end = a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b;
+    console.log(`${counts}  ·  ${a} → ${end}  ·  ${dur(st.spanMs)} span  ·  ` +
+                `median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
+  } else {
+    console.log(`${counts}  ·  no usable timestamps`);
+  }
+  console.log("");
+
+  for (const e of tail) {
+    const t = e.text.replace(/\s+/g, " ").trim();
+    if (!t) continue;
+    const cut = handoffBudget(e.role, chars);
+    const body = t.length > cut ? t.slice(0, cut) + " …" : t;
+    // The human unmarked at the margin, the assistant indented under it: the block
+    // reads as what was asked, with what it was answering underneath.
+    console.log(e.role === "user" ? `  ${body}` : `      · ${body}`);
+  }
+}
+
 async function cmdTail(target: string, f: Record<string, string | boolean>) {
   const n = Number(f.n ?? f.limit ?? 10);
   const chars = f.chars !== undefined ? Number(f.chars) : 0;      // 0 = whole turn
@@ -719,17 +810,53 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   try { parsed = await parserFor(file)(file); }
   catch (e) { console.error(`cannot read ${file}: ${String(e).slice(0, 160)}`); process.exit(1); }
 
+  /*
+   * --handoff: the block you paste as the FIRST prompt of the next session.
+   *
+   * Everything here follows from one constraint — the reader is a fresh model with no
+   * context, and every token it spends re-deriving a fact is one it does not spend on
+   * the work. So relic derives them instead:
+   *
+   *   human turns only     what I said back is the session's output, not its intent,
+   *                        and the next session is about to produce its own.
+   *   time ONLY first+last a timestamp on every line is 20 repetitions of a fact that
+   *                        matters twice. The span is what carries meaning.
+   *   span, gaps, density  these ARE the intention signal. Twenty turns in eight
+   *                        minutes at a 15s median gap is one person driving one thing
+   *                        hard. Twenty turns over six hours with multi-hour gaps is
+   *                        supervision of work running in parallel. The next session
+   *                        should not infer that from a column of timestamps — it is
+   *                        arithmetic, and arithmetic belongs in the tool.
+   */
+  const handoff = Boolean(f.handoff);
   const wantRole = f.role as string | undefined;
   const keepHarness = Boolean(f.harness);
-  const rows = parsed.events.filter(e => {
-    // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
-    // returned early on --role, so `--role user` — the flag people reach for to see
-    // what the HUMAN asked — was the one view that showed raw <bash-stdout> dumps and
-    // pasted skill bodies. Narrowing to the human is exactly when the filter matters.
-    if (wantRole ? e.role !== wantRole : e.role !== "user" && e.role !== "assistant") return false;
-    if (!keepHarness && e.role === "user" && isHarnessTurn(e.text)) return false;
-    return true;
-  });
+  /*
+   * A DROPPED TURN IS STILL A BOUNDARY.
+   *
+   * Harness turns are hidden, not deleted, because pairing needs to know they were
+   * there. Filtering them out of the array entirely lets an assistant message that
+   * answered a subagent report drift upward and pair with the human turn before it:
+   * running --handoff on the session that built this showed "suggest me" answered by
+   * a PR report it had nothing to do with. The reply had crossed a turn that was no
+   * longer in the list.
+   *
+   * So: `hidden` marks what the reader must not see, and the pairing below treats any
+   * user-channel turn — hidden or not — as the end of an exchange.
+   */
+  const marked = parsed.events
+    .filter(e => (wantRole ? e.role === wantRole : e.role === "user" || e.role === "assistant"))
+    .map(e => ({
+      // ROLE NARROWS, IT DOES NOT DISABLE THE HARNESS FILTER. The first version
+      // returned early on --role, so `--role user` — the flag people reach for to see
+      // what the HUMAN asked — was the one view that showed raw <bash-stdout> dumps
+      // and pasted skill bodies. Narrowing to the human is exactly when it matters.
+      e,
+      hidden: !keepHarness && e.role === "user" && isHarnessTurn(e.text),
+      // Only an INBOUND hidden turn ends an exchange. See isInboundTurn().
+      breaks: e.role === "user" && (!isHarnessTurn(e.text) || isInboundTurn(e.text)),
+    }));
+  const rows = marked.filter(m => !m.hidden).map(m => m.e);
   /*
    * EXCHANGES BY DEFAULT, not messages.
    *
@@ -748,11 +875,15 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   let tail: typeof rows;
   if (!wantRole && !f.flat) {
     const pairs: typeof rows = [];
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].role !== "user") continue;
+    for (let i = 0; i < marked.length; i++) {
+      if (marked[i].hidden || marked[i].e.role !== "user") continue;
       let last: (typeof rows)[number] | null = null;
-      for (let j = i + 1; j < rows.length && rows[j].role !== "user"; j++) last = rows[j];
-      pairs.push(rows[i]);
+      // Stop at the next turn that BREAKS the exchange — a visible human turn, or a
+      // hidden inbound one. A hidden turn the human's own turn caused does not break.
+      for (let j = i + 1; j < marked.length && !marked[j].breaks; j++) {
+        if (!marked[j].hidden) last = marked[j].e;
+      }
+      pairs.push(marked[i].e);
       if (last) pairs.push(last);
     }
     // n counts EXCHANGES, so take 2n messages — that is what the flag means to read.
@@ -766,6 +897,8 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   if (mode === "json")  { console.log(JSON.stringify({ file, title: parsed.title, turns: tail }, null, 2)); return; }
   if (mode === "jsonl") { for (const e of tail) console.log(JSON.stringify(e)); return; }
   if (mode === "plain") { for (const e of tail) console.log(`${e.seq}\t${e.role}\t${e.text.replace(/\s+/g, " ")}`); return; }
+
+  if (handoff) { printHandoff(parsed.title, tail, rows.length, chars || 220); return; }
 
   if (parsed.title) console.log(`${parsed.title}`);
   // Say what was filtered OUT. "10 turns" and "10 turns of 1,751" are different facts,
@@ -1516,7 +1649,7 @@ else if (cmd === "mcp") {
 }
 else if (cmd === "memory") await cmdMemory(f);
 else if (cmd === "pending") await cmdPending(f);
-else if (cmd === "recap") { if (!pos[1]) { console.error("recap needs a session id or prefix"); process.exit(1); } await cmdRecap(pos[1], f); }
+else if (cmd === "recap") await cmdRecap(await recapTarget(pos[1]), f);
 else if (cmd === "embed") await cmdEmbed(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
