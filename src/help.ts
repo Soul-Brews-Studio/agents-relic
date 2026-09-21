@@ -17,7 +17,7 @@ import { defaultRoot } from "./repo.js";
 export function helpText(): string {
   return `relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
-  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run] [--prune]
+  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--keep-noise] [--dry-run] [--prune]
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault the
                                vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
@@ -88,7 +88,7 @@ export function helpText(): string {
                                not a summary: session gives shape, recap gives content.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
-  skipped                      what --skip-noise dropped, and the proof
+  skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
   trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
   backend [--probe]            which engine answers what, and how fast here
   banks                        bank names on this machine

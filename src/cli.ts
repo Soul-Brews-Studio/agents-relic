@@ -18,6 +18,17 @@ import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
+
+// #37 — noise filtering is now ON by default: blob-shaped tool traffic (base64,
+// hex, JWTs, minified JS — see noise.ts's longestUnbrokenRun) inflates FTS document
+// frequencies for no benefit, and the rule has been auditable via `relic skipped`
+// since it was introduced. `--keep-noise` is the escape hatch back to the old,
+// unfiltered behaviour — nothing becomes unrecoverable, since the source JSONL on
+// disk is untouched either way. `--skip-noise` still works as a (now redundant) way
+// to ask for the default explicitly.
+function wantSkipNoise(f: Record<string, string | boolean>): boolean {
+  return !Boolean(f["keep-noise"]);
+}
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
@@ -76,7 +87,7 @@ function resolveSourcePath(f: Record<string, string | boolean>, only: string[] |
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
-  const skipNoise = Boolean(f["skip-noise"]);
+  const skipNoise = wantSkipNoise(f);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
   const override = resolveSourcePath(f, only);
@@ -126,7 +137,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
-  if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--skip-noise) -> relic skipped`);
+  if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--keep-noise to disable) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
               `, ${tally.ftsBuilt} fts index built in ${idxSecs}s` +
@@ -475,7 +486,7 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
                   repo: f.repo ? String(f.repo) : undefined,
                   bank: f.bank ? String(f.bank) : undefined };
   const { rows, imported, matchedBy } = await resolveSession(id, {
-    ...scope, noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
+    ...scope, noIndex: Boolean(f["no-index"]), skipNoise: wantSkipNoise(f),
   });
   if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
 
@@ -1435,7 +1446,7 @@ else if (cmd === "chain") {
   if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
   const { chain, imported } = await chainOf(pos[1], {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
-    noIndex: Boolean(f["no-index"]), skipNoise: Boolean(f["skip-noise"]),
+    noIndex: Boolean(f["no-index"]), skipNoise: wantSkipNoise(f),
   });
   if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
   if (!chain) console.log(`no session matches ${pos[1]}`);

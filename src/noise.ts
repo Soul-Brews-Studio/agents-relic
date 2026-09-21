@@ -17,8 +17,9 @@ const TOOL_RESULT_CAP = 4000;
  * and `rg` is better at the file. Measured on one shard, that single class is 34% of
  * all indexed text.
  *
- * Every rule here is OPT-IN (`index --skip-noise`) and every drop is logged, because
- * a filter you cannot audit is a filter you cannot trust. `relic skipped` reads the
+ * #37: as of this change every rule here runs by default (`index --keep-noise` opts
+ * back out to the old unfiltered behaviour) and every drop is logged, because a
+ * filter you cannot audit is a filter you cannot trust. `relic skipped` reads the
  * log back so a bad rule is visible rather than silent.
  *
  * Deliberately NOT dropped:
@@ -28,6 +29,40 @@ const TOOL_RESULT_CAP = 4000;
  */
 
 export interface NoiseVerdict { skip: boolean; rule: string }
+
+/**
+ * #37 — is there an unbroken run of at least 120 non-whitespace characters anywhere
+ * in the text? Whitespace codes only (space/tab/nl/cr/vt/ff) — punctuation inside a
+ * token does not break the run, which is the point: a JWT's three dot-joined base64url
+ * segments, a hex digest, and a minified-JS line are each one unbroken token even
+ * though none of them are pure base64.
+ *
+ * Replaces the old `binary-blob` rule's regex, `/[A-Za-z0-9+\/]{120,}={0,2}/`, which
+ * only caught the base64 alphabet. Benchmarked in #37 on 20,000 events / 12.7 MB:
+ *
+ *   longest-run >= 120      21 ms   617 MB/s   flagged 2,076
+ *   base64 regex (old)      57 ms   225 MB/s   flagged    64
+ *   shannon entropy        133 ms    95 MB/s   flagged 1,972  (worst: 6x slower, prose
+ *                                                              and tool-traffic entropy
+ *                                                              medians overlap 4.2-4.9)
+ *
+ * This is NOT the same predicate as the old regex — it is both faster (single pass,
+ * no backtracking) AND broader (2,076 vs 64 on that corpus, a ~32x increase in this
+ * rule's own catch). The delta is deliberate, not a silent regression: the rule's
+ * comment below ("matches nothing a human would type") applies just as well to a JWT
+ * or a hex digest as it does to base64, and catching them is the whole reason to
+ * prefer this tier over the regex it replaces. See PR for measurements on real data.
+ */
+function longestUnbrokenRun(t: string): number {
+  let max = 0, run = 0;
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    // space, tab, \n, \v, \f, \r
+    if (c === 32 || (c >= 9 && c <= 13)) run = 0;
+    else if (++run > max) max = run;
+  }
+  return max;
+}
 
 /** Three consecutive ascending integers used as line numbers — a file dump's tell. */
 function hasNumberedLines(t: string): boolean {
@@ -72,8 +107,10 @@ const RULES: { rule: string; test: (text: string, role: string) => boolean }[] =
   },
   {
     // Matches nothing a human would type, but every token enters the FTS index.
+    // See longestUnbrokenRun() above for why 120 unbroken chars, not the base64
+    // alphabet, is the test.
     rule: "binary-blob",
-    test: (t) => /[A-Za-z0-9+/]{120,}={0,2}/.test(t),
+    test: (t) => longestUnbrokenRun(t) >= 120,
   },
   {
     // Anchored and specific ON PURPOSE. The first version matched /token.?usage/i

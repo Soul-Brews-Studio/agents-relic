@@ -63,11 +63,11 @@ your repos.
                                    THE HUMAN IS 6.8% OF A TRANSCRIPT
                  │
                  ▼
- 3 ─ FILTER                         --skip-noise, opt-in, every drop logged
+ 3 ─ FILTER                         on by default (#37) — --keep-noise opts out, every drop logged
 
      file-readback    810 rows  2.64 MB   3 ascending line numbers = a file dump
      edit-payload     456       0.69 MB   the file now exists on disk
-     binary-blob       55       0.20 MB   base64
+     binary-blob       55       0.20 MB   base64 (widened in #37 to any unbroken 120-char run)
      navigation-call  769       0.08 MB   [tool_use Read] — intent, no content
                                           ── kept: bash, errors, all prose
      DISCARDED ──────────────────────► ~/.relic/skipped.jsonl   (the proof)
@@ -270,7 +270,7 @@ Facets come from the `sessions` row, which carries real `cwd`, `git_branch` and
 transcript, with no path guessing.
 
 Noise filtering is declarative here rather than heuristic: `active = 1` and
-`compacted = 0` are exact column predicates, unlike `--skip-noise`, which has to infer
+`compacted = 0` are exact column predicates, unlike noise filtering, which has to infer
 from text shape.
 
 ## Three readers, one index
@@ -477,7 +477,8 @@ relic index                          # all enabled sources, full history
 relic index --since 7d               # only files touched in the last week
 relic index --repo my-repo        # one repo — "personal memory"
 relic index --corpus claude-1sep     # one configured source
-relic index --skip-noise             # drop file dumps and navigation calls
+relic index                          # noise filtering is on by default (#37)
+relic index --keep-noise             # keep file dumps, navigation calls, blobs — old behaviour
 relic index --dry-run                # count files, write nothing
 ```
 
@@ -1092,7 +1093,7 @@ relic pending --list 50 --plain     # sessionId<TAB>repo<TAB>bank<TAB>source/tie
 relic status --json | jq '.rows[] | select(.bank=="codex")'
 ```
 
-### `skipped` — what `--skip-noise` dropped, and the proof
+### `skipped` — what noise filtering dropped, and the proof
 
 ```bash
 relic skipped                # counts by rule, with samples of what each one ate
@@ -1332,7 +1333,7 @@ Use `--prose` by default when you are looking for thinking rather than output.
 
 ---
 
-## What `--skip-noise` drops, and what it deliberately does not
+## What noise filtering drops (on by default since #37; `--keep-noise` opts out), and what it deliberately does not
 
 Measured on a 285-file shard — **14% of stored text**:
 
@@ -1340,7 +1341,7 @@ Measured on a 285-file shard — **14% of stored text**:
 |---|---|---|---|
 | `file-readback` | 810 | 2.64 | a file read into the transcript |
 | `edit-payload` | 456 | 0.69 | an Edit/Write payload — the file now exists on disk |
-| `binary-blob` | 55 | 0.20 | base64 images and similar |
+| `binary-blob` | 55 | 0.20 | base64 images and similar (widened in #37 to any unbroken 120-char run — also catches hex, JWTs, minified JS) |
 | `navigation-call` | 769 | 0.08 | `[tool_use Read] {"file_path":…}` — intent, no content |
 
 **Kept on purpose**: bash commands (*"what was that command again"* is a real query),
@@ -1509,7 +1510,7 @@ SQL.
     (The same collision makes an 8-char uuid prefix unsafe as an identifier.)
 
  ── WHAT IS NOT STORED ───────────────────────────────────────────────────────
-    No full text of a file that exists on disk (--skip-noise drops readbacks).
+    No full text of a file that exists on disk (noise filtering drops readbacks; --keep-noise restores them).
     No vectors, unless `relic embed` was run. They go to a 4th table,
     `vectors` (uid PK -> FixedSizeList<Float32,dim>), NEVER a column on
     `events`: a vector column cannot be added by widening, and in the

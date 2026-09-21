@@ -3,6 +3,9 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClaude } from "../src/shapes/claude.js";
+import { classify } from "../src/noise.js";
+import { importFiles } from "../src/import.js";
+import type { Found } from "../src/discover.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "relic-hygiene-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -188,5 +191,77 @@ describe("#44 — repo_key must not echo the cwd's casing", () => {
     // worse than echoing — the key would stop matching the rows already written.
     expect(resolveRepoKey("/opt/Code/github.com/nowhere/not-a-real-repo-xyz"))
       .toBe("github.com/nowhere/not-a-real-repo-xyz");
+  });
+});
+
+describe("#37 — binary-blob widened from base64-only to any unbroken 120-char run", () => {
+  // A genuine base64 blob — what the OLD regex, `/[A-Za-z0-9+/]{120,}={0,2}/`, caught.
+  const BASE64_BLOB = "SGVsbG8gd29ybGQhIFRoaXMgaXMgYSBsb25nIGJhc2U2NC1sb29raW5nIHN0cmluZyB0aGF0IHNo"
+    + "b3VsZCBiZSBmbGFnZ2VkIGFzIGJpbmFyeSBibG9iIG5vaXNlIGJ5IHRoZSBjbGFzc2lmaWVyLg==";
+
+  test("a real base64 blob is flagged", () => {
+    expect(BASE64_BLOB.length).toBeGreaterThanOrEqual(120);
+    expect(classify(`[tool_result] ${BASE64_BLOB}`, "tool_result"))
+      .toMatchObject({ skip: true, rule: "binary-blob" });
+  });
+
+  test("a long unbroken token that is NOT base64 (hex, JWT-shaped) is also flagged", () => {
+    // This is the widened behaviour #37 asks for: the old regex would have let both
+    // of these through, since neither is pure [A-Za-z0-9+/].
+    const hex = "a".repeat(60) + "f".repeat(60); // 120 hex chars, no base64 '+' or '/'
+    expect(classify(`[tool_result] ${hex}`, "tool_result"))
+      .toMatchObject({ skip: true, rule: "binary-blob" });
+
+    const jwtShaped = "eyJhbGciOiJIUzI1NiJ9." + "x".repeat(80) + "." + "y".repeat(30);
+    expect(classify(`[tool_result] ${jwtShaped}`, "tool_result"))
+      .toMatchObject({ skip: true, rule: "binary-blob" });
+  });
+
+  test("ordinary prose containing a long word is NOT flagged", () => {
+    // Prose roles are exempt regardless of shape (classify's early return), so this
+    // asserts on tool_result text — the one role the rule actually applies to.
+    const prose = "the output looked fine, nothing unusual about it at all, just normal "
+      + "sentence after sentence describing what happened during the run in plain words";
+    expect(classify(`[tool_result] ${prose}`, "tool_result").skip).toBe(false);
+
+    // A single long word (e.g. a URL-less long identifier) under 120 chars must survive.
+    const oneLongWord = "supercalifragilisticexpialidocious".repeat(2); // 70 chars, < 120
+    expect(classify(`[tool_result] ${oneLongWord} is a real word apparently`, "tool_result").skip)
+      .toBe(false);
+  });
+
+  test("prose roles stay exempt even when they contain a 120-char run", () => {
+    const hex = "a".repeat(130);
+    for (const role of ["user", "assistant", "thinking", "system"])
+      expect(classify(hex, role).skip).toBe(false);
+  });
+
+  // ---- the --keep-noise opt-out, exercised through the real importer -------------
+
+  const foundWith = (text: string): Found => ({
+    path: "/x/blob.jsonl", projectDir: "p", tier: "session", source: "claude",
+    workflowRunId: null, agentId: null, mtime: 1, size: 2, bank: "projects37",
+    parser: async () => ({
+      sessionUuid: "s37", cwd: null, model: "", lines: 1, badLines: 0,
+      startedAt: "", endedAt: "", description: "", title: "", gitBranch: "",
+      events: [
+        { uid: "u1", seq: 1, role: "user", ts: "", text: "a normal prose message" },
+        { uid: "u2", seq: 2, role: "tool_result", ts: "", text: "a".repeat(130) },
+      ],
+    }),
+  } as unknown as Found);
+
+  test("skipNoise defaults ON: the importer drops the blob event and keeps the prose one", async () => {
+    const root = join(tmp, "keep-noise-off");
+    const t = await importFiles([foundWith("a".repeat(130))], { dataRoot: root, inRepo: false, skipNoise: true });
+    expect(t.added).toBe(1);           // prose event kept
+    expect(t.skippedNoise).toBe(1);    // blob event dropped
+  });
+
+  test("--keep-noise (skipNoise: false) restores the old unfiltered behaviour", async () => {
+    const root = join(tmp, "keep-noise-on");
+    const t = await importFiles([foundWith("a".repeat(130))], { dataRoot: root, inRepo: false, skipNoise: false });
+    expect(t.added).toBe(2);           // both events kept, including the blob
+    expect(t.skippedNoise).toBe(0);
   });
 });
