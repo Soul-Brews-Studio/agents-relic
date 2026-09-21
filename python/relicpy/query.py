@@ -274,12 +274,31 @@ def looks_like_id(s: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{3,}", s or ""))
 
 
+#: The three tiers that are a CONVERSATION. `note` and `memory` are other kinds of
+#: thing that happen to share the `sessions` table, and they outnumber conversations
+#: 100:1 — see the tier note in list_sessions.
+TRANSCRIPT_TIERS = ["session", "subagent", "workflow_agent"]
+
+
 def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str] = None,
-                  worktree: Optional[str] = None, limit: int = 40) -> dict:
+                  worktree: Optional[str] = None, limit: int = 40,
+                  tiers: Optional[list[str]] = None) -> dict:
     """Newest first, filtered on the session's OWN first timestamp — not file mtime.
 
     An old session that got one new line stays old, which is what someone asking
     "what was I working on last Tuesday" means.
+
+    TIER, BECAUSE `sessions` HOLDS ONE ROW PER INDEXED FILE — of any kind. A vault
+    note is a row here, and the vault dwarfs everything else. Measured 2026-09-22
+    with --since 7d over the live index:
+
+        42,403  note        <- psi/*.md, one row each
+           382  session     <- what anybody asking "how many sessions" means
+            34  memory
+             8  subagent
+
+    So the unfiltered answer was off by 112x, and the daily histogram showed three
+    enormous spikes that were vault INDEXING runs, not activity.
     """
     rows: list[dict] = []
     for sh in pick_shards(scope):
@@ -290,6 +309,8 @@ def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str
                 rows.append(r)
         except Exception:
             continue
+    keep = set(TRANSCRIPT_TIERS if tiers is None else tiers)
+    rows = [r for r in rows if (r.get("tier") or "") in keep]
     if since:
         lo = to_iso(since)
         rows = [r for r in rows if (r.get("started_at") or "") >= lo]

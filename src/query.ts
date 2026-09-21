@@ -345,7 +345,15 @@ export interface SessionsOpts extends Scope {
   limit?: number; since?: string; until?: string; worktree?: string;
   /** false lists every transcript separately, children included. Default true. */
   group?: boolean;
+  /** Which `tier` values count. Defaults to TRANSCRIPT_TIERS — see store.sessions(). */
+  tiers?: string[];
 }
+
+/**
+ * The three tiers that are a CONVERSATION. `note` and `memory` are other kinds of
+ * thing that happen to share the table, and they outnumber conversations 100:1.
+ */
+export const TRANSCRIPT_TIERS = ["session", "subagent", "workflow_agent"];
 
 /** A session row plus what its children add up to. */
 export type SessionSummary = SessionRow & {
@@ -402,6 +410,7 @@ export async function listSessions(o: SessionsOpts = {}): Promise<SessionsResult
       const store = await LanceStore.open(sh.dir);
       for (const r of await store.sessions({
         since: toISO(o.since), until: toISO(o.until, true), worktree: o.worktree,
+        tiers: o.tiers ?? TRANSCRIPT_TIERS,
       })) rows.push({ ...r, repo: sh.key });
       searched++;
     } catch { /* skip unreadable shard */ }
@@ -778,6 +787,46 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
  *
  * Returns null when the file is gone or the index is current.
  */
+/**
+ * How old is the index BEHIND THIS ANSWER?
+ *
+ * A ranked list from a stale index is worse than an empty one: it is confident,
+ * relevant-looking, and silently scoped to whatever happened to be indexed. The header
+ * reported shard count and query latency — neither is the number that changes how you
+ * read the results.
+ *
+ * SCOPED TO THE SHARDS THAT PRODUCED HITS, for two reasons. It is the relevant
+ * population — "how current is what answered me" — and it is affordable: `freshness()`
+ * full-scans two columns per shard, measured at 9.1 ms, so asking all 1,136 shards
+ * costs 10.3 s against a search that takes 1 s.
+ *
+ * The cheap alternative was measured and rejected. Shard directory mtime costs 4 ms
+ * for ALL 1,136 shards — 2,575x faster — but it is a proxy: over 60 shards, 18 read
+ * older than `imported_at` (safe, over-reports staleness) and 1 read NEWER by 3 hours,
+ * which is the direction that says "fresh" about a stale index. A staleness warning
+ * that can under-report is worse than none, because it is trusted.
+ */
+export async function answerFreshness(
+  shardDirs: string[], cap = 25,
+): Promise<{ lastIndexed: string; ageSec: number; shards: number; sampled: boolean } | null> {
+  const dirs = [...new Set(shardDirs)];
+  const use = dirs.slice(0, cap);
+  let newest = "";
+  for (const dir of use) {
+    try {
+      const f = await (await LanceStore.open(dir)).freshness();
+      if (f.lastIndexed > newest) newest = f.lastIndexed;
+    } catch { /* an unreadable shard is not a freshness claim */ }
+  }
+  if (!newest) return null;
+  return {
+    lastIndexed: newest,
+    ageSec: Math.max(0, Math.round((Date.now() - Date.parse(newest)) / 1000)),
+    shards: use.length,
+    sampled: dirs.length > use.length,
+  };
+}
+
 export function staleness(row: SessionRow): { behindSec: number; fileMtimeMs: number } | null {
   try {
     const st = statSync(row.file_path);

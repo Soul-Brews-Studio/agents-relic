@@ -631,6 +631,42 @@ Filters stack:
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
 
+### Staleness, because a stale hit looks exactly like a fresh one
+
+```
+10 of 703 match(es) for prune ceiling · 1136 shards · 376 ms  ·  indexed 77.6h ago
+  ⚠ the shards that answered were last indexed 77.6h ago — newer sessions are NOT in these results.
+     relic index --bank projects-archive   ·   relic status  names which bank is behind
+```
+
+An empty result announces itself. **A ranked list from a stale index does not** — it is
+confident, relevant-looking, and silently scoped to whatever happened to be indexed. The
+header used to report shard count and latency, neither of which changes how you read the
+results.
+
+**Scoped to the shards that produced hits.** That is the relevant population — *how
+current is what answered me* — and it is the only affordable one: `freshness()`
+full-scans two columns per shard at **9.1 ms**, so asking all 1,136 costs **10.3 s**
+against a 1 s search. Over hit shards it measured **92 ms, 2.3% overhead**.
+
+The cheap alternative was measured and rejected. Shard directory mtime covers all 1,136
+shards in **4 ms** — 2,575× faster — but over 60 shards, 18 read *older* than
+`imported_at` (safe: over-reports staleness) and **1 read newer by 3 hours**, which is
+the direction that calls a stale index fresh. A staleness warning that can under-report
+is worse than none, because it gets trusted.
+
+**"Not indexed" and "no matches" are different facts.** With a `--repo` / `--bank` /
+`--worktree` filter that matches no shard, the narrower the filter the likelier it
+selects a slice that is entirely un-indexed — and the more authoritative the empty
+answer looks:
+
+```
+no shards match --repo arra-oracle-v4 in  /Users/beta/.relic
+
+  This is NOT "no matches" — nothing for that filter is in the index at all.
+  Check what is on disk but unindexed:   relic pending --repo arra-oracle-v4
+```
+
 ### Fan-out cost, and what it is not
 
 An unfiltered search asks all 817 shards. They are queried concurrently, capped at
@@ -688,6 +724,53 @@ scores are not strictly commensurable across shards. Same engine, same tokenizer
 schema makes them close enough to beat arrival order by a wide margin — but this is a
 ranking improvement, not a globally correct BM25. A true global ranking needs corpus
 statistics relic does not keep.
+
+### `report` — day by day, with the shape a list cannot show
+
+```bash
+relic report                          # last 7 days
+relic report --since 30d --tree       # + each session's transcript shape
+relic report --repo neo-oracle --per-repo 8
+```
+
+```
+2026-09-20  Sun  ──────────────  64 sessions · 169 transcripts · 19,495 ev
+  laris-co/neo-oracle                    29  12,510 ev
+    09:01  01a0b8e4 +2        151 ev  wt/neo-voice-bot-19sep-sat2026
+          use relic read from omp to claude code ? how many app we did
+    ... and 27 more in this repo (--per-repo N)
+  Soul-Brews-Studio/odin-oracle           23   2,254 ev
+```
+
+`sessions` is a **feed** — most recent N, newest first. A week is a different question:
+quiet days versus spikes, which repo owned a day, whether work sat in the main checkout
+or scattered across worktrees. `--limit 40` truncates that before the second day starts.
+
+Grouped **day → repo → worktree → session**, in the order the questions get asked.
+
+**The cap is per REPO, not per day.** Per-day was the first shape and it hid the answer:
+on a busy day one repo had 28 sessions and ate the whole budget, so every other repo
+touched that day rendered as `... and 60 more`. A report whose cap can exclude a whole
+repo cannot answer which repos a day belonged to.
+
+**Days are LOCAL, not UTC.** `iso.slice(0, 10)` is the obvious implementation and it is
+wrong: at UTC+07 a session at 01:30 local belongs to the previous UTC day, so it lands
+one row early on the only axis the report exists to show.
+
+**Transcript tiers only** — and that is the point. `sessions` holds one row per indexed
+*file* of any kind, and the vault outnumbers conversations 100:1. Measured 2026-09-22
+over `--since 7d`:
+
+| tier | rows |
+|---|---|
+| `note` | **42,403** — ψ/*.md, one row each |
+| `session` | 382 |
+| `memory` | 34 |
+| `subagent` | 8 |
+
+So the unfiltered answer to "how many sessions this week" was off by 112x, and the three
+enormous spikes in its daily histogram were vault *indexing* runs, not activity. `sessions`
+now filters the same way; pass `--all-tiers` for the raw population.
 
 ### `sessions` — list and count
 

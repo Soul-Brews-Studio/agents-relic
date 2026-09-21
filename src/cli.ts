@@ -10,13 +10,15 @@ import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
+import { buildReport, renderReport, type ReportRow } from "./report.js";
+import { helpText } from "./help.js";
 import { localDateTime, localTime, zoneOffset } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
-         statsOf, neighbours, nameOf, staleness, memoryReport, pendingReport,
+         statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
          groupByBank, maxISO } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
@@ -362,7 +364,17 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
   if (!pickShards(scope).length) {
     const where = dataRoot ?? (Boolean(f["in-repo"]) ? `${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
-    console.log(`no shards found in  ${where}\n`);
+    /*
+     * "NOT INDEXED" AND "NO MATCHES" ARE DIFFERENT FACTS, and this message covered
+     * both. The narrower the filter, the likelier it selects a slice that is entirely
+     * un-indexed — and the more authoritative the empty answer looks.
+     */
+    const named = ["repo", "bank", "worktree"].filter(k => f[k]).map(k => `--${k} ${f[k]}`).join(" ");
+    console.log(`no shards ${named ? `match ${named}` : `found`} in  ${where}\n`);
+    if (named) {
+      console.log(`  This is NOT "no matches" — nothing for that filter is in the index at all.`);
+      console.log(`  Check what is on disk but unindexed:   relic pending${f.repo ? ` --repo ${f.repo}` : ""}`);
+    }
     console.log(`  index one first:   relic index --since 7d${dataRoot ? ` --data-root ${dataRoot}` : ""}`);
     if (!dataRoot) console.log(`  or point elsewhere: relic search ... --data-root /path/to/index`);
     return;
@@ -416,8 +428,31 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
   if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`); return; }
   const narrowed = !f["all-tiers"] && !f.tier;
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms` +
-    (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : "") + "\n");
+  /*
+   * HOW OLD IS THE INDEX BEHIND THIS ANSWER.
+   *
+   * A ranked list from a stale index is worse than an empty one — confident,
+   * relevant-looking, and silently scoped to whatever happened to be indexed. Scoped
+   * to the shards that actually produced hits: that is the relevant population, and
+   * freshness() full-scans two columns per shard (9.1 ms measured), so asking all
+   * 1,136 would cost 10.3 s against a 1 s search.
+   */
+  const byKey = new Map(pickShards(scope).map(sh => [sh.key, sh.dir]));
+  const fresh = await answerFreshness(
+    [...new Set(hits.slice(0, limit).map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
+  const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
+  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+    (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
+  // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
+  if (fresh && fresh.ageSec > 86_400) {
+    // NOT `--corpus claude-live`: the stale shards may be any bank, and naming the
+    // wrong corpus sends the reader to re-index something that was already current.
+    const scoped = [f.repo ? `--repo ${f.repo}` : "", f.bank ? `--bank ${f.bank}` : ""].filter(Boolean).join(" ");
+    console.log(`  \u26A0 the shards that answered were last indexed ${humanAge(fresh.ageSec)} ago —` +
+                ` newer sessions are NOT in these results.`);
+    console.log(`     relic index${scoped ? ` ${scoped}` : ""}   ·   relic status  names which bank is behind`);
+  }
+  console.log("");
   for (const h of hits.slice(0, limit)) {
     const i = h.text.toLowerCase().indexOf(q.toLowerCase());
     const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
@@ -577,6 +612,58 @@ async function cmdSessions(f: Record<string, string | boolean>) {
     console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}`);
   }
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
+}
+
+// ---- report ----------------------------------------------------------------
+/**
+ * Day by day, with the shape a flat list cannot show.
+ *
+ * `sessions` is a feed — most recent N, newest first, one line each. A week is a
+ * different question: quiet days versus spikes, which repo owned a day, whether work
+ * sat in the main checkout or scattered across worktrees. `--limit 40` truncates that
+ * before the second day starts.
+ *
+ * Transcript tiers only by default, and that is not cosmetic. `sessions` holds one row
+ * per indexed FILE of any kind, and the vault outnumbers conversations 100:1 — an
+ * unfiltered week reported 42,827 "sessions", of which 42,403 were ψ notes. The three
+ * enormous daily spikes in that histogram were vault INDEXING runs, not activity.
+ */
+async function cmdReport(f: Record<string, string | boolean>) {
+  const scope = { dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
+                  repo: f.repo ? String(f.repo) : undefined,
+                  bank: f.bank ? String(f.bank) : undefined };
+  if (!pickShards(scope).length) { console.log("no shards match"); return; }
+
+  const since = (f.since as string) ?? "7d";
+  // group:false — one row per TRANSCRIPT. --tree needs every child's path, and the
+  // grouped summary keeps only a count.
+  const { rows, shards } = await listSessions({
+    ...scope, since, until: f.until as string, worktree: f.worktree as string,
+    group: false, limit: 1_000_000,
+    tiers: f["all-tiers"] ? undefined : undefined,
+  });
+  void shards;
+
+  const days = buildReport(rows as unknown as ReportRow[], nameOf);
+  const mode = outFmt(f);
+  if (mode === "json")  { console.log(JSON.stringify(days, null, 2)); return; }
+  if (mode === "jsonl") { for (const d of days) console.log(JSON.stringify(d)); return; }
+  if (mode === "plain") {
+    for (const d of days) for (const s of d.sessions)
+      console.log([d.day, localTime(s.startedAt), s.id, s.repo, s.worktree, s.events, s.transcripts, s.name].join("\t"));
+    return;
+  }
+
+  const totS = days.reduce((a, d) => a + d.sessions.length, 0);
+  const totE = days.reduce((a, d) => a + d.events, 0);
+  const totT = days.reduce((a, d) => a + d.transcripts, 0);
+  console.log(`${fmt(totS)} sessions · ${fmt(totT)} transcripts · ${fmt(totE)} events` +
+              ` · ${days.length} day${days.length === 1 ? "" : "s"} · since ${since}` +
+              (f.repo ? ` · repo~${f.repo}` : "") + ` · times local UTC${zoneOffset()}`);
+  // Absence is a fact: a day with no sessions is missing from this list, not zero.
+  for (const line of renderReport(days, { tree: Boolean(f.tree), perRepo: Number(f["per-repo"] ?? 4) }))
+    console.log(line);
+  if (!days.length) console.log("\n  nothing in range — widen --since, or check `relic status` for index freshness");
 }
 
 // ---- status ----------------------------------------------------------------
@@ -1058,93 +1145,13 @@ async function cmdPending(f: Record<string, string | boolean>) {
 }
 
 if (!cmd || f.help) {
-  console.log(`relic — per-repo LanceDB index of Claude Code + Codex session JSONL
-
-  index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--skip-noise] [--dry-run] [--prune]
-          [--source-path PATH]   run ONE --corpus against a root it does not normally
-                               walk — same walker, parser and bank. For a vault the
-                               vaults walker cannot reach (e.g. <repo>/wt/<slug>/ψ).
-  prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
-                               remove index rows for files discovery no longer yields.
-                               DRY BY DEFAULT — --apply is the only thing that deletes.
-                               Refuses --since/--repo (a narrowed scan makes everything
-                               outside it look deleted), refuses a run with parse
-                               failures, skips shards this run never reached, and
-                               REFUSES any shard losing more than --max-drop percent.
-  search  <query> [--repo S] [--bank B] [--org S] [--project S] [--dir S] [--all-tiers] [--worktree S] [--path S] [--tier ...] [--source ...]
-                  BM25 FINDS TOPICS, NOT SPECIFIC FACTS. For "did I already do X",
-                  search the most UNIQUE literal string in the request — an id, a
-                  filename, an error string — not the topic words. Measured on 288
-                  real queries here: longer queries return 11x MORE hits than short
-                  ones (median 1,392 vs 123), because FTS ranks any document holding
-                  any term, so every extra word widens the candidate set.
-                    95,529 hits  "herdr pane run agent prompt recent-unwrapped"
-                         1 hit   "VoiceProcessingEnabled"
-                  [--since 7d|2026-09-01] [--until DATE] [--limit N]
-                  [--prose]  humans + assistant only — 80% of a transcript is tool traffic
-                  [--role user|assistant|tool_use|tool_result|thinking]
-                  [--semantic] nearest-neighbour over relic-embed vectors instead of
-                  BM25. A separate MODE, never blended: measured here, FTS wins
-                  known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.
-                  [--overfetch 4] [--device mps]
-  show    <file> --seq N [--before 2] [--after 2]
-  session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
-                               --tree shows the SHAPE: which agents shared a workflow run
-  chain   <id|prefix>          the session tree on one time axis — what ran in parallel
-  read    <file> [--prose]     whole transcript as readable conversation, any format
-  mcp                          run the MCP server on stdio (same lookups, for a model)
-  now [--all] [--window 300]   what is running RIGHT NOW — this session, its live agents
-  dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
-  sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
-  memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
-                               sessions that produced it — which had one, which had none
-  pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N] [--paths]
-                               on disk but not indexed: missing vs changed. --list N
-                               names them — session id, repo, bank, newest first.
-                               --paths adds the full session id and absolute path.
-                               --tree groups them by directory — which RUN is missing.
-  embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
-                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
-                               [--session ID]  embed ONE session — the /forward + /new unit
-                               second pass, opt-in: writes a per-shard \`vectors\` table,
-                               never a column on \`events\`. Resumable — re-run to continue.
-                               Measured first: FTS beats every model tried here (bench/).
-  recap   <id|prefix> [--limit N] [--all-tiers] [--chars 140] [--json]
-                               what HAPPENED in one session — the human's turns with
-                               harness boilerplate stripped, the tools that ran, files
-                               edited, and how it ended. A projection of indexed rows,
-                               not a summary: session gives shape, recap gives content.
-  status  [--limit 15] [--bank B]
-  sources                      what this machine has, and what is on/off
-  skipped                      what --skip-noise dropped, and the proof
-  trace   [--limit 10] [--cloud]  query log: who answers, what is dead, keyword cloud
-  backend [--probe]            which engine answers what, and how fast here
-  banks                        bank names on this machine
-  shards  [--bank B] [--repo S] [--count]   the index layout
-
-  --no-native        force the TypeScript scan (see: relic backend)
-  --native PATH      use a specific relic-native binary
-  --in-repo          write <ghq>/<org>/<repo>/.relic/ instead of ~/.relic
-  --data-root PATH   explicit index location
-  --json --jsonl --plain   machine output (or --format json|jsonl|plain)
-                     plain = file<TAB>seq<TAB>repo<TAB>text, one per line
-
-Sharded BANK first, then per repo ghq-style, under $HOME by default:
-  ${defaultRoot()}/banks/<bank>/github.com/<org>/<repo>/
-
-A bank is one whole source root (a Claude projects dir, codex, omp, memory).
---bank filters to one exactly; relic status prints the banks on this machine.
-
-LanceDB only, with an ICU full-text index: real Thai word segmentation, and
-2-character queries work (trigram cannot do either). Vectors live in a SEPARATE
-per-shard \`vectors\` table, written only by \`relic embed\` — never as a column on
-\`events\`, which cannot be widened to a vector type without silently storing it
-as text. See relic embed --dry-run before spending anything.`);
+  console.log(helpText());
   process.exit(0);
 }
 
 if (cmd === "index") await cmdIndex(f);
 else if (cmd === "prune") await cmdPrune(f);
+else if (cmd === "report") await cmdReport(f);
 else if (cmd === "search") { if (!pos[1]) { console.error("search needs a query"); process.exit(1); } await cmdSearch(pos.slice(1).join(" "), f); }
 else if (cmd === "show") { if (!pos[1]) { console.error("show needs a file"); process.exit(1); } await cmdShow(pos[1], f); }
 else if (cmd === "sources") {
