@@ -216,6 +216,24 @@ const TOOLS = [
     },
   },
   {
+    name: "relic_trace",
+    description:
+      "The QUERY LOG — what has been asked of this index, not what the sessions say. " +
+      "Returns the keyword cloud (term + count, most-asked first), totals, zero-hit and " +
+      "FTS-miss counts, median latency, and the slowest queries. Use it to answer 'what " +
+      "do we keep looking for', 'which searches come back empty', 'is search slow'. " +
+      "It CANNOT tell you what the corpus contains — for that, search it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: num("How many cloud terms to return (default 60)."),
+        min_count: num("Drop terms asked fewer than this many times (default 2). A cloud " +
+                       "of 1:1 entries is all size-1 noise — the fleet's tag cloud learned " +
+                       "this the hard way."),
+      },
+    },
+  },
+  {
     name: "relic_pending",
     description:
       "What is on disk but NOT in the index, and WHICH sessions those are. " +
@@ -448,6 +466,41 @@ async function run(name: string, a: any): Promise<string> {
     if (!chain) return `no session matches ${a.id}`;
     const head = imported ? `(${imported} transcripts imported on demand)\n\n` : "";
     return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) });
+  }
+
+  if (name === "relic_trace") {
+    /*
+     * The query log, not the corpus. Worth being loud about in the output itself: a
+     * cloud of terms LOOKS like "what this machine is about" and is actually "what
+     * someone typed into search". The two diverge — the most-indexed topic can be the
+     * one nobody ever has to look for.
+     */
+    const { readTrace } = await import("./trace.js");
+    const { listShards } = await import("./repo.js");
+    // BARE repo keys, deduped — the same list `relic trace` builds. `top_repo` in the
+    // log is written bank-less, so passing "<bank>/github.com/..." shard keys would
+    // report every shard as "never produced a best hit".
+    const shards = [...new Set(listShards(DATA_ROOT, IN_REPO).map(s => s.repo))];
+    const t = readTrace(DATA_ROOT, shards);
+    if (!t) return "no query log yet — nothing has been searched on this machine";
+
+    const limit = Number(a.limit ?? 60);
+    const min = Number(a.min_count ?? 2);
+    const cloud = t.terms.filter(x => x.n >= min).slice(0, limit);
+
+    const out: string[] = [];
+    out.push(`${fmt(t.total)} queries logged · ${t.span} · median ${t.medianMs} ms`);
+    out.push(`${fmt(t.zeroHit)} returned nothing · ${fmt(t.ftsMisses)} FTS misses · ` +
+             `${fmt(t.terms.length)} distinct terms, ${fmt(cloud.length)} asked ${min}+ times`);
+    out.push("");
+    out.push("CLOUD  (term · times asked — this is what was ASKED, not what the corpus holds)");
+    for (const x of cloud) out.push(`  ${String(x.n).padStart(5)}  ${x.term}`);
+    if (t.slowest.length) {
+      out.push("");
+      out.push("SLOWEST");
+      for (const q of t.slowest.slice(0, 5)) out.push(`  ${String(q.ms).padStart(6)} ms  ${q.q}`);
+    }
+    return out.join("\n");
   }
 
   if (name === "relic_pending") {

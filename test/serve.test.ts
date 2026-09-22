@@ -79,3 +79,33 @@ describe("corsHeaders — allow-list only", () => {
     expect(corsHeaders(null, ["http://localhost:5173"])).toEqual({});
   });
 });
+
+/*
+ * relic_trace answers a different question from every other tool, and the difference is
+ * easy to lose: the cloud is what was ASKED, never what the corpus holds. The most
+ * indexed topic on a machine can be the one nobody ever needs to search for.
+ */
+describe("relic_trace cloud shaping", () => {
+  const cloud = (terms: { term: string; n: number }[], min: number, limit: number) =>
+    terms.filter(x => x.n >= min).slice(0, limit);
+
+  const TERMS = [
+    { term: "herdr", n: 37 }, { term: "provisioner", n: 19 }, { term: "bank", n: 15 },
+    { term: "relic", n: 12 }, { term: "asked once", n: 1 }, { term: "also once", n: 1 },
+  ];
+
+  test("single-use terms are dropped — a 1:1 cloud is all size-1 noise", () => {
+    const out = cloud(TERMS, 2, 60);
+    expect(out.map(x => x.term)).not.toContain("asked once");
+    expect(out).toHaveLength(4);
+  });
+
+  test("min_count 1 keeps them, for 'how many distinct things have I looked for'", () => {
+    expect(cloud(TERMS, 1, 60)).toHaveLength(6);
+  });
+
+  test("limit trims the tail, keeping the most-asked", () => {
+    const out = cloud(TERMS, 2, 2);
+    expect(out.map(x => x.term)).toEqual(["herdr", "provisioner"]);
+  });
+});
