@@ -92,8 +92,12 @@ export async function serve(o: ServeOpts) {
     // Unauthenticated ON PURPOSE: a liveness probe that needs a token cannot tell you
     // the server is up when you have the token wrong. It reveals nothing but the name.
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, server: "relic", tools: 8, auth: o.token ? "bearer" : "none" },
-                           { headers: cors });
+      // DERIVED, never a literal. This was hardcoded `tools: 8` and went stale the
+      // first time a tool was added — a health endpoint that reports a number it does
+      // not measure is worse than one that omits it.
+      const { TOOLS } = await import("./mcp.js");
+      return Response.json({ ok: true, server: "relic", tools: TOOLS.length,
+                             auth: o.token ? "bearer" : "none" }, { headers: cors });
     }
 
     if (url.pathname !== "/mcp") return new Response("not found", { status: 404, headers: cors });
