@@ -562,7 +562,16 @@ export interface SessionsResult {
 function groupTranscripts(rows: (SessionRow & { repo: string })[]): SessionSummary[] {
   const by = new Map<string, (SessionRow & { repo: string })[]>();
   for (const r of rows) {
-    const k = r.session_uuid || r.file_path;
+    /*
+     * KEY ON (repo, session_uuid), not the uuid alone.
+     *
+     * The same uuid appears under a resolved repo AND under `_unresolved` when part of
+     * a tree was indexed before its cwd could be attributed — a pre-existing indexing
+     * artifact. Keying on the uuid merges those into one row and silently loses trees:
+     * 4 of them on the live index. report.ts already keys on the pair and was right;
+     * this was the odd one out, and relic-py matched report.ts when it was ported.
+     */
+    const k = r.session_uuid ? `${r.repo}\u0000${r.session_uuid}` : r.file_path;
     (by.get(k) ?? by.set(k, []).get(k)!).push(r);
   }
   const out: SessionSummary[] = [];
@@ -749,7 +758,20 @@ export async function readAround(
  * is the exact bug this split exists to prevent.
  */
 export interface ShardStat {
-  key: string; bank: string; repo: string; events: number; sessions: number;
+  key: string; bank: string; repo: string; events: number;
+  /**
+   * ROWS IN THE sessions TABLE — one per TRANSCRIPT, not per conversation.
+   *
+   * A fan-out that spawned 110 workflow agents stores 111 rows sharing one
+   * session_uuid. Rendering this number under the word "sessions" overstated the
+   * count 5.5x on a real index (1,790 shown, 323 actual), and it was on a status
+   * board, which is the worst place for a confident wrong number.
+   *
+   * Callers that mean CONVERSATIONS must group by (repo, session_uuid) — see
+   * groupTranscripts — or say "transcripts" in the output. The field keeps its name
+   * for compatibility; the comment is the contract.
+   */
+  sessions: number;
   /** max(files.imported_at) — when the indexer last wrote this shard. "" if never. */
   lastIndexed: string;
   /** max(sessions.started_at) — when this shard's newest transcript began. "" if none. */

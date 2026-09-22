@@ -336,10 +336,15 @@ async function run(name: string, a: any): Promise<string> {
       // The legend, not a decoration: this is the only place a model can learn that the
       // two filters read two DIFFERENT columns of what follows.
       `bank = the heading (exact) · repo = the indented column (substring)`,
+      // The OTHER thing only stated here. Every count below is transcripts; one
+      // conversation is many of them when it fanned out to subagents. A reader who
+      // wants conversations has one command and it is named.
+      `transcript = one file · conversation = one session tree — relic_sessions counts those`,
       "",
     ];
     for (const b of banks) {
-      L.push(`${b.bank}   ${fmt(b.sessions)} sessions · ${fmt(b.events)} events · ${b.shards} shards`);
+      // "transcripts", because that is what the number counts. See ShardStat.sessions.
+      L.push(`${b.bank}   ${fmt(b.sessions)} transcripts · ${fmt(b.events)} events · ${b.shards} shards`);
       L.push(`${" ".repeat(b.bank.length)}   indexed ${when(b.lastIndexed)} · newest session ${when(b.newestSession)}`);
       for (const r of b.rows.slice(0, limit))
         L.push(`  ${r.repo.replace("github.com/", "").padEnd(46)} ` +
@@ -348,7 +353,7 @@ async function run(name: string, a: any): Promise<string> {
       L.push("");
     }
     L.push(`total ${fmt(rows.reduce((x, r) => x + r.events, 0))} events · ` +
-           `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} sessions · ${rows.length} shards`);
+           `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} transcripts · ${rows.length} shards`);
     return L.join("\n");
   }
 
