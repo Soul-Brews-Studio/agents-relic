@@ -1240,7 +1240,7 @@ claude mcp add relic -- bun /path/to/agents-relic/src/mcp.ts
 claude mcp add relic -- relic mcp
 ```
 
-Eight tools, each one deterministic lookup with named parameters:
+Nine tools, each one deterministic lookup with named parameters:
 
 | tool | answers | `bank` |
 |---|---|---|
@@ -1252,6 +1252,7 @@ Eight tools, each one deterministic lookup with named parameters:
 | `relic_session` | one id **or name** → the tree, its stats, and the sessions either side | yes |
 | `relic_chain` | what ran in parallel inside that session | yes |
 | `relic_show` | the conversation around one hit, read from the source `.jsonl` | — |
+| `relic_trace` | the query log — what has been **asked** of this index (keyword cloud, zero-hit + FTS-miss counts, latency); the one that answers "what came back empty", right before a model improvises | — |
 
 **`relic_status` groups bank → repo and says which column each filter reads.** It used to
 claim its rows were the values `repo` accepts. After banks those rows read
