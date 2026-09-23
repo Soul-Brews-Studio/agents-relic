@@ -1,4 +1,4 @@
-import { expect, test, describe, afterAll } from "bun:test";
+import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,11 @@ describe("parserFor", () => {
     expect(parserFor("/h/.claude/projects/-work-repo/bbbb.jsonl", builtin)).toBe(parseClaude);
   });
 
+  test("a transcript root never claims a .md, so a stray one outside memory/ reads as a vault note", () => {
+    expect(parserFor("/h/.claude/projects/-work-repo/notes.md", builtin)).toBe(parseVault);
+    expect(parserFor(`${home}/projects/-work-repo/notes.md`, declared)).toBe(parseVault);
+  });
+
   test("a root is a directory, not a string prefix", () => {
     const vault = [src({ key: "v", path: "/r/projects", walk: "vault", parser: parseVault })];
     expect(parserFor("/r/projects-archive/-x/s.jsonl", vault)).toBe(parseClaude);
@@ -89,8 +94,9 @@ describe("a declared home through loadSources", () => {
   const claudeHome = join(home, ".claude-test");
   const A = "aaaaaaaa-1111-4000-8000-000000000000";
   const B = "bbbbbbbb-2222-4000-8000-000000000000";
-  const line = (id: string, type: string, text: string, ts: string) => JSON.stringify({
-    type, sessionId: id, uuid: `${id}-${ts}`, timestamp: `2026-09-23T${ts}.000Z`, cwd: "/work/repo",
+  const C = "cccccccc-3333-4000-8000-000000000000";
+  const line = (id: string, type: string, text: string, ts: string, cwd = "/work/repo") => JSON.stringify({
+    type, sessionId: id, uuid: `${id}-${ts}`, timestamp: `2026-09-23T${ts}.000Z`, cwd,
     message: { role: type, content: text },
   });
 
@@ -106,33 +112,52 @@ describe("a declared home through loadSources", () => {
   writeFileSync(join(proj, "memory", "feedback_x.md"), "---\nname: x\ndescription: d\n---\nbody\n");
   const old = join(claudeHome, "projects-archive", "-work-old");
   mkdirSync(old, { recursive: true });
-  writeFileSync(join(old, `${B}.jsonl`), line(B, "user", "archived", "02:00:00") + "\n");
+  writeFileSync(join(old, `${B}.jsonl`), line(B, "user", "archived", "02:00:00", "/work/old") + "\n");
+  // The built-in home, where claude-live and claude-memory share one root. A separate
+  // project dir keeps it out of the declared home's cwd scans.
+  const builtin = join(home, ".claude", "projects", "-work-other");
+  mkdirSync(join(builtin, "memory"), { recursive: true });
+  writeFileSync(join(builtin, `${C}.jsonl`), line(C, "user", "built-in", "03:00:00", "/work/other") + "\n");
+  writeFileSync(join(builtin, "memory", "z.md"), "---\nname: z\ndescription: d\n---\nbody\n");
 
   const probe = () => {
     const src = join(import.meta.dir, "..", "src");
     const script = `
-      const { liveRoots } = await import("${src}/live.ts");
+      const { liveRoots, currentSession } = await import("${src}/live.ts");
       const { seekOnDisk } = await import("${src}/seek.ts");
       const { findSessions, isClaudeProjectDir } = await import("${src}/lineage.ts");
       const { parserFor } = await import("${src}/sources.ts");
+      // relic now asks the host's id first and scans up from cwd when there is none.
+      const now = async (cwd, id) => {
+        if (id) process.env.CLAUDE_CODE_SESSION_ID = id; else delete process.env.CLAUDE_CODE_SESSION_ID;
+        return (await currentSession(cwd))?.sessionUuid ?? null;
+      };
       console.log(JSON.stringify({
         roots: liveRoots(),
         seek: seekOnDisk("aaaaaaaa").map(f => [f.tier, f.bank]).sort(),
         byCwd: findSessions("aaaaaaaa", "/work/repo").map(h => h.id),
         bySweep: findSessions("bbbbbbbb", "/nowhere").map(h => h.id),
         projectDir: isClaudeProjectDir("${proj}"),
+        nowById: await now("/nowhere", "${B}"),
+        nowByCwd: await now("/work/old"),
         transcript: parserFor("${join(proj, `${A}.jsonl`)}").name,
         memory: parserFor("${join(proj, "memory", "feedback_x.md")}").name,
+        builtinTranscript: parserFor("${join(builtin, `${C}.jsonl`)}").name,
+        builtinMemory: parserFor("${join(builtin, "memory", "z.md")}").name,
       }));`;
-    const env = { ...process.env, HOME: home };
-    delete env.CLAUDE_CONFIG_DIR;
+    const env: Record<string, string | undefined> = { ...process.env, HOME: home };
+    // A config dir or a host session id would point the child back at this machine.
+    for (const k of ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_COMPANION_SESSION_ID"])
+      delete env[k];
     const out = Bun.spawnSync(["bun", "-e", script], { env, stdout: "pipe", stderr: "pipe" });
     if (out.exitCode !== 0) throw new Error(out.stderr.toString());
     return JSON.parse(out.stdout.toString().trim().split("\n").pop()!);
   };
 
-  test("live roots, on-demand seek, lineage and the parser all see the declared home", () => {
-    const r = probe();
+  let r: any;
+  beforeAll(() => { r = probe(); });
+
+  test("live roots, on-demand seek, lineage and now all find the declared home (#65)", () => {
     expect(r.roots).toContain(join(claudeHome, "projects"));
     expect(r.roots).toContain(join(claudeHome, "projects-archive"));
     expect(r.roots).not.toContain(claudeHome);
@@ -140,7 +165,15 @@ describe("a declared home through loadSources", () => {
     expect(r.byCwd).toEqual([A]);
     expect(r.bySweep).toEqual([B]);
     expect(r.projectDir).toBe(true);
+    // A projects-archive session, found by the host's id and by the cwd scan alike.
+    expect(r.nowById).toBe(B);
+    expect(r.nowByCwd).toBe(B);
+  });
+
+  test("the configured sources parse each file by kind, declared home and built-in alike (#69)", () => {
     expect(r.transcript).toBe("parseClaude");
     expect(r.memory).toBe("parseMemory");
+    expect(r.builtinTranscript).toBe("parseClaude");
+    expect(r.builtinMemory).toBe("parseMemory");
   });
 });

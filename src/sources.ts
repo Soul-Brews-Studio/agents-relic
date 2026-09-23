@@ -387,7 +387,8 @@ export function loadSources(): SourceDef[] {
 }
 
 /** What is actually on this machine, for the `sources` command. */
-// <projects-root>/<encoded-project>/memory/<name>.md — exactly what walkMemory enumerates.
+// <projects-root>/<encoded-project>/memory/<name>.md, the facts walkMemory enumerates.
+// Claude encodes a project's absolute path, so that directory always starts with "-".
 const MEMORY_FILE = /\/-[^/]*\/memory\/[^/]+\.md$/;
 
 /**
@@ -399,21 +400,24 @@ const MEMORY_FILE = /\/-[^/]*\/memory\/[^/]+\.md$/;
  * outside any configured root (a transcript copied somewhere for inspection).
  */
 export function parserFor(filePath: string, sources: SourceDef[] = loadSources()): Parser {
+  const isMd = filePath.endsWith(".md");
   const memoryFile = MEMORY_FILE.test(filePath);
   let best: SourceDef | null = null;
   for (const s of sources) {
     const root = s.path.replace(/\/+$/, "");
     // A bare prefix would let `projects` claim files under `projects-archive`.
     if (filePath !== root && !filePath.startsWith(root + "/")) continue;
-    // Memory and transcript sources share roots, so the file's kind decides which may claim it.
+    // Memory and transcript sources share roots, so each claims only the files it walks.
+    // Memory sources parse <project>/memory/*.md facts, never transcripts.
     if (s.walk === "memory" && !memoryFile) continue;
-    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && memoryFile) continue;
+    // Transcript sources never parse .md files.
+    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && isMd) continue;
     // Longest matching root wins — sources can nest (a vault inside a repo).
     if (!best || s.path.length > best.path.length) best = s;
   }
   if (best) return best.parser;
   if (memoryFile) return parseMemory;
-  return filePath.endsWith(".md") ? parseVault : parseClaude;
+  return isMd ? parseVault : parseClaude;
 }
 
 export function detect(): { key: string; bank: string; path: string; present: boolean; enabled: boolean; note: string }[] {
