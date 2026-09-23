@@ -268,6 +268,37 @@ describe("vectorSearch", () => {
     expect(hits[2].uid).toBe("v1");
   });
 
+  test("_distance is squared L2: a cosine of 0.6 scores 0.6, not 0.68 (#124)", async () => {
+    // Exact and orthogonal vectors score 1 and 0 under both formulas, which is how the
+    // wrong one survived. Only a vector in between tells 1 - d/2 from 1 - d^2/2.
+    const s = await mk("vs-sq");
+    await s.putVectors([{ uid: "v0", embedding: [0.6, 0.8], model: "test:x", dim: 2, norm: "l2", embedded_at: "" }]);
+    const hit = (await s.vectorSearch([1, 0], { limit: 3 })).find(h => h.uid === "v0")!;
+    expect(Number((hit as any)._score)).toBeCloseTo(0.6, 5);
+  });
+
+  test("low cosines keep their order instead of all clamping to 0 (#124)", async () => {
+    // True cosines 0.25, 0.10, -0.05 against [1, 0]. The squared-as-plain formula put all
+    // three at 0.000 and returned them in whatever order the events query did.
+    const s = await LanceStore.open(join(tmp, "vs-low"));
+    const cosines = [0.10, -0.05, 0.25];            // written out of order on purpose
+    await s.putEvents(cosines.map((_, i) => ({
+      uid: `w${i}`, session_uuid: "s", file_path: "/f", repo_key: "r", seq: i, role: "user", ts: "",
+      text: `word ${i} a sentence long enough to pass the minimum length`, source: "claude",
+      tier: "session", kind: "transcript", worktree: "", cwd: "", org: "", project: "", dir: "",
+      mem_type: "", origin_session: "",
+    })));
+    await s.putVectors(cosines.map((c, i) => ({
+      uid: `w${i}`, embedding: [c, Math.sqrt(1 - c * c)], model: "test:x", dim: 2, norm: "l2", embedded_at: "",
+    })));
+    const hits = await s.vectorSearch([1, 0], { limit: 3 });
+    expect(hits.map(h => h.uid)).toEqual(["w2", "w0", "w1"]);
+    const scores = hits.map(h => Number((h as any)._score));
+    expect(scores[0]).toBeCloseTo(0.25, 5);
+    expect(scores[1]).toBeCloseTo(0.10, 5);
+    expect(scores[2]).toBe(0);                      // a negative cosine still clamps to 0
+  });
+
   test("the scalar filter is applied to the EVENTS, after the vector hop", async () => {
     // The vectors table has no tier/role columns to pre-filter on, by design — so this
     // is a post-filter, and the overfetch exists to stop it starving the page.
