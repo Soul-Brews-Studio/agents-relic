@@ -316,7 +316,7 @@ async function recapTarget(arg: string | undefined): Promise<string> {
   // not data. On stdout it lands inside `--json` output and makes it unparseable:
   // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
   // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+  console.error(resolvedBanner(prev));
   return prev.id;
 }
 
@@ -825,11 +825,13 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * line by the time a human types, so without the exclusion `tail` would hand you your
  * own empty transcript.
  */
-async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
-  const { encodeProjectDir, sessionIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
+async function previousSessionFile(cwd: string): Promise<{ file: string; id: string; why: "here" | "session_key" } | null> {
+  const { encodeProjectDir, sessionIdFromEnv, hermesIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
   const { readdirSync, statSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const me = sessionIdFromEnv()?.id ?? "";
+  // A transcript is named by a Claude or Codex id; a Hermes id never names a file.
+  const host = sessionIdFromEnv();
+  const me = host && host.via !== "HERMES_SESSION_ID" ? host.id : "";
   const enc = encodeProjectDir(cwd);
   const found: { file: string; id: string; mtime: number }[] = [];
   for (const root of liveRoots()) {
@@ -851,7 +853,7 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * join the SAME ranking instead of being tried only when the transcripts come up
    * empty. The newest session is the answer, whichever host wrote it.
    */
-  const { hermesSessionsIn } = await import("./live-hermes.js");
+  const { hermesSessionsIn, hermesPredecessor } = await import("./live-hermes.js");
   const cands = [
     ...ranked.map(c => ({ file: c.file, id: c.id, at: c.lastEventMs ?? c.mtimeMs })),
     ...hermesSessionsIn(cwd).map(h => ({ file: h.path, id: h.id, at: h.lastMs })),
@@ -873,10 +875,32 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
-      if (human && p.events.length > 2) return { file: c.file, id: c.id };
+      if (human && p.events.length > 2) return { file: c.file, id: c.id, why: "here" };
     } catch { /* unreadable: try the next */ }
   }
-  return cands[0] ?? null;      // nothing substantial — hand back the newest and say so
+
+  /*
+   * NOTHING HERE WORTH READING, AND THE CALLER IS A HERMES SESSION: follow its own line.
+   *
+   * A gateway session (Discord, say) records no cwd, so no directory can hand it back —
+   * the case #100 reported. It does name itself in HERMES_SESSION_ID, and its row carries
+   * a session_key, so the session before it on that key is the conversation it continues.
+   *
+   * Tried only after the directory comes up empty or stubs-only, never before it: the
+   * environment cannot say which host is innermost, and a Claude session started from a
+   * Hermes shell inherits the variable. It still beats a stub, which is worse than no
+   * answer for the reason above.
+   */
+  const prior = hermesPredecessor(hermesIdFromEnv());
+  if (prior) return { file: prior.path, id: prior.id, why: "session_key" };
+  return cands[0] ? { file: cands[0].file, id: cands[0].id, why: "here" } : null;   // hand back the newest and say so
+}
+
+/** Which session was resolved, and by which rule. STDERR, not stdout — see recapTarget. */
+function resolvedBanner(prev: { id: string; why: "here" | "session_key" }): string {
+  const rule = prev.why === "session_key" ? "the session before this one on its Hermes session_key"
+                                         : "newest session here that is not this one";
+  return `\u2190 ${shortId(prev.id)}  (${rule})`;
 }
 
 /*
@@ -962,7 +986,7 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
     // not data. On stdout it lands inside `--json` output and makes it unparseable:
     // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
     // line was an arrow. Found by piping the new default into jq.
-    console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+    console.error(resolvedBanner(prev));
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
@@ -1516,6 +1540,7 @@ async function cmdNow(f: Record<string, string | boolean>) {
     console.log(`no session transcript for this directory`);
     console.log(`  ${process.cwd()}`);
     console.log(`  relic now --all   to see every active session on this machine`);
+    for (const note of hermesOffNotes()) console.log(`  ${note}`);
     return;
   }
 
@@ -1527,6 +1552,15 @@ async function cmdNow(f: Record<string, string | boolean>) {
     return;
   }
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
+
+  if (cur.source === "hermes") {
+    // A row in state.db, named by HERMES_SESSION_ID: no transcript tree and no timeline.
+    console.log(`${cur.title ?? "(untitled)"}\n`);
+    console.log(`${cur.sessionUuid}  ·  last message ${humanAge(cur.eventAgeSec ?? cur.ageSec)} ago`);
+    console.log(cur.confident ? cur.cwd : `(no cwd recorded — a gateway session)`);
+    console.log(`hermes  ${cur.projectDir}`);
+    return;
+  }
 
   console.log(`${cur.title ?? "(untitled)"}\n`);
   console.log(`${cur.sessionUuid}  ·  ${clockLabel(cur.ageSec, cur.eventAgeSec)}`);
@@ -1586,6 +1620,9 @@ async function cmdLineage(arg: string | undefined, f: Record<string, string | bo
       }
       l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
     }
+  } else if (cur?.source === "hermes") {
+    // The caller is a Hermes session (HERMES_SESSION_ID): its line comes from state.db.
+    l = buildHermesLineage(cur.projectDir, cur.sessionUuid, { all });
   } else {
     if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
     if (!isClaudeProjectDir(cur.projectDir)) {

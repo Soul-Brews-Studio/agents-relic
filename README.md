@@ -286,8 +286,15 @@ none, so they read `state.db` instead, through a parallel lookup rather than
   transcripts, so the newest session wins whichever agent wrote it. When relic runs
   inside a Hermes session, that session is skipped: Hermes sets `HERMES_SESSION_ID` on
   every command it runs.
-- A gateway session (Discord, say) records no cwd. It appears in `now --all` but can
-  never be the session before this one for a directory.
+- A gateway session (Discord, say) records no cwd, so no directory can claim it. When
+  the directory has nothing worth reading and `HERMES_SESSION_ID` is set, `tail`/`recap`
+  follow the caller's own line instead: the session immediately before it on the same
+  `session_key`, the same line `lineage` draws. This is a fallback, never a first
+  choice. A Claude session started from a Hermes shell inherits the variable, and the
+  environment cannot say which agent is innermost.
+- `now` names a Hermes caller by the same variable, and `lineage` with no id draws its
+  line. Hermes ids are not hex, so they get their own shape check. The Claude and Codex
+  checks are unchanged, and those two still win when both are set.
 
 Only an enabled `hermes` source is read. When a lookup comes up empty and `~/.hermes`
 holds data with the source switched off, the miss message says so.
