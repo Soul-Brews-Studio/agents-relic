@@ -5,6 +5,7 @@ export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
+import { COVER_FRACTION } from "./store/fts.js";
 import { queryProviderFor } from "./embed.js";
 import { discover, parseSince } from "./discover.js";
 import { resolveRepoKey, listShards, repoKeyOf } from "./repo.js";
@@ -329,6 +330,25 @@ export function degradedNote(degraded: string[] | undefined, searched: number): 
   const names = degraded.slice(0, 3).map(k => k.replace("github.com/", "")).join(", ");
   return `\u26A0 ${degraded.length} of ${searched} shards searched use the \`simple\` tokenizer (no ICU where they were ` +
          `indexed) — Thai word-internal matches are missed there: ${names}${degraded.length > 3 ? ", ..." : ""}`;
+}
+
+/**
+ * Rows outside their shard's full-text index (#115), rendered once for both status surfaces.
+ *
+ * A speed note, never a completeness one: those rows are still found, by tokenizing each of them
+ * again on every search. null when every index covers its shard.
+ */
+export function coverageNote(rows: { bank: string; repo: string; unindexed: number }[], limit = 5): string[] | null {
+  const behind = rows.filter(r => r.unindexed > 0).sort((a, b) => b.unindexed - a.unindexed);
+  if (!behind.length) return null;
+  const n = behind.reduce((a, r) => a + r.unindexed, 0);
+  return [
+    `${n.toLocaleString("en-US")} rows in ${behind.length} shard${behind.length === 1 ? "" : "s"} are not in the full-text ` +
+    `index yet — still found, by a slower scan. relic index re-indexes a shard once they pass ` +
+    `${Math.round(COVER_FRACTION * 100)}% of it; relic index --fts-rebuild covers them all now:`,
+    ...behind.slice(0, limit).map(r => `  ${r.unindexed.toLocaleString("en-US").padStart(9)}  ${r.bank}  ${r.repo.replace("github.com/", "")}`),
+    ...(behind.length > limit ? [`  ... and ${behind.length - limit} more`] : []),
+  ];
 }
 
 export async function searchEvents(q: string, o: SearchOpts = {}): Promise<SearchResult> {
@@ -886,6 +906,8 @@ export interface ShardStat {
   newestSession: string;
   /** The full-text tokenizer: "simple" = Thai substring search degraded, "none" = LIKE scan. */
   fts: "icu" | "simple" | "none";
+  /** Rows the full-text index does not cover yet (#115): found by a slower scan until it is rebuilt. */
+  unindexed: number;
 }
 
 /**
@@ -948,9 +970,10 @@ export async function indexStatus(
       const st = await LanceStore.open(sh.dir);
       const c = await st.counts();
       const fr = s.freshness === false ? { lastIndexed: "", newestSession: "" } : await st.freshness();
+      const fts = await st.ftsState();
       rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, events: c.events, sessions: c.sessions,
                   lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
-                  fts: (await st.ftsTokenizer()) ?? "none" });
+                  fts: fts.tokenizer ?? "none", unindexed: fts.unindexed });
     } catch { /* skip unreadable shard */ }
   }
   rows.sort((a, b) => b.events - a.events);

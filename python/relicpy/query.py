@@ -154,7 +154,8 @@ def index_status(s: Scope, freshness: bool = True) -> tuple[str, list[ShardStat]
             return ShardStat(key=sh.key, bank=sh.bank, repo=sh.repo,
                              events=c["events"], sessions=c["sessions"],
                              last_indexed=fr["last_indexed"],
-                             newest_session=fr["newest_session"])
+                             newest_session=fr["newest_session"],
+                             unindexed=st.fts_unindexed())
         except Exception:
             return None  # an unreadable shard contributes nothing, it is not fatal
 

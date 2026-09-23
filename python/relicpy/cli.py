@@ -21,6 +21,7 @@ from .progress import Progress
 from .query import floor_note, group_by_bank, index_status, match_count, search_events
 from .repo import banks as list_bank_names
 from .repo import default_root
+from .store import COVER_FRACTION
 
 
 def _local(iso: str) -> str:
@@ -283,6 +284,14 @@ def cmd_status(a: argparse.Namespace) -> int:
           f"{sum(r.sessions for r in rows):,} sessions · {len(rows)} shards")
     print(f"last indexed  {_local(max((r.last_indexed for r in rows), default=''))}"
           f"   ·   newest session  {_local(max((r.newest_session for r in rows), default=''))}")
+    # #115, as the TypeScript status says it: rows outside their shard's full-text index.
+    behind = sorted((r for r in rows if r.unindexed), key=lambda r: r.unindexed, reverse=True)
+    if behind:
+        print(f"  {sum(r.unindexed for r in behind):,} rows in {len(behind)} shard(s) are not in the full-text "
+              f"index yet — still found, by a slower scan. relic index re-indexes a shard once they pass "
+              f"{round(COVER_FRACTION * 100)}% of it:")
+        for r in behind[:5]:
+            print(f"  {r.unindexed:>11,}  {r.bank}  {r.repo.replace('github.com/', '')}")
     return 0
 
 
@@ -665,6 +674,9 @@ def cmd_index(a) -> int:
     if t.fts_drifted:
         print(f"  fts:         {t.fts_drifted} shard(s) rebuilt — the old index dropped stop words, "
               f"\"nas\" and \"bin\" among them (#97)")
+    if t.fts_covered:
+        print(f"  fts:         {t.fts_covered} shard(s) re-indexed to take in {t.fts_covered_rows:,} appended "
+              f"rows the old index did not cover (#115)")
     if t.fts_simple:
         print(f"  ! fts:       {len(t.fts_simple)} shard(s) on the `simple` tokenizer — this LanceDB "
               f"build has no ICU. Thai substring search degraded on this shard; a later run "

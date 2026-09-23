@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
   statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote, roomTag, channelHead,
-  facetArg, matchCount, floorNote,
+  facetArg, matchCount, floorNote, coverageNote,
 } from "./query.js";
 import { parseChannelEnvelope } from "./types.js";
 import { renderChain } from "./chain.js";
@@ -376,6 +376,7 @@ async function run(name: string, a: any): Promise<string> {
       L.push(`\u26A0 ${simple.length} shard(s) use the \`simple\` tokenizer (no ICU where indexed) — Thai substring ` +
              `search degraded: ${simple.slice(0, 5).map(r => r.key.replace("github.com/", "")).join(", ")}` +
              (simple.length > 5 ? ", ..." : ""));
+    L.push(...(coverageNote(rows.filter(r => r.events > 0)) ?? []));
     return L.join("\n");
   }
 

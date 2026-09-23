@@ -39,7 +39,7 @@ import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prun
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
          groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead, facetArg,
-         matchCount, floorNote } from "./query.js";
+         matchCount, floorNote, coverageNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, damageNote, DEFAULT_OLLAMA, DEFAULT_MODEL } from "./embed.js";
 import { scanLangs, recommend, renderLangs, renderEmbedCheck } from "./langs.js";
@@ -165,6 +165,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     console.log(`  fts:         ${tally.ftsDrifted} shard${tally.ftsDrifted === 1 ? "" : "s"} rebuilt — the old index dropped stop words, "nas" and "bin" among them (#97)`);
     console.log(`               shards this run did not reach keep theirs: relic index --fts-rebuild rebuilds every shard`);
   }
+  if (tally.ftsCovered)
+    console.log(`  fts:         ${tally.ftsCovered} shard${tally.ftsCovered === 1 ? "" : "s"} re-indexed to take in ` +
+                `${fmt(tally.ftsCoveredRows)} appended rows the old index did not cover (#115)`);
   if (tally.ftsSimple.length) {
     const n = tally.ftsSimple.length;
     console.log(`  \u26A0 fts:       ${n} shard${n === 1 ? "" : "s"} on the \`simple\` tokenizer — this LanceDB build has no ICU` +
@@ -329,6 +332,8 @@ async function cmdFtsRebuild(dataRoot: string | null, inRepo: boolean, dryRun: b
   console.log(`  shards:      ${fmt(r.shards)} on disk`);
   console.log(`  rebuilt:     ${fmt(r.rebuilt)}` +
               (r.drifted ? `  (${fmt(r.drifted)} had been built dropping stop words — #97)` : ""));
+  if (r.covered)
+    console.log(`  covered:     ${fmt(r.covered)} appended rows the old indexes did not cover (#115)`);
   console.log(`  skipped:     ${fmt(r.empty + r.kept)}` +
               (r.empty ? `  (${fmt(r.empty)} with no events table)` : ""));
   if (r.kept)
@@ -1528,18 +1533,19 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   if (smode === "json" || smode === "jsonl") {
     const rows: { key: string; bank: string; repo: string; ev: number; se: number;
                   events: number; sessions: number;
-                  lastIndexed: string; newestSession: string; fts: string }[] = [];
+                  lastIndexed: string; newestSession: string; fts: string; unindexed: number }[] = [];
     for (const sh of shards) {
       try {
         const st = await LanceStore.open(sh.dir);
         const c = await st.counts();
         const fr = await st.freshness();
+        const fts = await st.ftsState();
         rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo,
                     // ev/se predate the rest of this row and something may read them.
                     // events/sessions are the names everything else uses.
                     ev: c.events, se: c.sessions, events: c.events, sessions: c.sessions,
                     lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
-                    fts: (await st.ftsTokenizer()) ?? "none" });
+                    fts: fts.tokenizer ?? "none", unindexed: fts.unindexed });
       } catch { /* skip unreadable shard */ }
     }
     rows.sort((a, b) => b.ev - a.ev);
@@ -1573,15 +1579,16 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log("");
 
   const rows: { bank: string; repo: string; events: number; sessions: number;
-                lastIndexed: string; newestSession: string; fts: string }[] = [];
+                lastIndexed: string; newestSession: string; fts: string; unindexed: number }[] = [];
   for (const s of shards) {
     try {
       const st = await LanceStore.open(s.dir);
       const c = await st.counts();
       const fr = await st.freshness();
+      const fts = await st.ftsState();
       rows.push({ bank: s.bank, repo: s.repo, events: c.events, sessions: c.sessions,
                   lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
-                  fts: (await st.ftsTokenizer()) ?? "none" });
+                  fts: fts.tokenizer ?? "none", unindexed: fts.unindexed });
     } catch { /* skip unreadable shard */ }
   }
   // BANK FIRST, then repo. A flat list sorted by size interleaves three snapshots of the
@@ -1617,6 +1624,7 @@ async function cmdStatus(f: Record<string, string | boolean>) {
     for (const r of simple.slice(0, limit)) console.log(`    ${r.bank}  ${r.repo.replace("github.com/", "")}`);
     if (simple.length > limit) console.log(`    ... and ${simple.length - limit} more (--limit N)`);
   }
+  for (const line of coverageNote(withEv, Math.min(limit, 5)) ?? []) console.log(`  ${line}`);
   /*
    * VECTORS, MEASURED — this line used to be a hardcoded claim that vectors "land in
    * the same `events` table, no migration". Both halves were wrong: they land in a

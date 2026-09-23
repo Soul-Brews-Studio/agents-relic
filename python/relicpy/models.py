@@ -209,6 +209,7 @@ class ShardStat(BaseModel):
     sessions: int
     last_indexed: str = ""  # max(files.imported_at) — when the INDEXER last wrote
     newest_session: str = ""  # max(sessions.started_at) — how recent the MATERIAL is
+    unindexed: int = 0  # rows the full-text index does not cover yet (#115)
 
 
 class BankGroup(BaseModel):
