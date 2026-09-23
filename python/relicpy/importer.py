@@ -106,6 +106,8 @@ class ImportTally:
     fts_built: int = 0
     fts_failed: int = 0
     fts_ms: int = 0
+    fts_simple: list[str] = field(default_factory=list)  # "bank/repo" left on the `simple` tokenizer
+    fts_upgraded: int = 0
     shards: Optional[Shards] = None
     # Every file DISCOVERED this run, grouped by (bank, repo) — including the ones
     # skipped as unchanged, which are the majority on a repeat run and are exactly the
@@ -295,8 +297,12 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             fts_bar.tick(f"  building full-text index  {i+1}/{len(stores)} shards   ",
                          (i + 1) / len(stores) * 100, i == len(stores) - 1)
         try:
-            st.ensure_fts_index()
+            r = st.ensure_fts_index()
             t.fts_built += 1
+            if r and r.get("upgraded"):
+                t.fts_upgraded += 1
+            if r and r["tokenizer"] == "simple":
+                t.fts_simple.append(st.dir)
         except Exception as err:
             t.fts_failed += 1
             if verbose:

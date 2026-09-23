@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
-import { asObj, str, truncate, flattenContent, blockRole, uidOf, stripEnvelope, parseChannelEnvelope, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
+import { asObj, str, truncate, flattenContent, blockRole, uidOf, treeKeyOf, stripEnvelope, parseChannelEnvelope, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
 
 /** Roles whose text is worth full-text indexing. UI/state events are counted, not indexed. */
 const INDEXED = new Set(["user", "assistant", "system"]);
@@ -14,6 +14,7 @@ const INDEXED = new Set(["user", "assistant", "system"]);
  */
 export const parseClaude: Parser = async (filePath) => {
   const fileKey = basename(filePath);
+  const uidKey = treeKeyOf(filePath);
   const events: ParsedEvent[] = [];
   const typeCounts: Record<string, number> = {};
   let lines = 0, badLines = 0, seq = 0;
@@ -79,7 +80,7 @@ export const parseClaude: Parser = async (filePath) => {
     // A channel plugin's routing, as facets beside the text — never in place of it.
     const channel = role === "user" ? parseChannelEnvelope(text) : null;
     events.push({
-      uid: uidOf("claude", fileKey, seq),   // path-independent by design
+      uid: uidOf("claude", uidKey, seq),    // root-independent by design
       seq, role, ts, text: truncate(text), cwd: lineCwd,
       ...(channel && { channel }),
     });

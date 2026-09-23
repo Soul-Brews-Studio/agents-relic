@@ -20,16 +20,28 @@ SEP = chr(31)
 
 
 def uid_of(source: str, file_key: str, seq: int) -> str:
-    """Event identity. Deliberately EXCLUDES the directory.
+    """Event identity. Deliberately EXCLUDES the root and project directory.
 
-    Only the basename and the line number participate, so the same transcript found
-    under two roots (live + archive, or two machines) collapses to one row.
+    Only the path INSIDE the session tree (see tree_key_of) and the line number
+    participate, so the same transcript found under two roots (live + archive, or two
+    machines) collapses to one row.
 
     It hashes a LINE SLOT, not an event — which is why search dedup keys on content
     instead of uid. A resumed session writes a new file under the same uuid whose
     slot 7 holds a different event entirely.
     """
     return hashlib.sha1(SEP.join([source, file_key, str(seq)]).encode("utf-8")).hexdigest()
+
+
+def tree_key_of(file_path: str) -> str:
+    # Basename at the top of a project dir, path from the session dir below it: one agent file can sit in two trees (#58).
+    parts = file_path.split("/")
+    n = len(parts)
+    if n >= 5 and parts[n - 3] == "workflows" and parts[n - 4] == "subagents":
+        return "/".join(parts[n - 5:])
+    if n >= 3 and parts[n - 2] == "subagents":
+        return "/".join(parts[n - 3:])
+    return parts[n - 1]
 
 
 def as_obj(v: Any) -> Optional[dict]:

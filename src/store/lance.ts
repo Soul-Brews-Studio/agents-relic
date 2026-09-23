@@ -1,6 +1,7 @@
 import * as lancedb from "@lancedb/lancedb";
 import { Index } from "@lancedb/lancedb";
 import { mkdirSync } from "node:fs";
+import { ensureFtsIndex as ensureFts, tokenizerOf, type FtsOutcome, type Tokenizer } from "./fts.js";
 
 /**
  * The only store. LanceDB holds events, sessions and the manifest; there is no
@@ -22,7 +23,7 @@ import { mkdirSync } from "node:fs";
  */
 
 export interface EventRow {
-  uid: string;            // sha1(source, basename, seq) — path-independent, dedups across roots
+  uid: string;            // sha1(source, treeKeyOf(path), seq) — root-independent, dedups across roots
   session_uuid: string;
   file_path: string;
   repo_key: string;
@@ -253,6 +254,27 @@ export class LanceStore {
     await t?.delete(`file_path = ${sqlStr(filePath)}`);
   }
 
+  /** (uid, seq, file_path) of every event these files own — chunked like pruneFiles. */
+  async eventKeysOf(paths: string[]): Promise<{ uid: string; seq: number; file_path: string }[]> {
+    const t = await this.existing("events");
+    if (!t || !paths.length) return [];
+    const out: { uid: string; seq: number; file_path: string }[] = [];
+    for (let i = 0; i < paths.length; i += 200) {
+      const where = `file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`;
+      for (const r of await t.query().where(where).select(["uid", "seq", "file_path"]).toArray() as any[])
+        out.push({ uid: String(r.uid), seq: Number(r.seq), file_path: String(r.file_path) });
+    }
+    return out;
+  }
+
+  /** Vectors whose events are about to be re-keyed would otherwise be orphans nothing can reach. */
+  async deleteVectors(uids: string[]): Promise<void> {
+    const t = await this.existing("vectors");
+    if (!t) return;
+    for (let i = 0; i < uids.length; i += 200)
+      await t.delete(`uid IN (${uids.slice(i, i + 200).map(sqlStr).join(", ")})`);
+  }
+
   /**
    * Every file_path this shard holds a row for — the population `prune` compares
    * discovery against.
@@ -344,30 +366,16 @@ export class LanceStore {
    * (The "tantivy is 10-200x slower than FTS5" note in lance-indexer predates this
    * engine. Re-measured here, FTS is 7-28x FASTER than the LIKE scan it replaced.)
    */
-  async ensureFtsIndex(): Promise<void> {
+  async ensureFtsIndex(opts: { rebuild?: boolean } = {}, config?: (tok: Tokenizer) => Index): Promise<FtsOutcome | null> {
     const t = await this.existing("events");
-    if (!t) return;
-    const has = (await t.listIndices()).some(i => i.columns.includes("text"));
-    if (has) return;
-    await t.createIndex("text", {
-      config: Index.fts({
-        baseTokenizer: "icu",
+    if (!t) return null;
+    return ensureFts(t, opts, config);
+  }
 
-        // stem:false — this is a CODE corpus, and the English stemmer mangles identifiers.
-        // Proven with table.tokenize():
-        //   stem:true    structured_output_mode -> structured_output_mod
-        //                CLAUDE_..._AGENT_TEAMS -> claude_..._agent_team
-        //   stem:false   both exact
-        // The cost is that `sessions` no longer matches `session`. That is the right
-        // trade here: a 3,000-event sample held 354 distinct identifiers over 21 chars
-        // (env vars, git SHAs, index names), and searching for a precise identifier is
-        // the common case — searching for an English plural is not.
-        stem: false,
-
-        // Long identifiers and 64-char hashes must survive whole.
-        maxTokenLength: 128,
-      }),
-    });
+  /** "simple" marks a shard where Thai substring search is degraded; null = no index, LIKE scan. */
+  async ftsTokenizer(): Promise<Tokenizer | null> {
+    const t = await this.existing("events");
+    return t ? tokenizerOf(t) : null;
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */

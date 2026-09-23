@@ -572,6 +572,14 @@ def cmd_index(a) -> int:
     print(f"  imported:    {t.imported:,} files -> {t.added:,} events")
     print(f"  shards:      {t.shards.size} (bank,repo) pairs, {t.fts_built} fts index "
           f"built in {t.fts_ms/1000:.1f}s")
+    if t.fts_upgraded:
+        print(f"  fts:         {t.fts_upgraded} shard(s) rebuilt from `simple` to ICU")
+    if t.fts_simple:
+        print(f"  ! fts:       {len(t.fts_simple)} shard(s) on the `simple` tokenizer — this LanceDB "
+              f"build has no ICU. Thai substring search degraded on this shard; a later run "
+              f"where ICU loads rebuilds it.")
+        for d in t.fts_simple[:5]:
+            print(f"               {d}")
     if t.failed:
         print(f"  failed:      {t.failed:,}")
     print(f"  wrote:       {getattr(a, 'data_root', None) or default_root()} "

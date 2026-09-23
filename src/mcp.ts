@@ -5,12 +5,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, roomTag, channelHead,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote, roomTag, channelHead,
 } from "./query.js";
 import { parseChannelEnvelope, saidText } from "./types.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
-import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
 import { trace } from "./trace.js";
 
 /**
@@ -191,7 +191,8 @@ const TOOLS = [
       "the working directory and lists its live agents plus an activity timeline. " +
       "With all=true: every session written to recently across this machine, newest " +
       "first — the 'which agents are alive' question. " +
-      "Answered from file mtime, NOT the index: a transcript being appended to right now " +
+      "Answered from the files, NOT the index (mtime prefilters, the last timestamped record " +
+      "ranks — hosts rewrite metadata without one): a transcript being appended to right now " +
       "cannot be in an index that already ran, so this is the only tool here that is " +
       "current to the second. Use it to learn your own session id.",
     inputSchema: {
@@ -283,7 +284,7 @@ async function run(name: string, a: any): Promise<string> {
       if (!live.length) return `nothing written in the last ${humanAge(windowSec)}`;
       const L = [`${live.length} session(s) active in the last ${humanAge(windowSec)}`, ""];
       for (const x of live) {
-        L.push(`${humanAge(x.ageSec).padStart(5)} ago  ${x.sessionUuid}  ` +
+        L.push(`${humanAge(x.eventAgeSec).padStart(5)} ago  ${x.sessionUuid}  ` +
                `${x.agents} live agent(s)  ${x.title ?? "(untitled)"}`);
         L.push(`            ${x.cwd ?? x.projectDir}`);
       }
@@ -298,7 +299,7 @@ async function run(name: string, a: any): Promise<string> {
     const agents = all.filter(x => x.tier !== "session" && x.ageSec <= windowSec);
     const L = [
       cur.title ?? "(untitled)",
-      `${cur.sessionUuid} · last write ${humanAge(cur.ageSec)} ago`,
+      `${cur.sessionUuid} · ${clockLabel(cur.ageSec, cur.eventAgeSec)}`,
       cur.cwd,
     ];
     // The encoding maps both "/" and "." to "-", so two checkouts can share a project
@@ -362,6 +363,11 @@ async function run(name: string, a: any): Promise<string> {
     }
     L.push(`total ${fmt(rows.reduce((x, r) => x + r.events, 0))} events · ` +
            `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} transcripts · ${rows.length} shards`);
+    const simple = rows.filter(r => r.events > 0 && r.fts === "simple");
+    if (simple.length)
+      L.push(`\u26A0 ${simple.length} shard(s) use the \`simple\` tokenizer (no ICU where indexed) — Thai substring ` +
+             `search degraded: ${simple.slice(0, 5).map(r => r.key.replace("github.com/", "")).join(", ")}` +
+             (simple.length > 5 ? ", ..." : ""));
     return L.join("\n");
   }
 
@@ -372,7 +378,7 @@ async function run(name: string, a: any): Promise<string> {
       return `no shards match${a?.repo ? ` repo~${a.repo}` : ""} — call relic_status to see what is indexed`;
 
     const limit = Number(a.limit ?? 20);
-    const { hits, shards, ms, total, unfaceted } = await searchEvents(q, {
+    const { hits, shards, ms, total, degraded, unfaceted } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
       via: a.via, chat: a.chat, fromUser: a.from_user,
@@ -386,15 +392,17 @@ async function run(name: string, a: any): Promise<string> {
             shards, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
             top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true }, DATA_ROOT);
 
+    const lossy = degradedNote(degraded, shards);
     // Said on the answer itself: a shard that predates the facets cannot match one, and
     // its silence reads exactly like "no such turn".
-    const note = unfaceted ? `${unfaceted} of ${shards} shards predate channel facets and cannot match ` +
+    const unfacetedNote = unfaceted ? `${unfaceted} of ${shards} shards predate channel facets and cannot match ` +
       `via/chat/from_user until \`relic index --backfill-channel --apply\` re-reads them` : "";
-    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + (note ? `\n${note}` : "");
+    const notes = [lossy, unfacetedNote].filter(Boolean);
+    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + notes.map(n => `\n${n}`).join("");
     const narrowed = !a.all_tiers && !a.tier;
     const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
       (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""),
-      ...(note ? [note] : []), ""];
+      ...notes, ""];
     for (const h of hits.slice(0, limit)) {
       const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
       const text = c ? c.body : h.text;

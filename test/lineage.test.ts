@@ -206,3 +206,41 @@ describe("buildLineage + renderLineage", () => {
     expect(renderLineage(l, { now: ms("13:02:00"), current: C })).toContain("c3333333  09-16 12:00:05 → now   1.0h");
   });
 });
+
+describe("#67 — mtime is not liveness", () => {
+  let dir: string;
+  beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "relic-lineage-67-")); });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("a parent rewritten long after the /clear still links on its last event within 120s", () => {
+    const p = node("p", { startMs: ms("10:00:00"), endMs: ms("12:00:00"), mtimeMs: ms("20:00:00") });
+    const c = node("c", { startMs: ms("12:01:30"), endMs: ms("13:00:00"), mtimeMs: ms("13:00:00"), started: "clear" });
+    expect(inferLinks([p, c])[0]).toMatchObject({ parent: "p", kind: "clear", via: "last-event", gapMs: 90_000 });
+    const late = node("c", { ...c, startMs: ms("12:03:00") });
+    expect(inferLinks([p, late])).toEqual([]);
+  });
+
+  test("a transcript whose first 64 KB holds no timestamp still gets a node", () => {
+    const f = join(dir, "big-head.jsonl");
+    const snapshot = { type: "file-history-snapshot", messageId: "m", snapshot: { pad: "s".repeat(1_000) } };
+    write(f, [
+      ...Array.from({ length: 100 }, () => snapshot),
+      hook("big-head", "09:00:00", "startup"),
+      user("big-head", "09:00:01", "real work"),
+      asst("big-head", "09:30:00", "done"),
+    ]);
+    expect(probe(f, "big-head")).toMatchObject({ startMs: ms("09:00:00"), endMs: ms("09:30:00"), started: "startup" });
+  });
+
+  test("a metadata rewrite does not make an idle transcript read as now", async () => {
+    const id = "e5555555-0000-4000-8000-000000000000";
+    write(join(dir, `${id}.jsonl`), [
+      hook(id, "10:00:00", "startup"), user(id, "10:00:01", "work"), asst(id, "11:00:00", "done"),
+      { type: "permission-mode", permissionMode: "default", sessionId: id },
+    ], "13:01:00");
+    const l = await buildLineage(dir, id);
+    const out = renderLineage(l, { now: ms("13:02:00") });
+    expect(out).toContain("e5555555  09-16 10:00:00 → 11:00:00   1.0h");
+    expect(out).not.toContain("→ now");
+  });
+});

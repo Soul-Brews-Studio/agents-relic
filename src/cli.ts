@@ -17,7 +17,7 @@ import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
-import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
 import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
 import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -37,7 +37,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO, unindexedHint, roomTag, channelHead } from "./query.js";
+         groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
@@ -143,11 +143,22 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
+  if (tally.repaired) console.log(`  repaired:    ${fmt(tally.repaired)} files re-keyed — same-named transcripts had overwritten each other's events (#58)`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--keep-noise to disable) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
               `, ${tally.ftsBuilt} fts index built in ${idxSecs}s` +
               (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
+  if (tally.ftsUpgraded)
+    console.log(`  fts:         ${tally.ftsUpgraded} shard${tally.ftsUpgraded === 1 ? "" : "s"} rebuilt from \`simple\` to ICU`);
+  if (tally.ftsSimple.length) {
+    const n = tally.ftsSimple.length;
+    console.log(`  \u26A0 fts:       ${n} shard${n === 1 ? "" : "s"} on the \`simple\` tokenizer — this LanceDB build has no ICU` +
+                (tally.ftsNoIcu ? ` ("${/unknown base tokenizer [\w-]+/i.exec(tally.ftsNoIcu)?.[0] ?? tally.ftsNoIcu.slice(0, 80)}")` : ""));
+    console.log(`               Thai substring search degraded on this shard${n === 1 ? "" : " (each of them)"}; a later run where ICU loads rebuilds it.`);
+    for (const k of tally.ftsSimple.slice(0, 5)) console.log(`               ${k}`);
+    if (n > 5) console.log(`               ... and ${n - 5} more — relic status lists them`);
+  }
   console.log(`  wrote:       ${dataRoot ?? (inRepo ? "in-repo .relic/" : defaultRoot())} in ${secs}s`);
 
   // Opt-in, never implicit. The import just resolved every discovered file to its
@@ -212,6 +223,7 @@ async function cmdBackfillChannel(f: Record<string, string | boolean>) {
                                                     verbose: Boolean(f.verbose), progress: true });
   console.log(`  re-imported: ${fmt(tally.imported)} files -> ${fmt(tally.added)} events` +
               (tally.failed ? `  ⚠ ${fmt(tally.failed)} failed (re-run with --verbose to see why)` : ""));
+  if (tally.repaired) console.log(`  repaired:    ${fmt(tally.repaired)} files re-keyed — same-named transcripts had overwritten each other's events (#58)`);
   console.log(`  events:      ${fmt(before)} -> ${fmt(await total())} across the ${fmt(dirs.length)}` +
               ` shard${dirs.length === 1 ? "" : "s"} rewritten` +
               (tally.skippedNoise ? `  ·  ${fmt(tally.skippedNoise)} held back as noise -> relic skipped` : ""));
@@ -575,7 +587,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms, generic, unfaceted } = await searchEvents(q, {
+  const { hits, shards: searched, ms, generic, degraded, unfaceted } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
@@ -617,7 +629,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const mode = outFmt(f);
 
   if (mode === "json") {
-    console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length, hits: top }, null, 2));
+    console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length,
+                                 degraded: degraded ?? [], ...(unfaceted !== undefined && { unfaceted }), hits: top }, null, 2));
     return;
   }
   if (mode === "jsonl") {
@@ -631,7 +644,12 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     return;
   }
 
-  if (!hits.length) { console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`); return; }
+  const lossy = degradedNote(degraded, searched);
+  if (!hits.length) {
+    console.log(`no matches for ${q} across ${searched} shards (${ms} ms)`);
+    if (lossy) console.log(`  ${lossy}`);
+    return;
+  }
   const narrowed = !f["all-tiers"] && !f.tier;
   /*
    * HOW OLD IS THE INDEX BEHIND THIS ANSWER.
@@ -648,6 +666,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
   console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
     (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
+  if (lossy) console.log(`  ${lossy}`);
   // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
   if (fresh && fresh.ageSec > 86_400) {
     // NOT `--corpus claude-live`: the stale shards may be any bank, and naming the
@@ -857,8 +876,8 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * that nothing carries over. So the recovery prompt must not contain an id, or it
  * goes stale the moment it is used once.
  *
- * FILESYSTEM, NOT THE INDEX. mtime is the only thing that knows which transcript was
- * written last, and the index is always at least one run behind a live session.
+ * FILESYSTEM, NOT THE INDEX — the index is always at least one run behind a live session.
+ * Ranked by last event, not mtime: a metadata-only rewrite must not resurrect an idle one (#67).
  *
  * The current session is excluded by id from the host env when it is set, and by
  * "youngest file" when it is not — a brand new session has usually already flushed a
@@ -866,7 +885,7 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * own empty transcript.
  */
 async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
-  const { encodeProjectDir, sessionIdFromEnv, liveRoots } = await import("./live.js");
+  const { encodeProjectDir, sessionIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
   const { readdirSync, statSync } = await import("node:fs");
   const { join } = await import("node:path");
   const me = sessionIdFromEnv()?.id ?? "";
@@ -883,7 +902,7 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
       }
     } catch { /* root without this project */ }
   }
-  found.sort((a, b) => b.mtime - a.mtime);
+  const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
   /*
    * NEWEST IS NOT THE SAME AS WORTH READING.
@@ -897,14 +916,14 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * filter. Parsing stops at the first real hit, so the normal case costs one parse.
    */
   const { parserFor } = await import("./sources.js");
-  for (const c of found.slice(0, 8)) {
+  for (const c of ranked.slice(0, 8)) {
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
       if (human && p.events.length > 2) return { file: c.file, id: c.id };
     } catch { /* unreadable: try the next */ }
   }
-  return found[0] ?? null;      // nothing substantial — hand back the newest and say so
+  return ranked[0] ?? null;     // nothing substantial — hand back the newest and say so
 }
 
 /*
@@ -1291,7 +1310,7 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   if (smode === "json" || smode === "jsonl") {
     const rows: { key: string; bank: string; repo: string; ev: number; se: number;
                   events: number; sessions: number;
-                  lastIndexed: string; newestSession: string }[] = [];
+                  lastIndexed: string; newestSession: string; fts: string }[] = [];
     for (const sh of shards) {
       try {
         const st = await LanceStore.open(sh.dir);
@@ -1301,7 +1320,8 @@ async function cmdStatus(f: Record<string, string | boolean>) {
                     // ev/se predate the rest of this row and something may read them.
                     // events/sessions are the names everything else uses.
                     ev: c.events, se: c.sessions, events: c.events, sessions: c.sessions,
-                    lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
+                    lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
+                    fts: (await st.ftsTokenizer()) ?? "none" });
       } catch { /* skip unreadable shard */ }
     }
     rows.sort((a, b) => b.ev - a.ev);
@@ -1335,14 +1355,15 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   console.log("");
 
   const rows: { bank: string; repo: string; events: number; sessions: number;
-                lastIndexed: string; newestSession: string }[] = [];
+                lastIndexed: string; newestSession: string; fts: string }[] = [];
   for (const s of shards) {
     try {
       const st = await LanceStore.open(s.dir);
       const c = await st.counts();
       const fr = await st.freshness();
       rows.push({ bank: s.bank, repo: s.repo, events: c.events, sessions: c.sessions,
-                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
+                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
+                  fts: (await st.ftsTokenizer()) ?? "none" });
     } catch { /* skip unreadable shard */ }
   }
   // BANK FIRST, then repo. A flat list sorted by size interleaves three snapshots of the
@@ -1366,6 +1387,18 @@ async function cmdStatus(f: Record<string, string | boolean>) {
   // over fresh material, and only one of those is a problem to act on.
   console.log(`last indexed  ${when(maxISO(rows.map(r => r.lastIndexed)))}` +
               `   ·   newest session  ${when(maxISO(rows.map(r => r.newestSession)))}`);
+  // Only shards that hold events can have an index; an empty one is not a degraded one.
+  const withEv = rows.filter(r => r.events > 0);
+  const simple = withEv.filter(r => r.fts === "simple"), noFts = withEv.filter(r => r.fts === "none");
+  console.log(`fts     ${fmt(withEv.length - simple.length - noFts.length)} ICU` +
+              (simple.length ? `  ·  ${simple.length} simple` : "") +
+              (noFts.length ? `  ·  ${noFts.length} no index (slow LIKE scan)` : ""));
+  if (simple.length) {
+    console.log(`  \u26A0 Thai substring search degraded on ${simple.length === 1 ? "this shard" : "these shards"}` +
+                ` — built with \`simple\` where LanceDB had no ICU; a run where ICU loads rebuilds them:`);
+    for (const r of simple.slice(0, limit)) console.log(`    ${r.bank}  ${r.repo.replace("github.com/", "")}`);
+    if (simple.length > limit) console.log(`    ... and ${simple.length - limit} more (--limit N)`);
+  }
   /*
    * VECTORS, MEASURED — this line used to be a hardcoded claim that vectors "land in
    * the same `events` table, no migration". Both halves were wrong: they land in a
@@ -1474,8 +1507,9 @@ async function cmdNow(f: Record<string, string | boolean>) {
     if (!live.length) { console.log(`nothing written in the last ${humanAge(windowSec)}`); return; }
     console.log(`${live.length} session${live.length === 1 ? "" : "s"} active in the last ${humanAge(windowSec)}\n`);
     for (const s of live) {
-      console.log(`${humanAge(s.ageSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
-        `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}`);
+      const wrote = Math.abs(s.ageSec - s.eventAgeSec) > 180 ? `  (write ${humanAge(s.ageSec)} ago)` : "";
+      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
+        `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}${wrote}`);
       console.log(`            ${s.cwd ?? s.projectDir}`);
     }
     return;
@@ -1499,7 +1533,7 @@ async function cmdNow(f: Record<string, string | boolean>) {
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
 
   console.log(`${cur.title ?? "(untitled)"}\n`);
-  console.log(`${cur.sessionUuid}  ·  last write ${humanAge(cur.ageSec)} ago`);
+  console.log(`${cur.sessionUuid}  ·  ${clockLabel(cur.ageSec, cur.eventAgeSec)}`);
   console.log(`${cur.cwd}`);
   // The encoding maps both "/" and "." to "-", so two checkouts CAN land in the same
   // project directory. Say so rather than presenting a guess as a fact.
