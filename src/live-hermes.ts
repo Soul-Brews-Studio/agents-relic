@@ -1,11 +1,12 @@
 import { hermesDbs } from "./discover.js";
-import { readHermes, hermesLinks, enabledHermesRoots, type HermesRow } from "./lineage-hermes.js";
+import { readHermes, hermesLinks, enabledHermesRoots, findHermesSessions, type HermesRow } from "./lineage-hermes.js";
 import { warnOnce } from "./shapes/hermes.js";
 import { resolveRepoKey, contextOf } from "./repo.js";
-import type { LiveSession } from "./live.js";
+import { hermesIdFromEnv, type CurrentSession, type LiveSession } from "./live.js";
 
 /**
- * Hermes, for the two questions live.ts answers from transcript files (#100).
+ * Hermes, for the questions live.ts answers from transcript files (#100): what is running,
+ * which session came before this one, and which session am I.
  *
  * Hermes writes no transcript. A session is rows in state.db, so the project-directory
  * sweep behind `now --all` and the encoded-cwd lookup behind a no-argument `tail` both
@@ -85,7 +86,7 @@ export function sameCheckout(a: string, b: string): boolean {
  */
 export function hermesSessionsIn(cwd: string, roots = enabledHermesRoots(), env = process.env):
   { id: string; path: string; lastMs: number }[] {
-  const me = (env.HERMES_SESSION_ID ?? "").trim();
+  const me = hermesIdFromEnv(env);
   const out: { id: string; path: string; lastMs: number }[] = [];
   for (const db of dbsUnder(roots)) {
     const rows = rowsOf(db);
@@ -96,4 +97,43 @@ export function hermesSessionsIn(cwd: string, roots = enabledHermesRoots(), env 
     }
   }
   return out.sort((a, b) => b.lastMs - a.lastMs);
+}
+
+/** One session by exact id across the enabled DBs, with the rest of its DB for context. */
+function hermesRow(id: string, roots: string[]): { db: string; rows: HermesRow[]; row: HermesRow } | null {
+  const hit = findHermesSessions(id, roots).find(h => h.id === id);
+  if (!hit) return null;
+  const rows = rowsOf(hit.db);
+  const row = rows.find(r => r.id === id);
+  return row ? { db: hit.db, rows, row } : null;
+}
+
+/**
+ * The CALLER as a Hermes session, for `now` — the row HERMES_SESSION_ID names.
+ *
+ * `confident` keeps its transcript meaning: it is about the cwd claim, not the id. A
+ * gateway session records no cwd, so it stays false and `cwd` falls back to the caller's.
+ */
+export function hermesCurrent(id: string, cwd: string, roots = enabledHermesRoots(), now = Date.now()):
+  CurrentSession | null {
+  const hit = hermesRow(id, roots);
+  if (!hit) return null;
+  const { db, row } = hit;
+  return { sessionUuid: row.id, projectDir: db, path: `${db}#${row.id}`, cwd: row.cwd ?? cwd, title: row.title,
+           ageSec: ageSec(row.endMs, now), lastEventMs: row.endMs, eventAgeSec: ageSec(row.endMs, now),
+           confident: row.cwd !== null, source: "hermes" };
+}
+
+/**
+ * The session immediately before `id` on its session_key — the line `lineage` draws (#74).
+ *
+ * This is how a gateway session finds the conversation it continues. It records no cwd,
+ * so no directory can hand it back. Null when the id is in no enabled DB, is a spawn
+ * (spawns belong to their parent's line), or opens its line.
+ */
+export function hermesPredecessor(id: string | null, roots = enabledHermesRoots()): { id: string; path: string } | null {
+  const hit = id ? hermesRow(id, roots) : null;
+  if (!hit) return null;
+  const link = hermesLinks(hit.rows).links.find(l => l.child === hit.row.id);
+  return link ? { id: link.parent, path: `${hit.db}#${link.parent}` } : null;
 }

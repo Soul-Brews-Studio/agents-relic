@@ -46,3 +46,31 @@ describe("sessionIdFromEnv", () => {
     expect(sessionIdFromEnv({ CLAUDE_CODE_SESSION_ID: "04d1d650-031a-44f6-9c22-3e400e68390f" })).not.toBeNull();
   });
 });
+
+/*
+ * #100: Hermes sets HERMES_SESSION_ID on every terminal command, and its ids are not hex.
+ * TypeScript only — relic-py has no Hermes reader to resolve one with.
+ */
+describe("sessionIdFromEnv — Hermes", () => {
+  const ID = "04d1d650-031a-44f6-9c22-3e400e68390f";
+
+  test("gateway, CLI and cron ids are read", () => {
+    for (const id of ["20260917_155210_1077e06e", "20260917_125737_67c3cb", "cron_4f2a9c1b7d3e_20260917_155210"])
+      expect(sessionIdFromEnv({ HERMES_SESSION_ID: id })).toEqual({ id, via: "HERMES_SESSION_ID" });
+  });
+
+  test("the Claude and Codex checks are not loosened to fit it", () => {
+    for (const key of ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_COMPANION_SESSION_ID"])
+      expect(sessionIdFromEnv({ [key]: "20260917_155210_1077e06e" })).toBeNull();
+  });
+
+  test("it is asked last — a Claude session started from a Hermes shell keeps its own id", () => {
+    expect(sessionIdFromEnv({ HERMES_SESSION_ID: "20260917_155210_1077e06e", CLAUDE_CODE_SESSION_ID: ID }))
+      .toEqual({ id: ID, via: "CLAUDE_CODE_SESSION_ID" });
+  });
+
+  test("junk is still junk", () => {
+    for (const v of ["", "none", "undefined", "20260917", "20260917_155210", "20260917_155210_xyz", "cron_"])
+      expect(sessionIdFromEnv({ HERMES_SESSION_ID: v })).toBeNull();
+  });
+});
