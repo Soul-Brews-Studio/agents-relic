@@ -51,6 +51,11 @@ export function helpText(): string {
   session <id|prefix> [--repo S] [--bank B] [--tree]  resolve an id to its transcripts
                                --tree shows the SHAPE: which agents shared a workflow run
   chain   <id|prefix>          the session tree on one time axis — what ran in parallel
+  lineage [id|prefix] [--all]  which session ids are ONE line of work: /clear and a
+                               relaunch start a new id, /compact keeps it. Linked from
+                               the transcripts (SessionStart hook, the /clear turn, the
+                               old file's final write), never the index. NO ID = this
+                               session. --all draws every chain in the directory.
   read    <file> [--prose]     whole transcript as readable conversation, any format
   tail    [id|prefix|file] [-n 10] [--chars N] [--role user] [--flat] [--harness]
           [--handoff]          the block to paste as the next session's FIRST prompt:
