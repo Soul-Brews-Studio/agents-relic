@@ -15,7 +15,7 @@ import { helpText } from "./help.js";
 import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
-import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
+import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -858,10 +858,11 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
 function printHandoff(title: string | undefined, tail: { role: string; ts?: string | null; text: string }[],
                       total: number, chars: number) {
   const humans = tail.filter(e => e.role === "user");
-  const st = handoffStats(humans.map(e => e.ts));
+  const stamps = usableStamps(humans.map(e => e.ts));
+  const st = handoffStats(stamps);
 
   if (title) console.log(title);
-  const counts = `${humans.length} human turns of ${fmt(total)}`;
+  const counts = `${humans.length} human turn${humans.length === 1 ? "" : "s"} of ${fmt(total)}`;
   if (st) {
     // Drop the repeated date on the end ONLY when it is the same day. A 30-hour
     // session printing "22:34 → 04:31" reads as six hours, and the span beside it
@@ -870,6 +871,12 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
     const end = a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b;
     console.log(`${counts}  ·  ${a} → ${end}  ·  ${dur(st.spanMs)} span  ·  ` +
                 `median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
+  } else if (stamps.length === 1) {
+    // One turn has no span to report, but it IS dated, and a handoff block the next
+    // session pastes as its first prompt should say when the work it describes happened.
+    // Saying "no usable timestamps" here reads as a damaged transcript; on a host that
+    // opens a session per inbound message, single-turn sessions are the normal shape.
+    console.log(`${counts}  ·  ${localDateTime(stamps[0])}`);
   } else {
     console.log(`${counts}  ·  no usable timestamps`);
   }
