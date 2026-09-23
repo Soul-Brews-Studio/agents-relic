@@ -163,6 +163,14 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
    * SAME batch as its events — so an interrupt loses at most one batch, and those
    * files are simply re-imported next run. Granularity moves from 1 file to N; the
    * invariant "a file is only marked done once its rows are committed" still holds.
+   *
+   * THE RULE FOR ANY WRITE THAT TAKES MORE THAN ONE COMMIT: after ANY prefix of its
+   * commits, the next plain run must be able to redo the rest. There are two ways to
+   * get that. Either take the done marker down before deleting (mark stale, delete,
+   * insert, mark done — what flush() does), or write the new rows before deleting the
+   * old ones. Never delete first while the marker still says done: the delete erases
+   * the only evidence that the work was needed. That is how an interrupted #58 re-key
+   * lost events. See markStale().
    */
   const FLUSH_EVERY = 250;
   // The batch carries its own store. The shard key is now (bank, repo), and re-deriving
@@ -180,9 +188,13 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     for (const b of pending.values()) {
       if (!b.events.length && !b.sessions.length && !b.files.length && !b.deletes.length) continue;
       const store = b.store;
+      // Marker down before any row goes. That costs one commit per 200 files, and it makes
+      // every commit below safe to lose: a run killed anywhere after it leaves these files
+      // looking changed, so the next plain `index` re-imports them.
+      if (b.deletes.length) await store.markStale(b.deletes);
       if (b.vectorDeletes.length) await store.deleteVectors(b.vectorDeletes);
-      // Deletes FIRST and as a unit: a re-imported file must drop its old rows before
-      // the new ones land, or the two generations coexist.
+      // Deletes before the insert, and as a unit: a re-imported file must drop its old
+      // rows before the new ones land, or the two generations coexist.
       for (const fp of b.deletes) await store.deleteEventsOf(fp);
       // One commit per TABLE per batch — not per row. Looping putSession/putFile here
       // was the original bug in this fix: it batched events and left the other two

@@ -506,6 +506,12 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+A file that is being rewritten, whether it changed on disk or the #58 re-key is
+repairing it, has its manifest row marked stale **before** its old rows are deleted. A
+run killed partway through the rewrite leaves the file looking changed, and the next
+run finishes the job. Before this, a killed re-key left the file skipped as unchanged
+and its events gone, for good.
+
 ### `--source-path` — run one source against another root
 
 ```bash

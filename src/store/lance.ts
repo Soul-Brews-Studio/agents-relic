@@ -229,6 +229,30 @@ export class LanceStore {
     await t?.delete(`file_path = ${sqlStr(filePath)}`);
   }
 
+  /**
+   * Take down the "imported" mark on these files. It must commit BEFORE any of their
+   * rows are deleted.
+   *
+   * The `files` row is the only thing that makes `index` skip a file, so it is a done
+   * marker. A rewrite that spans several commits has to take the marker down first and
+   * put it back last. The #58 re-key re-imports files that are UNCHANGED on disk, so
+   * their `files` rows still match, and the only sign a file needed re-keying was its
+   * old rows. The delete destroys those rows. A run killed between the per-file delete
+   * commits and the insert commit therefore left the files skipped as unchanged on
+   * every later run, with their events gone.
+   *
+   * No file on disk has an mtime of -1, so after this commit the next plain `index`
+   * re-imports these files, whatever else did or did not commit. `relic pending`
+   * reads the same manifest, so it lists them as changed until then, which is true.
+   */
+  async markStale(paths: string[]): Promise<void> {
+    const t = await this.existing("files");
+    if (!t) return;
+    for (let i = 0; i < paths.length; i += 200)
+      await t.update({ where: `file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`,
+                       values: { mtime: -1 } });
+  }
+
   /** (uid, seq, file_path) of every event these files own — chunked like pruneFiles. */
   async eventKeysOf(paths: string[]): Promise<{ uid: string; seq: number; file_path: string }[]> {
     const t = await this.existing("events");
