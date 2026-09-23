@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint,
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
@@ -467,10 +467,11 @@ async function run(name: string, a: any): Promise<string> {
   }
 
   if (name === "relic_chain") {
-    const { chain, imported } = await chainOf(String(a.id), scope);
+    const { chain, imported, unindexed } = await chainOf(String(a.id), scope);
     if (!chain) return `no session matches ${a.id}`;
     const head = imported ? `(${imported} transcripts imported on demand)\n\n` : "";
-    return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) });
+    const foot = unindexed ? `\n\n${unindexedHint(unindexed)}` : "";
+    return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) }) + foot;
   }
 
   if (name === "relic_trace") {

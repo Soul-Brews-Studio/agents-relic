@@ -33,7 +33,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO } from "./query.js";
+         groupByBank, maxISO, unindexedHint } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
@@ -1721,14 +1721,17 @@ else if (cmd === "trace") {
 else if (cmd === "lineage") await cmdLineage(pos[1], f);
 else if (cmd === "chain") {
   if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
-  const { chain, imported } = await chainOf(pos[1], {
+  const { chain, imported, unindexed } = await chainOf(pos[1], {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
     noIndex: Boolean(f["no-index"]), skipNoise: wantSkipNoise(f),
   });
   if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
   if (!chain) console.log(`no session matches ${pos[1]}`);
-  else if (outFmt(f) === "json") console.log(JSON.stringify(chain, null, 2));
-  else console.log(renderChain(chain, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
+  else if (outFmt(f) === "json") console.log(JSON.stringify({ ...chain, unindexed }, null, 2));
+  else {
+    console.log(renderChain(chain, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
+    if (unindexed) console.log(`\n${unindexedHint(unindexed)}`);
+  }
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);
