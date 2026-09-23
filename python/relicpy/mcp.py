@@ -152,6 +152,11 @@ def _facet_arg(name: str, v) -> Optional[str]:
         return None
     if isinstance(v, bool):
         raise ValueError(f"{name} needs a value, e.g. {name} discord")
+    # Python's json keeps an int exact, so unlike the TypeScript side a whole chat id sent
+    # as a number is fine. A float is not exact, and a dict or list would be searched for
+    # as its repr.
+    if not isinstance(v, (str, int)):
+        raise ValueError(f"{name} must be a string")
     out = str(v).strip()
     if not out:
         raise ValueError(f"{name} needs a non-empty value")

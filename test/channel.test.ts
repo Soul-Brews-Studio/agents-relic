@@ -282,6 +282,9 @@ describe("facet filters match what was typed, literally", () => {
     expect(facetArg("--via", undefined)).toBeUndefined();
     expect(() => facetArg("--via", true)).toThrow("--via needs a value");   // a bare flag
     expect(() => facetArg("from_user", "   ")).toThrow("non-empty");
+    expect(() => facetArg("chat", 1512079809021214730)).toThrow("send it quoted");   // already rounded
+    expect(() => facetArg("via", { a: 1 })).toThrow("via must be a string");
+    expect(() => facetArg("via", ["discord"])).toThrow("via must be a string");
   });
 
   test("the CLI refuses a bare facet flag, and facets with --semantic", async () => {

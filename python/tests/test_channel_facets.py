@@ -173,6 +173,10 @@ def test_python_mcp_facet_args_and_full_ids():
         _facet_arg("via", True)
     with pytest.raises(ValueError, match="non-empty"):
         _facet_arg("from_user", "  ")
+    assert _facet_arg("chat", 1512079809021214730) == "1512079809021214730"   # json keeps it exact
+    for bad in (1.5e18, {"a": 1}, ["discord"]):
+        with pytest.raises(ValueError, match="must be a string"):
+            _facet_arg("via", bad)
     # The same string test/channel.test.ts pins for channelHead(c, { full: true }).
     assert _channel_head(parse_channel_envelope(FIX["parse"][0]["text"])) == (
         "nazt_ (user_id 691531480689541170) · via plugin:discord:discord · chat_id 1512079809021214730 · "

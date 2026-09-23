@@ -1105,10 +1105,18 @@ export function channelHead(c: ChannelFacets, o: { full?: boolean } = {}): strin
  * Checked at the edge because the fan-out swallows per-shard errors: a bare `--via`
  * arrives as `true` and an MCP client can send `chat: 214730` as a number, and either one
  * used to throw inside every shard and come back as "no matches across 0 shards".
+ *
+ * A number is taken only while it is exact: a whole chat id sent as a JSON number
+ * (1512079809021214730) has already been rounded by the parser, and its String() would
+ * match a room that does not exist. Anything else that is not a string — an object, an
+ * array — is refused rather than searched for as "[object Object]".
  */
 export function facetArg(name: string, v: unknown): string | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v === "boolean") throw new Error(`${name} needs a value, e.g. ${name} discord`);
+  if (typeof v === "number" && !Number.isSafeInteger(v))
+    throw new Error(`${name} must be a string: ${v} is not exact as a number — send it quoted`);
+  if (typeof v !== "string" && typeof v !== "number") throw new Error(`${name} must be a string`);
   const s = String(v).trim();
   if (!s) throw new Error(`${name} needs a non-empty value`);
   return s;
