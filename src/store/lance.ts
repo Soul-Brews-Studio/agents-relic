@@ -382,7 +382,13 @@ export class LanceStore {
   async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean; via?: string; chat?: string; fromUser?: string } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
-    const limit = opts.limit ?? 20;
+    // `--limit 0` means "all" — recap teaches that idiom in its own footer, and honours it
+    // (recap.ts: `limit > 0 ? slice : all`). A LanceDB fts/vector search compiles to a
+    // datafusion topk that asserts `k > 0`, so a bare `.limit(0)` panics the worker instead
+    // of returning everything. Resolve 0/negative to the table's row count — a safe upper
+    // bound once the filters run — so `k` is always positive and the two verbs agree. Fixes #94.
+    let limit = opts.limit ?? 20;
+    if (limit <= 0) limit = Math.max(await t.countRows(), 1);
     const filters: string[] = [];
     /*
      * CHANNEL FACETS, probed like `kind` below: a shard indexed before they existed has
@@ -728,6 +734,31 @@ export class LanceStore {
     let n = 0;
     for (const r of await q.toArray()) if (String(r.text ?? "").length >= minChars) n++;
     return n;
+  }
+
+  /**
+   * The embeddable population, as (role, text) — what `relic langs` measures.
+   *
+   * SAME eligibility as embeddableCount and unembedded: main tiers when asked, length
+   * filtered here rather than in SQL, so the language mix describes exactly the text a
+   * model would be fed. `where` narrows it further — `relic langs` passes a uid range,
+   * which is a uniform sample because a uid is a sha1.
+   */
+  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number } = {}): Promise<{ role: string; text: string }[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const minChars = opts.minChars ?? 24;
+    let q = t.query().select(["role", "text"]);
+    const filters = [opts.where ?? "", opts.mainTiers ? await this.mainTiersFilter(t) : ""].filter(Boolean);
+    if (filters.length) q = q.where(filters.join(" AND "));
+    const out: { role: string; text: string }[] = [];
+    for (const r of await q.toArray()) {
+      const text = String(r.text ?? "");
+      // Eligibility on the full length, as embed decides it; keep only the slice embed sends,
+      // so `--sample 1` over a big shard does not hold every event's full text at once.
+      if (text.length >= minChars) out.push({ role: String(r.role ?? ""), text: opts.maxChars ? text.slice(0, opts.maxChars) : text });
+    }
+    return out;
   }
 
   async counts(): Promise<{ events: number; sessions: number; files: number }> {

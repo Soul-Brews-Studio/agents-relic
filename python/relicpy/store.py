@@ -12,6 +12,7 @@ import os
 from typing import Iterable, Optional
 
 import lancedb
+from lancedb.index import FTS
 
 from .models import EventRow, FileRow, SessionRow, vector_row_model
 
@@ -39,9 +40,12 @@ def _create_fts(t, tokenizer: str, name: Optional[str]) -> None:
     # 3,000-event sample holds 354 distinct identifiers over 21 characters.
     #
     # max_token_length=128 — long identifiers and 64-char hashes survive whole.
-    t.create_fts_index("text", use_tantivy=False, base_tokenizer=tokenizer,
-                       stem=False, remove_stop_words=False, max_token_length=128,
-                       replace=True, name=name)
+    #
+    # create_index(config=FTS(...)) replaces create_fts_index(), deprecated in
+    # LanceDB 0.25.0 — native FTS only now, so there is no use_tantivy to pass.
+    t.create_index("text", config=FTS(base_tokenizer=tokenizer, stem=False,
+                                       remove_stop_words=False, max_token_length=128),
+                   replace=True, name=name)
 
 
 class LanceStore:

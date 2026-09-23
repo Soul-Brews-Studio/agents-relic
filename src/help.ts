@@ -89,10 +89,11 @@ export function helpText(): string {
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
-                               day by day: which repo, which worktree, what it was
+          [--all-tiers]        day by day: which repo, which worktree, what it was
                                called. --tree adds each session's transcript shape.
                                Transcript tiers only — a sessions row can be a ψ note,
-                               which outnumber conversations 100:1.
+                               which outnumber conversations 100:1. --all-tiers counts
+                               them too.
   memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
                                sessions that produced it — which had one, which had none
   pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N] [--paths]
@@ -106,6 +107,13 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
+  langs   [--sample 64] [--repo S] [--bank B] [--all-tiers] [--min-chars 24] [--max-chars 2000] [--json]
+                               which languages the embeddable corpus is written in, and
+                               which measured model fits it: th / th+en / en / latin /
+                               other scripts, share of events and chars, Thai by role,
+                               vectors already on disk. Same population as embed.
+                               1 in 64 events by default, picked by uid (a sha1, so the
+                               sample is uniform and repeatable); --sample 1 reads all.
   recap   [id|prefix] [--limit 20] [--all-tiers] [--chars 140] [--json]
                                NO ID = the session before this one, same as tail.
                                Shows the LAST 20 asked turns; --limit 0 for all. The

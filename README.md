@@ -1253,6 +1253,50 @@ style better than a classifier would — but not by quality. 0.140 MRR, 34% reca
 median target rank 68 of 3,000 is a different failure from FTS's, not a better one.
 `relic embed` ships as the infrastructure that makes this measurable.
 
+### `langs` — which languages, so which model
+
+The default model, `all-minilm`, is English-only: Thai paraphrase MRR **0.006** in
+bench/. Whether that matters is a fact about the corpus, so `langs` measures it on the
+population `embed` would feed a model: the same tiers, the same `--min-chars`, the same
+first `--max-chars` of each event.
+
+```bash
+relic langs                       # whole index, 1 event in 64
+relic langs --repo neo-oracle     # one repo
+relic langs --sample 1 --json     # every event, machine-readable
+```
+
+```
+sample   1 in 64 by uid -> 4,238 events · ~271,232 eligible · 0.2 s
+
+lang        events   share   chars   what it is
+th              46    1.1%    2.0%   Thai is at least half the letters
+th+en          191    4.5%    5.5%   Thai is 10-49% of the letters: code-switched, usually with English
+en           2,093   49.4%   54.7%   Latin script with English function words: prose
+latin        1,908   45.0%   37.8%   Latin script without them: code, paths, JSON, ids, or another Latin language
+any Thai       467   11.0%           at least one Thai character (bench/'s definition)
+
+role            events   carry Thai
+note             1,609    21.8%
+assistant          502     7.2%
+user               243     3.3%
+
+vectors  st:intfloat/multilingual-e5-small+passage: · 384d · 66,570 rows in 2 shards
+
+model    MULTILINGUAL. 11.0% of eligible events carry Thai, at or above 1.0%. ...
+         -> keep the model on disk (st:intfloat/multilingual-e5-small+passage:). ...
+```
+
+`--repo neo-oracle`, 2026-09-23, trimmed. How it decides:
+
+| | |
+|---|---|
+| script, not a detector | Thai against Latin is a Unicode-block question and needs no model. Latin text is split by English function words, so `en` is prose and `latin` is code, JSON, paths and ids. Single letters do not count: `a` is the commonest function word in prose and the commonest variable name in code. |
+| the sample | `uid < '0400'` is 1 in 64. Every shape mints uids with `uidOf`, a sha1, so a hex range is uniform and repeatable, and the filter runs inside Lance instead of reading text that would be thrown away. A test pins the premise on 64,000 real uids. |
+| the rule | at least 1% of eligible events carrying Thai, or dominated by another non-Latin script, means multilingual. |
+| the candidates | `MEASURED_MODELS` in `embed.ts`: only models measured here, with the evidence each one has. The Ollama en-th cosine and the bench/ MRR are never ranked against each other. |
+| keep beats switch | when the vectors already on disk fit, the advice is to keep that model. embed refuses a second model per shard (`--reset` drops the vectors), and semantic search embeds a query with the model its shard stores. |
+
 ### `attach` — index someone else's LanceDB
 
 ```bash

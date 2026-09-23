@@ -40,6 +40,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
@@ -625,7 +626,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
                   ` --via/--chat/--from-user cannot match anything in them.` +
                   `\n    relic index --backfill-channel   counts what re-reading their channel turns would take`);
 
-  const top = hits.slice(0, limit);
+  // `--limit 0` (and negative) means "all", the same idiom recap teaches — so show every
+  // hit the store returned rather than slicing to nothing. The store already unbounded the
+  // query for limit <= 0 (#94); this keeps the CLI's own slice/count in agreement.
+  const top = limit > 0 ? hits.slice(0, limit) : hits;
   const mode = outFmt(f);
 
   if (mode === "json") {
@@ -662,9 +666,9 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   const byKey = new Map(pickShards(scope).map(sh => [sh.key, sh.dir]));
   const fresh = await answerFreshness(
-    [...new Set(hits.slice(0, limit).map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
+    [...new Set(top.map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
   const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+  console.log(`${top.length} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
     (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
   if (lossy) console.log(`  ${lossy}`);
   // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
@@ -677,7 +681,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.log(`     relic index${scoped ? ` ${scoped}` : ""}   ·   relic status  names which bank is behind`);
   }
   console.log("");
-  for (const h of hits.slice(0, limit)) {
+  for (const h of top) {
     // A channel hit says who, where and when, then the words — not 180 chars of routing.
     const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
     const text = c ? c.body : h.text;
@@ -1190,7 +1194,10 @@ async function cmdReport(f: Record<string, string | boolean>) {
   const { rows, shards } = await listSessions({
     ...scope, since, until: f.until as string, worktree: f.worktree as string,
     group: false, limit: 1_000_000,
-    tiers: f["all-tiers"] ? undefined : undefined,
+    // [] means "no tier predicate at all" in store.sessions(); undefined falls back to
+    // TRANSCRIPT_TIERS. Both arms read `undefined` before, so --all-tiers was accepted
+    // and silently did nothing here while it worked everywhere else.
+    tiers: f["all-tiers"] ? [] : undefined,
   });
   void shards;
 
@@ -1217,6 +1224,46 @@ async function cmdReport(f: Record<string, string | boolean>) {
 }
 
 // ---- status ----------------------------------------------------------------
+/**
+ * `relic langs` — the language mix of the embeddable corpus, and which measured model
+ * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
+ */
+async function cmdLangs(f: Record<string, string | boolean>) {
+  const sample = f.sample === undefined ? 64 : typeof f.sample === "string" ? Number(f.sample) : NaN;
+  if (!Number.isInteger(sample) || sample < 1) {
+    console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
+    process.exit(1);
+  }
+  // Every flag that narrowed the measurement rides into the printed embed command, so
+  // "continue with" acts on the scope that was measured — never silently on the whole index.
+  const scopeArgs: string[] = [];
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+    if (typeof f[k] === "string") scopeArgs.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) scopeArgs.push(`--${k}`);
+  const bar = progress();
+  const r = await scanLangs({
+    scopeArgs,
+    dataRoot: (f["data-root"] as string) ?? null,
+    inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined,
+    bank: f.bank ? String(f.bank) : undefined,
+    sample,
+    // Same flags, same meaning as embed: the population measured is the one embedded.
+    mainTiers: !f["all-tiers"],
+    minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
+    maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
+    onProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty") bar.tick(`  ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total);
+    },
+  });
+  bar.clear();
+  const rec = recommend(r);
+  if (outFmt(f) === "json") { console.log(JSON.stringify({ ...r, recommendation: rec }, null, 2)); return; }
+  if (outFmt(f) === "jsonl") { console.log(JSON.stringify({ ...r, recommendation: rec })); return; }
+  if (!r.shards) { console.log("no shards match — check --repo / --bank, or run relic index first"); return; }
+  console.log(renderLangs(r, rec));
+}
+
 /*
  * EMBED — a second pass over an index that is already complete.
  *
@@ -1969,5 +2016,6 @@ else if (cmd === "serve") {
 }
 else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
+else if (cmd === "langs") await cmdLangs(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
