@@ -286,8 +286,15 @@ none, so they read `state.db` instead, through a parallel lookup rather than
   transcripts, so the newest session wins whichever agent wrote it. When relic runs
   inside a Hermes session, that session is skipped: Hermes sets `HERMES_SESSION_ID` on
   every command it runs.
-- A gateway session (Discord, say) records no cwd. It appears in `now --all` but can
-  never be the session before this one for a directory.
+- A gateway session (Discord, say) records no cwd, so no directory can claim it. When
+  the directory has nothing worth reading and `HERMES_SESSION_ID` is set, `tail`/`recap`
+  follow the caller's own line instead: the session immediately before it on the same
+  `session_key`, the same line `lineage` draws. This is a fallback, never a first
+  choice. A Claude session started from a Hermes shell inherits the variable, and the
+  environment cannot say which agent is innermost.
+- `now` names a Hermes caller by the same variable, and `lineage` with no id draws its
+  line. Hermes ids are not hex, so they get their own shape check. The Claude and Codex
+  checks are unchanged, and those two still win when both are set.
 
 Only an enabled `hermes` source is read. When a lookup comes up empty and `~/.hermes`
 holds data with the source switched off, the miss message says so.
@@ -505,6 +512,12 @@ Incremental by `(path, mtime, size)` — unchanged files are never re-read. The 
 is written **per file**, so an interrupted run resumes rather than restarting. The one
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
+
+A file that is being rewritten, whether it changed on disk or the #58 re-key is
+repairing it, has its manifest row marked stale **before** its old rows are deleted. A
+run killed partway through the rewrite leaves the file looking changed, and the next
+run finishes the job. Before this, a killed re-key left the file skipped as unchanged
+and its events gone, for good.
 
 ### `--source-path` — run one source against another root
 
@@ -1150,9 +1163,11 @@ directory it could not list or reach, `walk-error` for a single file it could no
 Every walker used to answer those with an empty list, so an unreadable directory looked
 exactly like an empty one and `relic pending` reported `0 missing` about files it had
 never seen. Now each is one stderr line per path (ENOENT stays quiet — optional
-`subagents/` directories are the normal case), `index` logs them here, `pending` says
-its counts cover only what the walk could read, and `prune` refuses to run over a scan
-that could not see everything.
+`subagents/` directories are the normal case — and so does ENAMETOOLONG, a directory
+name derived from a deep cwd that is too long to exist), `index` logs them here,
+`pending` says its counts cover only what the walk could read, and `prune` refuses to
+run over a scan that could not see everything. The lookups report the same way:
+`lineage`, `tail`/`recap` with no id, `dig`, the shard listing and the repo index.
 
 ### `embed` — the opt-in second pass
 
@@ -1163,8 +1178,29 @@ already complete, and it is resumable, scoped, and free to skip.
 relic embed --dry-run                      # what would this cost? no provider call
 relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
 relic embed --model bge-m3 --reset         # change model: drops `vectors` first
+relic embed --repair --bank hermes         # a shard whose `vectors` no longer reads (#105)
 relic-py embed --provider st --model intfloat/multilingual-e5-small
 ```
+
+**An interrupted embed.** Re-running resumes it, because the anti-join is against what
+is on disk. A kill mid-write costs at most the batch in flight: Lance writes data files
+first and the manifest last. One state does not resume. That is a table whose current
+version references data files that are 0 bytes, which is what #105 hit. `countRows`
+still answers, but every scan fails. `embed` now says so and prints the one command
+that repairs that shard:
+
+```
+  hermes/_unresolved  SKIP  vectors table unreadable at v3 — LanceError(IO): Generic LocalFileSystem error: failed to fill whole buffer
+                            `events` and the full-text index are untouched. To repair this shard's vectors only:
+                              relic embed --repair --bank hermes --repo _unresolved
+                            that restores v1 (64 of 192 vectors) and re-embeds the rest
+```
+
+`--repair` bisects the table's versions for the newest one that reads and restores it,
+as a new version on top, so the history is kept. The same run then re-embeds what that
+version lacks. If no version reads, it drops that one shard's `vectors`, as `--reset`
+would. It never touches `events`, `sessions`, `files` or the full-text index, and it
+never touches a table that reads. A dry run never repairs.
 
 ```
 provider  ollama:all-minilm

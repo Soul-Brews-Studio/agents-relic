@@ -67,8 +67,8 @@ def cmd_embed(a: argparse.Namespace) -> int:
     so embedding is opt-in, resumable, and scoped — and --dry-run answers "how much
     would this cost" without a single call to the provider.
     """
-    from .embed import embed_shards      # imported here so `relic-py --help` never
-                                         # touches an optional model runtime
+    from .embed import damage_note, embed_shards   # imported here so `relic-py --help`
+                                                   # never touches an optional model runtime
 
     main_tiers = not a.all_tiers
     last = [0]
@@ -85,7 +85,7 @@ def cmd_embed(a: argparse.Namespace) -> int:
                          device=a.device, batch=a.batch, limit=a.limit,
                          main_tiers=main_tiers, min_chars=a.min_chars,
                          max_chars=a.max_chars, dry_run=a.dry_run, reset=a.reset,
-                         on_progress=progress)
+                         repair=a.repair, on_progress=progress)
     except (ValueError, RuntimeError) as e:
         # A bad --provider or a missing optional dependency is a usage error, not a
         # traceback: the message already says what to run instead.
@@ -117,10 +117,29 @@ def cmd_embed(a: argparse.Namespace) -> int:
     print(f"provider  {t.provider_id}" + ("   (dry run — nothing written)" if t.dry_run else ""))
     print(f"scope     {'main tiers' if main_tiers else 'all tiers'}, "
           f"text >= {a.min_chars} chars, truncated at {a.max_chars}\n")
+    # The run's own flags, minus scope and the two that would defeat a repair — the
+    # repair command a damaged shard prints is this run, narrowed to that shard.
+    carry: list[str] = []
+    if getattr(a, "data_root", None):
+        carry += ["--data-root", a.data_root]
+    for flag, val, default in (("--provider", a.provider, "ollama"), ("--model", a.model, "all-minilm"),
+                               ("--host", a.host, None), ("--device", a.device, None),
+                               ("--batch", a.batch, 64), ("--limit", a.limit, None),
+                               ("--min-chars", a.min_chars, 24), ("--max-chars", a.max_chars, 2000)):
+        if val is not None and val != default:
+            carry += [flag, str(val)]
+    carry += [f for f, on in (("--in-repo", getattr(a, "in_repo", False)), ("--all-tiers", a.all_tiers)) if on]
+
     w = max([6] + [len(x.key) for x in touched])
-    for x in touched[: a.limit or 40]:
+    # A damaged shard is listed even past the display cap: its line carries the only
+    # command that repairs it.
+    cap = a.limit or 40
+    for x in touched[:cap] + [x for x in touched[cap:] if x.damage]:
+        note = [f"  {'':<{w}}        {line}" for line in damage_note(x, carry)]
         if x.skipped:
             print(f"  {x.key:<{w}}  SKIP  {x.skipped}")
+            for n in note:
+                print(n)
             continue
         cov = round((x.already + x.embedded) / x.eligible * 100) if x.eligible else 0
         line = (f"  {x.key:<{w}}  {cov:>3}%  "
@@ -134,6 +153,8 @@ def cmd_embed(a: argparse.Namespace) -> int:
         if x.dim:
             line += f"  dim {x.dim}"
         print(line)
+        for n in note:
+            print(n)
     secs = t.ms / 1000
     rate = f"  ({t.embedded / secs:.0f}/s)" if t.embedded and secs > 0 else ""
     print(f"\n{t.embedded:,} embedded · {t.pending:,} pending · {t.failed:,} failed"
@@ -1119,6 +1140,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="count what would be embedded; no call to the provider")
     em.add_argument("--reset", action="store_true",
                     help="drop `vectors` first — the only way to change model or dim")
+    em.add_argument("--repair", action="store_true",
+                    help="put a shard whose `vectors` no longer reads back to its newest "
+                         "version that does (drop it if none does), then carry on (#105)")
     em.set_defaults(func=cmd_embed)
 
     pr = sub.add_parser("prune", parents=[common],
