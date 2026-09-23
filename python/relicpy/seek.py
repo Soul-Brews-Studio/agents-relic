@@ -13,6 +13,7 @@ from typing import Optional
 
 from .discover import Found, _dirs, _files, _stat
 from .sources import bank_of, load_sources
+from .unreadable import reachable
 
 _cwd_cache: dict[str, Optional[str]] = {}
 
@@ -58,9 +59,9 @@ def seek_on_disk(session_id: str) -> list[Found]:
     """
     out: list[Found] = []
     for src in load_sources():
-        if not os.path.exists(src.path):
-            continue
         if src.walk not in ("claude-tiers", "flat", "omp"):
+            continue
+        if not reachable(src.path):
             continue
         # The same bank the bulk walker would have stamped. Without it an on-demand
         # import writes into the fallback bank instead of the source's own.

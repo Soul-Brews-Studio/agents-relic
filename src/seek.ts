@@ -1,6 +1,7 @@
-import { readdirSync, statSync, existsSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { bankOf, loadSources, transcriptRoots } from "./sources.js";
+import { dirUnreadable, walkError, reachable } from "./unreadable.js";
 import type { Found, Tier } from "./discover.js";
 
 /**
@@ -19,17 +20,19 @@ import type { Found, Tier } from "./discover.js";
 const SUB = "subagents";
 const WF = "workflows";
 
+// An unreadable directory here makes a real session look like it does not exist, so
+// anything but ENOENT is reported (#99) — see unreadable.ts.
 function dirs(p: string): string[] {
   try { return readdirSync(p, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(p, e); return []; }
 }
 function files(p: string): string[] {
   try { return readdirSync(p, { withFileTypes: true }).filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(p, e); return []; }
 }
 function statOf(p: string) {
   try { const s = statSync(p); return { mtime: Math.floor(s.mtimeMs / 1000), size: s.size }; }
-  catch { return null; }
+  catch (e) { walkError(p, e); return null; }
 }
 
 /** Every transcript whose filename starts with `id`, across all configured sources. */
@@ -38,11 +41,11 @@ export function seekOnDisk(id: string): Found[] {
   const want = (name: string) => name.startsWith(id);
 
   for (const src of loadSources()) {
-    if (!existsSync(src.path)) continue;
     // TRANSCRIPT layouts only. `claude-memory` points at the SAME directory as
     // `claude-live`, so without this gate every session id matches a second time, is
     // parsed by parseMemory, and lands as a bogus one-event row in the memory bank.
     if (src.walk !== "claude-tiers" && src.walk !== "claude-home" && src.walk !== "flat" && src.walk !== "omp") continue;
+    if (!reachable(src.path)) continue;
     // Same bank the bulk walker would have stamped. Without it an on-demand
     // `relic session <id>` import writes into the fallback bank instead of the
     // source's own — a misfile that no error would report.
@@ -81,7 +84,7 @@ export function seekOnDisk(id: string): Found[] {
       for (const sessionDir of dirs(pp)) {
         if (!want(sessionDir)) continue;
         const sub = join(pp, sessionDir, SUB);
-        if (!existsSync(sub)) continue;
+        if (!reachable(sub)) continue;
 
         for (const f of files(sub)) {
           const st = statOf(join(sub, f));

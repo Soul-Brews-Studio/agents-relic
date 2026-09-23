@@ -87,6 +87,7 @@ class ImportTally:
     fts_ms: int = 0
     fts_simple: list[str] = field(default_factory=list)  # "bank/repo" left on the `simple` tokenizer
     fts_upgraded: int = 0
+    fts_drifted: int = 0  # rebuilt: built with other stop-word settings (#97)
     shards: Optional[Shards] = None
     # Every file DISCOVERED this run, grouped by (bank, repo) — including the ones
     # skipped as unchanged, which are the majority on a repeat run and are exactly the
@@ -278,6 +279,8 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             t.fts_built += 1
             if r and r.get("upgraded"):
                 t.fts_upgraded += 1
+            if r and r.get("drifted"):
+                t.fts_drifted += 1
             if r and r["tokenizer"] == "simple":
                 t.fts_simple.append(st.dir)
         except Exception as err:

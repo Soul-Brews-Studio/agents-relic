@@ -576,6 +576,7 @@ def pending_report(scope: Scope, corpus: Optional[list[str]] = None,
     structurally cannot see a file older than the span.
     """
     from .discover import discover, parse_since
+    from .unreadable import walk_failures
     t0 = time.time()
 
     seen: dict[str, dict] = {}
@@ -590,6 +591,7 @@ def pending_report(scope: Scope, corpus: Optional[list[str]] = None,
     # without the same filter here every source's files count as missing against a
     # manifest that was never asked for them.
     found = [f for f in discover(corpus, since_ms) if not scope.bank or f.bank == scope.bank]
+    unreadable = walk_failures()
 
     groups: dict[str, PendingGroup] = {}
     indexed = changed = missing = 0
@@ -643,6 +645,7 @@ def pending_report(scope: Scope, corpus: Optional[list[str]] = None,
         found=len(found), indexed=indexed, changed=changed, missing=missing,
         newest_pending_ms=newest, scan_ms=int((time.time() - t0) * 1000),
         files=files, files_omitted=max(0, len(pending) - len(files)),
+        unreadable=unreadable,
     )
 
 

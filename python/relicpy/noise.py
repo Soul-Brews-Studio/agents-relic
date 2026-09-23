@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .repo import default_root
+from .unreadable import WALK_RULES
 
 # Numbers followed by an arrow, tab or space — `cat -n`, `rg -n` and Read all emit one
 # of those three. Anchored on a boundary, NOT on a line start: a numbered dump is
@@ -80,7 +81,12 @@ def skipped_path(data_root: str | None) -> str:
 
 
 def log_skipped(rows: list[dict], data_root: str | None) -> None:
-    """One line per dropped event — enough to judge the rule by."""
+    """One line per dropped event — enough to judge the rule by.
+
+    Also takes walk failures (#99): a PATH the walk could not read, so nothing under it
+    was indexed. Those rows carry path/error/ts and a rule from WALK_RULES, which is how
+    the readers below tell the two kinds apart. See logSkippedFiles in src/noise.ts.
+    """
     if not rows:
         return
     try:
@@ -96,14 +102,7 @@ def read_skipped(data_root: str | None, limit: int = 20) -> dict:
     p = skipped_path(data_root)
     if not os.path.exists(p):
         return {"total": 0, "by_rule": [], "bytes": 0, "rows": []}
-    rows = []
-    for line in open(p, encoding="utf-8"):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue          # skip a torn line
+    rows = [r for r in _log_rows(p) if r.get("rule") not in WALK_RULES]
     by_rule: dict[str, dict] = {}
     for r in rows:
         b = by_rule.setdefault(r.get("rule", "?"), {"rule": r.get("rule", "?"), "n": 0, "bytes": 0})
@@ -115,3 +114,38 @@ def read_skipped(data_root: str | None, limit: int = 20) -> dict:
         "bytes": sum(int(r.get("bytes") or 0) for r in rows),
         "rows": rows[-limit:],
     }
+
+
+def _log_rows(p: str) -> list[dict]:
+    rows = []
+    for line in open(p, encoding="utf-8"):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue          # skip a torn line
+    return rows
+
+
+def read_skipped_files(data_root: str | None) -> dict:
+    """Paths the walk could not read, one row per PATH — its newest record, plus how many
+    runs logged it. The log is append-only, so one unreadable directory recurs once per
+    index run until someone fixes it. Same shape as readSkippedFiles in src/noise.ts."""
+    p = skipped_path(data_root)
+    by_path: dict[str, dict] = {}
+    for r in (_log_rows(p) if os.path.exists(p) else []):
+        if r.get("rule") not in WALK_RULES:
+            continue
+        row = {"rule": r["rule"], "path": str(r.get("path", "")),
+               "error": str(r.get("error", "")), "ts": str(r.get("ts", ""))}
+        prev = by_path.get(row["path"])
+        runs = (prev["runs"] if prev else 0) + 1
+        by_path[row["path"]] = {**(row if not prev or row["ts"] >= prev["ts"] else prev), "runs": runs}
+    paths = sorted(by_path.values(), key=lambda x: x["ts"], reverse=True)
+    by_rule: dict[str, int] = {}
+    for x in paths:
+        by_rule[x["rule"]] = by_rule.get(x["rule"], 0) + 1
+    return {"total": len(paths),
+            "by_rule": [{"rule": k, "n": n} for k, n in sorted(by_rule.items(), key=lambda kv: -kv[1])],
+            "paths": paths}
