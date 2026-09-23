@@ -380,13 +380,18 @@ export function loadSources(): SourceDef[] {
  */
 export function parserFor(filePath: string): Parser {
   let best: SourceDef | null = null;
+  const isMd = filePath.endsWith(".md");
   for (const s of loadSources()) {
     if (!filePath.startsWith(s.path)) continue;
+    // Memory sources exclusively parse markdown facts, never .jsonl transcripts.
+    if (s.walk === "memory" && !isMd) continue;
+    // Transcript sources do not parse .md files.
+    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && isMd) continue;
     // Longest matching root wins — sources can nest (a vault inside a repo).
     if (!best || s.path.length > best.path.length) best = s;
   }
   if (best) return best.parser;
-  return filePath.endsWith(".md") ? parseVault : parseClaude;
+  return isMd ? parseVault : parseClaude;
 }
 
 export function detect(): { key: string; bank: string; path: string; present: boolean; enabled: boolean; note: string }[] {

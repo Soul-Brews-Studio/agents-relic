@@ -242,8 +242,20 @@ export function inferLinks(nodes: LineageNode[], w = WINDOWS): Link[] {
 
 function claudeRoots(): string[] {
   const seen = new Set<string>();
-  for (const s of loadSources())
-    if (s.walk === "claude-tiers" && s.enabled && existsSync(s.path)) seen.add(s.path);
+  for (const s of loadSources()) {
+    if (!s.enabled || !existsSync(s.path)) continue;
+    if (s.walk === "claude-tiers") {
+      seen.add(s.path);
+    } else if (s.walk === "claude-home") {
+      try {
+        for (const e of readdirSync(s.path, { withFileTypes: true })) {
+          if (e.isDirectory() && (e.name === "projects" || e.name.startsWith("projects-"))) {
+            seen.add(join(s.path, e.name));
+          }
+        }
+      } catch {}
+    }
+  }
   return [...seen];
 }
 

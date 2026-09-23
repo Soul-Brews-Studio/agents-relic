@@ -420,9 +420,17 @@ function tsFresh(roots: string[], windowSec: number): FreshMap {
 export function liveRoots(): string[] {
   const seen = new Set<string>();
   for (const src of loadSources()) {
-    if (src.walk !== "claude-tiers" && src.walk !== "omp") continue;
-    if (!existsSync(src.path)) continue;
-    seen.add(src.path);
+    if (src.walk === "claude-tiers" || src.walk === "omp") {
+      if (existsSync(src.path)) seen.add(src.path);
+    } else if (src.walk === "claude-home" && existsSync(src.path)) {
+      try {
+        for (const e of readdirSync(src.path, { withFileTypes: true })) {
+          if (e.isDirectory() && (e.name === "projects" || e.name.startsWith("projects-"))) {
+            seen.add(join(src.path, e.name));
+          }
+        }
+      } catch {}
+    }
   }
   return [...seen];
 }

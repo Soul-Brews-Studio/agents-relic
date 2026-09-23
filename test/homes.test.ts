@@ -88,4 +88,16 @@ describe("envHomes reports, and never acts", () => {
     if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prev;
   });
+
+  test("parserFor picks parseClaude for .jsonl transcripts even when a nested memory source exists", () => {
+    const { parserFor, loadSources } = require("../src/sources.js");
+    const { parseClaude } = require("../src/shapes/claude.js");
+    const { parseMemory } = require("../src/shapes/memory.js");
+    const sources = loadSources();
+    const memSource = sources.find((s: any) => s.walk === "memory");
+    if (memSource) {
+      expect(parserFor(`${memSource.path}/-proj/s.jsonl`)).toBe(parseClaude);
+      expect(parserFor(`${memSource.path}/-proj/memory/fact.md`)).toBe(parseMemory);
+    }
+  });
 });
