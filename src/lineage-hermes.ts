@@ -103,6 +103,17 @@ export function disabledHermesRoots(): string[] {
   return hermesSources(false);
 }
 
+/** Hermes roots on disk whose source is on — the only ones read. */
+export function enabledHermesRoots(): string[] {
+  return hermesSources(true);
+}
+
+/** The miss message's last word: data on disk that relic was told not to read. One line per root. */
+export function hermesOffNotes(): string[] {
+  return disabledHermesRoots().map(r =>
+    `(${r} holds Hermes data, but its source is disabled — enable "hermes" in ~/.relic/sources.json)`);
+}
+
 /** Every session whose id starts with `prefix`, across enabled Hermes sources. */
 export function findHermesSessions(prefix: string, roots = hermesSources(true)): { id: string; db: string }[] {
   const hits: { id: string; db: string }[] = [];

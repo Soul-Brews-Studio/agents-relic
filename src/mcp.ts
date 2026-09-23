@@ -10,6 +10,7 @@ import {
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
+import { hermesOffNotes } from "./lineage-hermes.js";
 import { trace } from "./trace.js";
 
 /**
@@ -191,7 +192,8 @@ const TOOLS = [
       type: "object",
       properties: {
         all: { type: "boolean" as const, description:
-          "List every recently-active session on the machine instead of just this one." },
+          "List every recently-active session on the machine instead of just this one. " +
+          "Includes Hermes sessions, read from state.db, when the hermes source is enabled." },
         cwd: str("Directory to resolve the session for (default: the server's cwd). " +
                  "Walks up to the nearest directory an agent was started in."),
         window: num("Seconds a write must be within to count as live (default 300)."),
@@ -273,7 +275,7 @@ async function run(name: string, a: any): Promise<string> {
 
     if (a?.all) {
       const live = await liveSessions(windowSec, Number(a?.limit ?? 20));
-      if (!live.length) return `nothing written in the last ${humanAge(windowSec)}`;
+      if (!live.length) return [`nothing written in the last ${humanAge(windowSec)}`, ...hermesOffNotes()].join("\n");
       const L = [`${live.length} session(s) active in the last ${humanAge(windowSec)}`, ""];
       for (const x of live) {
         L.push(`${humanAge(x.eventAgeSec).padStart(5)} ago  ${x.sessionUuid}  ` +

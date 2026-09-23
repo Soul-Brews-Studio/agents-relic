@@ -69,7 +69,8 @@ export function helpText(): string {
                                parallel work. Add --role user for your turns alone.
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
-                               an id. Found by mtime, never the index.
+                               an id. Found by mtime, never the index. Hermes
+                               sessions that ran in this checkout count too.
                                the LAST N EXCHANGES — what was I just doing. An
                                exchange is the human's turn plus the last thing
                                the agent said before they spoke again. Takes a
@@ -78,6 +79,7 @@ export function helpText(): string {
                                55 of 63 user-channel turns were the tooling itself.
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now|live [--all] [--window 300]  what is running RIGHT NOW — this session, its agents
+                               --all is machine-wide, Hermes sessions (state.db) included
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
