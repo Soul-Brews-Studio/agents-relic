@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .discover import Found
+from .progress import Progress
 from .models import DEFAULT_BANK, EventRow, FileRow, SessionRow
 from .repo import context_of, location_of, repo_key_of, shard_dir_for, resolve_repo_key
 from .store import LanceStore
@@ -162,6 +163,8 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
                 b.store.put_files(b.files)
             b.events, b.sessions, b.files, b.deletes = [], [], [], []
 
+    bar = Progress()
+
     def _tick() -> None:
         """One progress line, naming what the numbers MEAN.
 
@@ -173,9 +176,9 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
         rate = t.done / secs
         eta = round((len(found) - t.done) / rate) if rate > 0 else 0
         pct = round(t.done / max(1, len(found)) * 100)
-        print(f"\r  {pct:3d}%  {t.done:,}/{len(found):,} scanned  {t.imported:,} imported  "
-              f"{t.skipped:,} unchanged  {t.added:,} events  {shards.size} shards  "
-              f"{rate:.0f}/s  eta {eta}s   ", end="", file=sys.stderr)
+        bar.tick(f"  {pct:3d}%  {t.done:,}/{len(found):,} scanned  {t.imported:,} imported  "
+                 f"{t.skipped:,} unchanged  {t.added:,} events  {shards.size} shards  "
+                 f"{rate:.0f}/s  eta {eta}s   ", pct)
 
     since_flush = 0
     for f in found:
@@ -272,8 +275,8 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             t.failed += 1
             if verbose:
                 print(f"  FAIL {f.path}: {str(err)[:160]}", file=sys.stderr)
-    if progress and t.done >= 100:
-        print("\r" + " " * 90 + "\r", end="", file=sys.stderr)
+    if progress:
+        bar.clear()
 
     # A scan writes nothing, so there is nothing to flush and no index to rebuild.
     if no_write:
@@ -286,10 +289,11 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
     # and unranked — so the index looks complete and silently ranks wrong.
     tf0 = time.time()
     stores = shards.stores()
+    fts_bar = Progress()
     for i, st in enumerate(stores):
         if progress:
-            print(f"\r  building full-text index  {i+1}/{len(stores)} shards   ",
-                  end="", file=sys.stderr)
+            fts_bar.tick(f"  building full-text index  {i+1}/{len(stores)} shards   ",
+                         (i + 1) / len(stores) * 100, i == len(stores) - 1)
         try:
             st.ensure_fts_index()
             t.fts_built += 1
@@ -297,7 +301,7 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
             t.fts_failed += 1
             if verbose:
                 print(f"\n  FTS FAIL: {str(err)[:160]}", file=sys.stderr)
-    if progress and stores:
-        print("\r" + " " * 60 + "\r", end="", file=sys.stderr)
+    if progress:
+        fts_bar.clear()
     t.fts_ms = int((time.time() - tf0) * 1000)
     return t

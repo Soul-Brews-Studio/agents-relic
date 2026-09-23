@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, roomTag, channelHead,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, roomTag, channelHead,
 } from "./query.js";
 import { parseChannelEnvelope, saidText } from "./types.js";
 import { renderChain } from "./chain.js";
@@ -106,8 +106,8 @@ const TOOLS = [
     description:
       "List or count indexed sessions, newest first, each with its NAME (the title the " +
       "host assigned, falling back to the opening user message). " +
-      "Answers 'what was I working on' over a time range. Filters on the session's own " +
-      "first timestamp, not file mtime — an old session that got one new line stays old.",
+      "Answers 'what was I working on' over a time range. A session matches any window it " +
+      "was active in, on its own event timestamps — not file mtime.",
     inputSchema: {
       type: "object",
       properties: {
@@ -484,10 +484,11 @@ async function run(name: string, a: any): Promise<string> {
   }
 
   if (name === "relic_chain") {
-    const { chain, imported } = await chainOf(String(a.id), scope);
+    const { chain, imported, unindexed } = await chainOf(String(a.id), scope);
     if (!chain) return `no session matches ${a.id}`;
     const head = imported ? `(${imported} transcripts imported on demand)\n\n` : "";
-    return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) });
+    const foot = unindexed ? `\n\n${unindexedHint(unindexed)}` : "";
+    return head + renderChain(chain, { width: Number(a?.width ?? 40), maxRows: Number(a?.limit ?? 8) }) + foot;
   }
 
   if (name === "relic_trace") {

@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { dur, handoffStats } from "../src/time.js";
+import { dur, handoffStats, usableStamps } from "../src/time.js";
 import { handoffBudget, isHarnessTurn, isInboundTurn } from "../src/recap.js";
 import { stripEnvelope } from "../src/types.js";
 
@@ -56,6 +56,36 @@ describe("handoffStats", () => {
     const base = Date.parse("2026-09-22T04:00:00Z");
     const st = handoffStats([base, base + 5 * 60_000])!;
     expect(st.spanMs).toBe(5 * 60_000);
+  });
+});
+
+/*
+ * `handoffStats` returning null carried two meanings at the print site: "nothing here
+ * parses" and "one stamp, nothing to space it against". The header said the first when
+ * it meant the second, so a session of one human turn — the NORMAL shape on a host that
+ * opens a session per inbound message — read as a damaged transcript. These pin the
+ * split: the arithmetic still refuses to invent a span, the stamps stay countable.
+ */
+describe("usableStamps", () => {
+  test("one usable stamp is still one stamp, even though there is no span", () => {
+    const one = usableStamps([null, "2026-09-21T13:58:00Z", "not a date", undefined]);
+    expect(one).toHaveLength(1);
+    expect(handoffStats(one)).toBeNull();          // the span refuses, as designed
+  });
+
+  test("none usable stays none — the two cases must not collapse into each other", () => {
+    expect(usableStamps([])).toHaveLength(0);
+    expect(usableStamps([null, undefined, "", "not a date"])).toHaveLength(0);
+  });
+
+  test("sorted ascending, so a caller can date a block from the first element", () => {
+    const ms = usableStamps(["2026-09-22T04:30:00Z", "2026-09-22T04:00:00Z"]);
+    expect(ms[0]).toBe(Date.parse("2026-09-22T04:00:00Z"));
+  });
+
+  test("feeds handoffStats unchanged — one parse, same answer", () => {
+    const raw = ["2026-09-22T00:00:00Z", null, "2026-09-22T02:00:00Z"];
+    expect(handoffStats(usableStamps(raw))).toEqual(handoffStats(raw));
   });
 });
 
