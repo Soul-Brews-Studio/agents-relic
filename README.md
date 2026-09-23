@@ -622,6 +622,7 @@ relic search "ความจริง"                     # Thai — real word
 | `--path facebook` | any substring of the working directory |
 | `--prose` | humans + assistant only — see Roles below |
 | `--role user\|assistant\|tool_use\|tool_result\|thinking` | exact role |
+| `--via discord` · `--chat 214730` · `--from-user nazt_` | channel turns only: the plugin a turn came in by, the room or thread, who sent it. Substrings, case-blind — see Channel facets below |
 | `--source claude-live\|codex` | which agent wrote it |
 | `--tier session\|subagent\|workflow_agent` | which transcript tier |
 | `--since 7d` · `--until 2026-09-17` | date range; accepts `7d` `12h` `30m` or a date |
@@ -632,6 +633,36 @@ Filters stack:
 ```bash
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
+
+### Channel facets — who asked, from which room, on whose clock
+
+A turn that arrives through a channel plugin (Discord, Telegram, MQTT, an inbox) opens
+with an envelope, and the envelope is the only place those facts exist. `role: user`
+says only that *a* human spoke; a shared channel is several. Import parses the envelope
+into columns beside the text, which keeps the envelope byte for byte:
+
+| envelope | column | |
+|---|---|---|
+| `source` | `via` | verbatim — `plugin:discord:discord`, `arra-oracle-discord`, `mqtt` … |
+| `chat_id` | `chat_id` | the channel or thread |
+| `message_id` | `msg_id` | the message upstream |
+| `user` · `user_id` | `from_user` · `from_user_id` | who typed it |
+| `ts` | `sent_ts` | the sender's clock — `ts` is when the transcript was written |
+
+`via` sits beside `source` (the transcript format), not inside `kind` (what a row is):
+a turn typed into Discord is still a transcript turn. Only a turn that **opens** with an
+envelope that names its `source` counts — quoted envelopes in summaries and tool output
+are never parsed. A session row lists its rooms and senders, most frequent first.
+
+```
+nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07      a search hit
+  emraccoon (discord): ขอคำจำกัดความสั้นๆ ของเบียร์ตัวนี้ …     tail --handoff
+neo-genesis-packaged  [discord #…345195 +5 · nazt_, emraccoon]   sessions
+```
+
+Shards indexed before the columns existed cannot match a facet filter, and `search`
+says how many. `relic index --backfill-channel` counts the transcripts that need a
+re-read — dry by default, `--apply` re-imports exactly those, `--bank`/`--repo` narrow it.
 
 ### Staleness, because a stale hit looks exactly like a fresh one
 
