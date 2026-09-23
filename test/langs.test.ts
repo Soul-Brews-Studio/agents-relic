@@ -112,19 +112,44 @@ describe("recommend", () => {
 
   test("English-only vectors on a Thai corpus are flagged, and switching says --reset", () => {
     const r = corpus(10, 90);
-    r.vectors = [{ model: "ollama:all-minilm", dim: 384, rows: 5, shards: 1 }];
+    r.vectors = [{ model: "ollama:all-minilm", dim: 384, rows: 5, shards: 1, keys: ["projects/a"] }];
     const rec = recommend(r);
-    expect(rec.current).toEqual([{ model: "ollama:all-minilm", dim: 384, ok: false }]);
+    expect(rec.current).toEqual([{ model: "ollama:all-minilm", dim: 384, ok: false, shards: 1, keys: ["projects/a"] }]);
     expect(rec.keep).toBe(false);
     expect(rec.command).toBe("relic embed --model bge-m3 --reset");
   });
 
   test("multilingual vectors already on disk are kept, not replaced", () => {
     const r = corpus(10, 90);
-    r.vectors = [{ model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 5, shards: 2 }];
+    r.vectors = [{ model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 5, shards: 2, keys: ["projects/a", "projects/b"] }];
     const rec = recommend(r);
     expect(rec.keep).toBe(true);
     expect(rec.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
+  });
+
+  /*
+   * Measured on the live index, 2026-09-23: e5-small in 309 shards and bge-m3 in 3. Both
+   * fit a Thai corpus, so "keep" is right, but the advice must not pretend there is one.
+   */
+  test("two models on disk: keep the one most shards hold, and name where the other sits", () => {
+    const r = corpus(10, 90);
+    r.events = 100; r.estimated = 100;
+    r.vectors = [
+      { model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 900, shards: 309, keys: ["projects/a"] },
+      { model: "ollama:bge-m3", dim: 1024, rows: 80, shards: 3, keys: ["projects/x", "projects/y", "projects/z"] },
+    ];
+    const rec = recommend(r);
+    expect(rec.keep).toBe(true);
+    expect(rec.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
+    const text = renderLangs(r, rec);
+    expect(text).toContain("309 shards");
+    expect(text).toContain("ollama:bge-m3 is on 3 other shards (projects/x, projects/y, projects/z)");
+  });
+
+  test("a trace of another script stays out of the verdict", () => {
+    const r = corpus(10, 1989);
+    tallyLang(r, "user", "你好，世界。这是一个测试");       // 1 in 2,000: prints as 0.1% only from 1 in 1,000
+    expect(recommend(r).reason).not.toContain("another non-Latin script");
   });
 
   test("nothing eligible recommends nothing", () => {

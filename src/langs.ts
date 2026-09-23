@@ -126,7 +126,7 @@ export interface LangsOpts extends Scope {
   onProgress?: (done: number, total: number, key: string) => void;
 }
 
-export interface VectorsOnDisk { model: string; dim: number; rows: number; shards: number }
+export interface VectorsOnDisk { model: string; dim: number; rows: number; shards: number; keys: string[] }
 
 export interface LangsResult {
   shards: number;           // shards in scope
@@ -183,8 +183,8 @@ export async function scanLangs(o: LangsOpts = {}): Promise<LangsResult> {
       const v = await store.vectorStats();
       if (v && v.rows > 0) {
         const k = `${v.model}|${v.dim}`;
-        const agg = vec.get(k) ?? { model: v.model, dim: v.dim, rows: 0, shards: 0 };
-        agg.rows += v.rows; agg.shards++;
+        const agg = vec.get(k) ?? { model: v.model, dim: v.dim, rows: 0, shards: 0, keys: [] };
+        agg.rows += v.rows; agg.shards++; agg.keys.push(sh.key);
         vec.set(k, agg);
       }
       r.read++;
@@ -193,7 +193,7 @@ export async function scanLangs(o: LangsOpts = {}): Promise<LangsResult> {
     }
   }
   r.estimated = Math.round(r.events / r.rate);
-  r.vectors = [...vec.values()].sort((a, b) => b.rows - a.rows);
+  r.vectors = [...vec.values()].sort((a, b) => b.shards - a.shards || b.rows - a.rows);
   r.ms = Date.now() - t0;
   return r;
 }
@@ -215,7 +215,7 @@ export interface Recommendation {
   thaiShare: number;        // anyThai / events
   otherShare: number;       // events whose dominant script is neither Latin nor Thai
   reason: string;
-  current: { model: string; dim: number; ok: boolean }[];
+  current: { model: string; dim: number; ok: boolean; shards: number; keys: string[] }[];
   /**
    * The vectors already on disk fit the corpus, so the advice is to keep that model.
    * Switching is not free: embed refuses a second model in a shard (--reset drops the
@@ -262,11 +262,11 @@ export function recommend(r: LangsResult, models: MeasuredModel[] = MEASURED_MOD
 
   const current = r.vectors.map(v => {
     const m = models.find(x => v.model === idOf(x) || v.model.startsWith(idOf(x) + "+"));
-    return { model: v.model, dim: v.dim, ok: multi ? Boolean(m?.multilingual) : true };
+    return { model: v.model, dim: v.dim, ok: multi ? Boolean(m?.multilingual) : true, shards: v.shards, keys: v.keys };
   });
 
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
-  const others = otherShare ? `, ${pct(otherShare)} another non-Latin script` : "";
+  const others = otherShare >= 0.001 ? `, ${pct(otherShare)} another non-Latin script` : "";
   const reason = !r.events
     ? "nothing eligible in scope"
     : multi
@@ -345,9 +345,16 @@ export function renderLangs(r: LangsResult, rec: Recommendation): string {
   for (const c of rec.candidates)
     out.push(`         ${c.provider.padEnd(6)} ${String(c.dim).padStart(4)}d  ${`~${c.gib.toFixed(1)}`.padStart(6)} GiB  ` +
              `${c.model.padEnd(w)}  ${evidence(c)}`);
-  if (rec.keep)
-    out.push(`         -> keep the model on disk (${rec.current[0].model}). It already covers this mix, and one model across ` +
-             `shards keeps semantic search comparable. Continue with: ${rec.command}`);
+  if (rec.keep) {
+    const [kept, ...odd] = rec.current;
+    out.push(`         -> keep the model on disk (${kept.model}, ${num(kept.shards)} shards). It already covers this mix, ` +
+             `and one model across shards keeps semantic search comparable. Continue with: ${rec.command}`);
+    // Two models in one index: each shard answers with its own, so scores across them
+    // are not on one scale. Name where the odd ones sit instead of hiding them.
+    for (const o of odd)
+      out.push(`            ${o.model} is on ${num(o.shards)} other shards (${o.keys.slice(0, 3).join(", ")}` +
+               `${o.keys.length > 3 ? ", ..." : ""}): re-embed them with the kept model and --reset to make it one.`);
+  }
   else if (rec.command)
     out.push(`         -> ${rec.command}` +
              (rec.current.length ? "   (--reset drops the vectors on disk: embed refuses a second model per shard)" : ""));
