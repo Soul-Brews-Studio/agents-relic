@@ -77,6 +77,14 @@ def _normalize_repo(seg: str) -> str:
     return re.sub(r"\.(wt-.*|omx-worktrees|worktrees)$", "", seg)
 
 
+# Forge hosts whose path segment starts a <host>/<org>/<repo> triple — same list as src/repo.ts.
+REPO_HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org")
+
+
+def _host_index(parts: list[str]) -> int:
+    return next((i for i, p in enumerate(parts) if p in REPO_HOSTS), -1)
+
+
 def repo_key_of(cwd: Optional[str]) -> Optional[str]:
     """A cwd to "github.com/<org>/<repo>", or None.
 
@@ -89,10 +97,9 @@ def repo_key_of(cwd: Optional[str]) -> Optional[str]:
         return None
     parts = [p for p in cwd.split("/") if p]
 
-    if "github.com" in parts:
-        gh = parts.index("github.com")
-        if len(parts) >= gh + 3:
-            return f"github.com/{parts[gh + 1]}/{_normalize_repo(parts[gh + 2])}"
+    gh = _host_index(parts)
+    if gh >= 0 and len(parts) >= gh + 3:
+        return f"{parts[gh]}/{parts[gh + 1]}/{_normalize_repo(parts[gh + 2])}"
 
     # incubate worktrees drop the host segment: .../incubate/worktrees/<org>/<repo>/...
     if "worktrees" in parts:
@@ -146,9 +153,11 @@ def canonical_repo_key(key: str) -> str:
 
 def reset_repo_index() -> None:
     """Both caches are one fact about this machine — reset together or they drift."""
-    global _repo_index_cache, _canon_cache
+    global _repo_index_cache, _canon_cache, _mappings_cache
     _repo_index_cache = None
     _canon_cache = None
+    _mappings_cache = None
+    _remote_cache.clear()
 
 
 _repo_index_cache: Optional[dict] = None
@@ -207,6 +216,9 @@ def resolve_repo_key(cwd: Optional[str]) -> Optional[str]:
        20  ~/.herdr/worktrees/<repo>/<space>    recoverable
        16  /tmp/claude-<uid>/-<encoded>/...     recoverable
     """
+    mapped = mapped_repo_key(cwd)
+    if mapped:
+        return mapped
     direct = repo_key_of(cwd)
     # A repo this machine does not have falls through unchanged — peer roots carry
     # paths from another host, and inventing a spelling for them would be worse than
@@ -237,7 +249,136 @@ def resolve_repo_key(cwd: Optional[str]) -> Optional[str]:
                 as_dir = "-" + re.sub(r"[/.]", "-", os.path.join(ghq_root(), key)[1:])
                 if enc == as_dir or enc.startswith(as_dir + "-"):
                     return key
+    return remote_repo_key(cwd)
+
+
+# A key relic can shard and list: <host>/<org>/<repo>, host a domain.
+_VALID_KEY = re.compile(r"^[^/\s]+\.[^/\s]+/[^/\s]+/[^/\s]+$")
+
+_mappings_cache: Optional[list[tuple[str, str]]] = None
+
+
+def parse_repo_mappings(cfg, home: str, warn=lambda m: None) -> list[tuple[str, str]]:
+    """Pure: sources.json `repo_mappings`, validated, longest prefix first — mirrors src/repo.ts."""
+    out: list[tuple[str, str]] = []
+    raw = (cfg or {}).get("repo_mappings") or {} if isinstance(cfg, dict) else {}
+    for prefix, key in raw.items():
+        p = os.path.join(home, prefix[2:]) if prefix.startswith("~/") else prefix
+        if isinstance(key, str) and _VALID_KEY.match(key) and os.path.isabs(p):
+            out.append((p.rstrip("/"), key))
+        else:
+            warn(f"relic: ignoring repo_mappings entry {prefix!r} -> {key!r} "
+                 f"(needs an absolute path and a <host>/<org>/<repo> key)")
+    return sorted(out, key=lambda kv: -len(kv[0]))
+
+
+def _repo_mappings() -> list[tuple[str, str]]:
+    global _mappings_cache
+    if _mappings_cache is None:
+        import json
+        import sys
+        cfg = None
+        try:
+            with open(os.path.join(str(_HOME), ".relic", "sources.json")) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            pass
+        _mappings_cache = parse_repo_mappings(cfg, str(_HOME), lambda m: print(m, file=sys.stderr))
+    return _mappings_cache
+
+
+def mapped_repo_key(cwd: Optional[str], mappings: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
+    if not cwd:
+        return None
+    for prefix, key in (mappings if mappings is not None else _repo_mappings()):
+        if cwd == prefix or cwd.startswith(prefix + "/"):
+            return key
     return None
+
+
+_SCP = re.compile(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!/)(.+)$")
+
+
+def remote_to_key(url: str) -> Optional[str]:
+    """An origin URL to <host>/<org>/<repo> — scp-style ssh, ssh://, https; credentials, port, .git dropped."""
+    from urllib.parse import urlparse
+    u = url.strip()
+    if re.match(r"^[a-z+]+://", u, re.I):
+        x = urlparse(u)
+        host, path = x.hostname or "", x.path
+    else:
+        m = _SCP.match(u)
+        if not m:
+            return None
+        host, path = m.group(1), m.group(2)
+    segs = [s for s in re.sub(r"\.git/?$", "", path).split("/") if s]
+    # Nested groups (gitlab.com/group/sub/repo) have no <org>/<repo> shard to land in.
+    if "." not in host or len(segs) != 2:
+        return None
+    return f"{host.lower()}/{segs[0]}/{_normalize_repo(segs[1])}"
+
+
+def _git_config_for(d: str) -> Optional[str]:
+    dotgit = os.path.join(d, ".git")
+    if os.path.isdir(dotgit):
+        return os.path.join(dotgit, "config")
+    if not os.path.isfile(dotgit):
+        return None
+    try:
+        with open(dotgit) as f:
+            m = re.search(r"^gitdir:\s*(.+)$", f.read(), re.M)
+        if not m:
+            return None
+        gitdir = os.path.normpath(os.path.join(d, m.group(1).strip()))
+        common = os.path.join(gitdir, "commondir")
+        if os.path.exists(common):
+            with open(common) as f:
+                gitdir = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+        return os.path.join(gitdir, "config")
+    except OSError:
+        return None
+
+
+def _origin_of(config_path: str) -> Optional[str]:
+    try:
+        with open(config_path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    in_origin = False
+    for line in text.splitlines():
+        sec = re.match(r"^\s*\[(.+)\]\s*$", line)
+        if sec:
+            in_origin = re.match(r'^remote\s+"origin"$', sec.group(1).strip()) is not None
+            continue
+        kv = re.match(r"^\s*url\s*=\s*(.+?)\s*$", line)
+        if in_origin and kv:
+            return kv.group(1)
+    return None
+
+
+_remote_cache: dict[str, Optional[str]] = {}
+
+
+def remote_repo_key(cwd: str, home: Optional[str] = None) -> Optional[str]:
+    """Nearest repo's origin, cached per cwd; never walks into $HOME (a dotfiles repo would claim everything)."""
+    if cwd in _remote_cache:
+        return _remote_cache[cwd]
+    home = home if home is not None else str(_HOME)
+    key: Optional[str] = None
+    if os.path.exists(cwd):
+        d = cwd
+        while d != home and d != os.path.dirname(d):
+            cfg = _git_config_for(d)
+            if cfg:
+                url = _origin_of(cfg)  # the nearest repo decides, origin or not
+                key = remote_to_key(url) if url else None
+                break
+            d = os.path.dirname(d)
+    if key:
+        key = canonical_repo_key(key)
+    _remote_cache[cwd] = key
+    return key
 
 
 def context_of(cwd: Optional[str]) -> dict[str, str]:
@@ -252,10 +393,8 @@ def context_of(cwd: Optional[str]) -> dict[str, str]:
     if not cwd:
         return {"worktree": "", "subpath": ""}
     parts = [p for p in cwd.split("/") if p]
-    if "github.com" not in parts:
-        return {"worktree": "", "subpath": ""}
-    gh = parts.index("github.com")
-    if len(parts) < gh + 3:
+    gh = _host_index(parts)
+    if gh < 0 or len(parts) < gh + 3:
         return {"worktree": "", "subpath": ""}
 
     repo_seg = parts[gh + 2]
@@ -290,10 +429,8 @@ def location_of(cwd: Optional[str]) -> dict[str, str]:
     if not cwd:
         return empty
     parts = [p for p in cwd.split("/") if p]
-    if "github.com" not in parts:
-        return empty
-    gh = parts.index("github.com")
-    if len(parts) < gh + 3:
+    gh = _host_index(parts)
+    if gh < 0 or len(parts) < gh + 3:
         return empty
 
     ctx = context_of(cwd)
