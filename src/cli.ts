@@ -1544,7 +1544,9 @@ async function cmdNow(f: Record<string, string | boolean>) {
     return;
   }
 
-  const all = treeFiles(cur.projectDir, cur.sessionUuid);
+  // Asked BEFORE treeFiles: a Hermes session is a row in state.db, so its projectDir is
+  // a file, and probing a transcript tree beneath it reads as an unreadable path (#99).
+  const all = cur.source === "hermes" ? [] : treeFiles(cur.projectDir, cur.sessionUuid);
   const liveFiles = all.filter(x => x.ageSec <= windowSec);
 
   if (mode === "json") {
@@ -1554,7 +1556,7 @@ async function cmdNow(f: Record<string, string | boolean>) {
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
 
   if (cur.source === "hermes") {
-    // A row in state.db, named by HERMES_SESSION_ID: no transcript tree and no timeline.
+    // Named by HERMES_SESSION_ID: no transcript tree to count and no timeline to draw.
     console.log(`${cur.title ?? "(untitled)"}\n`);
     console.log(`${cur.sessionUuid}  ·  last message ${humanAge(cur.eventAgeSec ?? cur.ageSec)} ago`);
     console.log(cur.confident ? cur.cwd : `(no cwd recorded — a gateway session)`);

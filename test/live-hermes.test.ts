@@ -268,6 +268,8 @@ describe("no-argument tail/recap, now and now --all, through the CLI", () => {
     const pretty = relic(join(tmp, "empty"), ["now"], { HERMES_SESSION_ID: NEWER });
     expect(pretty.stdout).toContain(`${NEWER}  ·  last message 15m ago`);
     expect(pretty.stdout).toContain("(no cwd recorded — a gateway session)");
+    // The DB is a file: probing a transcript tree beneath it must not read as unreadable (#99).
+    expect(json.stderr + pretty.stderr).not.toContain("cannot read");
     expect(relic(join(tmp, "empty"), ["now", "--plain"], { HERMES_SESSION_ID: NEWER }).stdout.trim()).toBe(NEWER);
   });
 
