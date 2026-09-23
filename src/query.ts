@@ -1,5 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble } from "./types.js";
+import { isHostPreamble, stripLeadingEnvelope } from "./types.js";
 export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
@@ -962,6 +962,10 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   // boilerplate as the session's name.
   // A host's own boot directive is not a name. Claude's two shapes were already
   // handled below; Codex's three were not, and they account for 64% of its sessions.
+  if (isHostPreamble(d)) return "(untitled)";
+
+  // Rows indexed before import stripped envelopes still carry them, cut at 200 chars.
+  d = stripLeadingEnvelope(d.replace(/\.\.\.\[\+\d+\]$/, ""));
   if (isHostPreamble(d)) return "(untitled)";
 
   d = d.replace(/<local-command-caveat>[\s\S]*$/, "")

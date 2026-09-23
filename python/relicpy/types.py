@@ -173,3 +173,27 @@ _HOST_PREAMBLE = [
 def is_host_preamble(text) -> bool:
     t = str(text or "").lstrip()
     return any(rx.match(t) for rx in _HOST_PREAMBLE)
+
+
+# Tags whose content later code reads: slash-command promotion and the caveat drop.
+_STRUCTURAL_TAGS = {
+    "command-name", "command-message", "command-args",
+    "local-command-caveat", "local-command-stdout", "local-command-stderr",
+}
+_ENVELOPE = re.compile(r"^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)")
+
+
+def strip_leading_envelope(text) -> str:
+    """Mirror of stripLeadingEnvelope in src/types.ts — same cases, same results."""
+    raw = str(text or "")
+    t, changed = raw, False
+    for _ in range(8):
+        m = _ENVELOPE.match(t)
+        if not m or m.group(1).lower() in _STRUCTURAL_TAGS or is_host_preamble(t):
+            break
+        t = t[m.end():]
+        close = t.find(f"</{m.group(1)}>")
+        if close >= 0:
+            t = t[:close] + " " + t[close + len(m.group(1)) + 3:]
+        changed = True
+    return t.strip() if changed else raw

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
-import { asObj, str, truncate, flattenContent, blockRole, uidOf, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
+import { asObj, str, truncate, flattenContent, blockRole, uidOf, stripLeadingEnvelope, type ParsedEvent, type ParsedFile, type Parser } from "../types.js";
 
 /** Roles whose text is worth full-text indexing. UI/state events are counted, not indexed. */
 const INDEXED = new Set(["user", "assistant", "system"]);
@@ -74,7 +74,8 @@ export const parseClaude: Parser = async (filePath) => {
     // tool's own output first.
     const role = blockRole(raw) ?? str(msg?.role) ?? type;
 
-    if (!description && role === "user") description = truncate(text, 200);
+    // Strip the envelope BEFORE the 200-char cut, or a channel tag eats the whole budget.
+    if (!description && role === "user") description = truncate(stripLeadingEnvelope(text), 200);
     events.push({
       uid: uidOf("claude", fileKey, seq),   // path-independent by design
       seq, role, ts, text: truncate(text), cwd: lineCwd,

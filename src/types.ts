@@ -171,3 +171,24 @@ export function isHostPreamble(text: unknown): boolean {
   const t = String(text ?? "").trimStart();
   return HOST_PREAMBLE.some(rx => rx.test(t));
 }
+
+// Tags whose content later code reads: slash-command promotion and the caveat drop.
+const STRUCTURAL_TAGS = new Set([
+  "command-name", "command-message", "command-args",
+  "local-command-caveat", "local-command-stdout", "local-command-stderr",
+]);
+
+// Leading host envelopes (<channel …>, <teammate-message …>) of any length, cut-off ones included; wrapped text kept.
+export function stripLeadingEnvelope(text: string): string {
+  const raw = String(text ?? "");
+  let t = raw, changed = false;
+  for (let i = 0; i < 8; i++) {
+    const m = /^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)/.exec(t);
+    if (!m || STRUCTURAL_TAGS.has(m[1].toLowerCase()) || isHostPreamble(t)) break;
+    t = t.slice(m[0].length);
+    const close = t.indexOf(`</${m[1]}>`);
+    if (close >= 0) t = t.slice(0, close) + " " + t.slice(close + m[1].length + 3);
+    changed = true;
+  }
+  return changed ? t.trim() : raw;
+}
