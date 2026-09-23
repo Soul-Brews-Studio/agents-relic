@@ -16,6 +16,7 @@ import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 
@@ -1429,6 +1430,44 @@ async function cmdNow(f: Record<string, string | boolean>) {
               `${" ".repeat(34)}${localTime(b.endMs)}`);
 }
 
+async function cmdLineage(arg: string | undefined, f: Record<string, string | boolean>) {
+  const cur = await currentSession();
+  let target: { id: string; projectDir: string };
+  if (arg) {
+    const hits = findSessions(arg);
+    if (!hits.length) { console.error(`no Claude Code transcript matches ${arg}`); process.exit(1); }
+    if (hits.length > 1) {
+      console.error(`${arg} matches ${hits.length} sessions — give more of the id:`);
+      for (const h of hits.slice(0, 10)) console.error(`  ${h.id}  ${h.projectDir}`);
+      process.exit(1);
+    }
+    target = hits[0];
+  } else {
+    if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
+    if (!isClaudeProjectDir(cur.projectDir)) {
+      console.error(`lineage reads Claude Code transcripts; this session is under ${cur.projectDir}`);
+      process.exit(1);
+    }
+    target = { id: cur.sessionUuid, projectDir: cur.projectDir };
+  }
+
+  const l = await buildLineage(target.projectDir, target.id, { all: Boolean(f.all) });
+  const mode = outFmt(f);
+  if (mode === "json") { console.log(JSON.stringify(lineageJSON(l), null, 2)); return; }
+  if (mode === "plain" || mode === "jsonl") {
+    const parent = new Map(l.links.map(k => [k.child, k]));
+    for (const n of [...l.nodes].sort((a, b) => a.startMs - b.startMs)) {
+      const k = parent.get(n.id);
+      const row = { id: n.id, parent: k?.parent ?? null, kind: k?.kind ?? null, gapMs: k?.gapMs ?? null,
+                    start: new Date(n.startMs).toISOString(), end: new Date(n.endMs).toISOString(), title: n.title ?? n.prompt };
+      console.log(mode === "jsonl" ? JSON.stringify(row)
+        : [row.id, row.parent ?? "-", row.kind ?? "-", row.gapMs ?? "-", row.start, row.end, row.title ?? ""].join("\t"));
+    }
+    return;
+  }
+  console.log(renderLineage(l, { current: cur?.sessionUuid ?? null }));
+}
+
 // ---- main ------------------------------------------------------------------
 const { f, pos } = flags(process.argv.slice(2));
 const cmd = pos[0];
@@ -1679,6 +1718,7 @@ else if (cmd === "trace") {
         t.neverTop.slice(0, 12).map(s2 => s2.replace("github.com/", "")).join("\n  "));
   }
 }
+else if (cmd === "lineage") await cmdLineage(pos[1], f);
 else if (cmd === "chain") {
   if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
   const { chain, imported } = await chainOf(pos[1], {
