@@ -10,6 +10,10 @@ live tree. Anything else (EACCES, EIO, ENOTDIR, ELOOP) is a real failure and get
 stderr line per path per process. A path BENEATH one already reported gets none: it is
 the same failure again.
 
+ENAMETOOLONG is absence too: the kernel saying no such name can exist here. A directory
+named after an encoded cwd can pass the limit, and the limit is not one number — 255
+CHARACTERS on APFS (measured), 255 BYTES on ext4 — so only the error can tell.
+
 Two kinds, both of which drop data:
 
     dir-unreadable   a directory could not be listed or reached — nothing under it is seen
@@ -55,7 +59,7 @@ def _describe(err: BaseException) -> str:
 
 
 def _report(rule: str, path: str, err: BaseException) -> None:
-    if isinstance(err, FileNotFoundError):
+    if isinstance(err, FileNotFoundError) or getattr(err, "errno", None) == errno.ENAMETOOLONG:
         return
     if _covered(_collected, path):
         return

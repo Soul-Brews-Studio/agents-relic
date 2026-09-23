@@ -74,7 +74,9 @@ export function helpText(): string {
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
                                an id. Found by mtime, never the index. Hermes
-                               sessions that ran in this checkout count too.
+                               sessions that ran in this checkout count too; a
+                               Hermes caller with nothing here gets the session
+                               before it on its session_key (HERMES_SESSION_ID).
                                the LAST N EXCHANGES — what was I just doing. An
                                exchange is the human's turn plus the last thing
                                the agent said before they spoke again. Takes a
@@ -83,7 +85,8 @@ export function helpText(): string {
                                55 of 63 user-channel turns were the tooling itself.
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now|live [--all] [--window 300]  what is running RIGHT NOW — this session, its agents
-                               --all is machine-wide, Hermes sessions (state.db) included
+                               --all is machine-wide, Hermes sessions (state.db) included;
+                               a Hermes caller is named by its HERMES_SESSION_ID
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
@@ -101,7 +104,7 @@ export function helpText(): string {
                                --tree groups them by directory — which RUN is missing.
   embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--max-chars 2000]
-                               [--dry-run] [--reset] [--force]
+                               [--dry-run] [--reset] [--force] [--repair]
                                [--session ID]  embed ONE session — the /forward + /new unit
                                --model all-minilm, the default, is ENGLISH-ONLY: all-MiniLM
                                scored 0.006 on Thai paraphrase (bench/). For Thai: --model
@@ -110,6 +113,10 @@ export function helpText(): string {
                                as langs does, and REFUSES an English-only model when 1% or
                                more of the events carry Thai, or another non-Latin script.
                                --force embeds anyway; --dry-run shows the same check.
+                               [--repair]  a shard whose \`vectors\` no longer reads is put back
+                               to its newest version that does (dropped if none does), then
+                               embedding carries on. Without it, that shard SKIPs and prints
+                               the exact command. Only \`vectors\` is ever touched.
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).

@@ -1,10 +1,11 @@
 import { expect, test, describe, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, existsSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lancedb from "@lancedb/lancedb";
 import { LanceStore } from "../src/store/lance.js";
-import { l2normalise, providerFor, queryProviderFor, embedShard, embedShards, type EmbedProvider } from "../src/embed.js";
+import { l2normalise, providerFor, queryProviderFor, embedShard, embedShards, damageNote,
+         type EmbedProvider, type ShardEmbedStat } from "../src/embed.js";
 import { checkEmbedModel, renderEmbedCheck, CHECK_MIN_EVENTS, type EmbedCheck } from "../src/langs.js";
 import { shardDirFor } from "../src/repo.js";
 import { uidOf } from "../src/types.js";
@@ -493,4 +494,187 @@ describe("the language check — embed measures its scope before any provider ca
       expect(multi.stderr).toBe("");
     });
   });
+});
+
+describe("an interrupted embed, and a vectors table that no longer reads (#105)", () => {
+  const seed = async (dir: string, n: number) => {
+    const s = await LanceStore.open(dir);
+    await s.putEvents(Array.from({ length: n }, (_, i) => ({
+      uid: `u${i}`, session_uuid: "s", file_path: "/f", repo_key: "r", seq: i,
+      role: "user", ts: "", text: `event number ${i} with enough text to pass min-chars`,
+      source: "claude", tier: "session", kind: "transcript", worktree: "", cwd: "",
+      org: "", project: "", dir: "", mem_type: "", origin_session: "",
+    })));
+    return s;
+  };
+  const versionOf = async (dir: string) => (await (await lancedb.connect(dir)).openTable("vectors")).version();
+
+  /*
+   * The REPORTED state, built on purpose: the two newest versions reference data files
+   * that are 0 bytes, while the first commit's file is intact. That is the shape in the
+   * issue (two 0-byte files beside one 200 KB file). A kill alone does not produce it;
+   * the SIGKILL test below pins what a kill does leave. So this truncates exactly the
+   * files those versions wrote.
+   *
+   * 20 events, 3 commits of 4 (v1..v3). v2 and v3 are damaged, and v1 holds 4 rows.
+   */
+  const damaged = async (dir: string, zero: number[], provider = fake(8)) => {
+    const s = await seed(dir, 20);
+    const data = join(dir, "vectors.lance", "data");
+    const files = () => existsSync(data) ? readdirSync(data) : [];
+    const perCommit: string[][] = [];
+    const put = s.putVectors;
+    s.putVectors = async rows => { const had = new Set(files()); await put(rows); perCommit.push(files().filter(f => !had.has(f))); };
+    await embedShard(s, provider, { batch: 4, limit: 12 });
+    for (const c of zero) for (const f of perCommit[c]) truncateSync(join(data, f), 0);
+    return LanceStore.open(dir);   // a fresh store: the damage is on disk, not in a cached handle
+  };
+
+  test("a SIGKILL during a write leaves the last commit readable, and the next run resumes", async () => {
+    /*
+     * What a kill really leaves. Lance writes the data files first and the manifest
+     * last, so a killed commit is all or nothing. On m5, 60 kills timed into embed
+     * writes always left a table that read, and it read at the last commit that landed.
+     * The timing of this kill varies from run to run. The assertions hold for any timing.
+     */
+    const dir = join(tmp, "killed");
+    await seed(dir, 600);
+    const src = join(import.meta.dir, "..", "src");
+    const child = Bun.spawn(["bun", "-e", `
+      const { LanceStore } = await import(${JSON.stringify(join(src, "store", "lance.ts"))});
+      const { embedShard } = await import(${JSON.stringify(join(src, "embed.ts"))});
+      const s = await LanceStore.open(${JSON.stringify(dir)});
+      const put = s.putVectors;
+      s.putVectors = async rows => { process.stdout.write("W\\n"); await put(rows); };
+      await embedShard(s, { id: "test:fake", embed: async t => t.map(() => Array.from({ length: 1024 }, (_, i) => i + 1)) },
+                       { batch: 100 });`], { stdout: "pipe", stderr: "pipe" });
+    // Kill once the third write has started: two commits have landed, and the third is in flight.
+    const reader = child.stdout.getReader();
+    let out = "";
+    while ((out.match(/W/g) ?? []).length < 3) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += new TextDecoder().decode(value);
+    }
+    child.kill("SIGKILL");
+    await child.exited;
+    const after = await LanceStore.open(dir);
+    expect(await after.vectorDamage()).toBeNull();
+    const rows = (await after.vectorStats())!.rows;
+    expect(rows % 100).toBe(0);                  // whole commits only
+    expect(rows).toBeGreaterThanOrEqual(200);
+    const r = await embedShard(after, { id: "test:fake", embed: async t => t.map(() => Array.from({ length: 1024 }, (_, i) => i + 1)) },
+                               { batch: 100 });
+    expect(r.already + r.embedded).toBe(600);
+  }, 30_000);
+
+  test("the reported state: countRows still answers, a scan does not", async () => {
+    const s = await damaged(join(tmp, "d-state"), [1, 2]);
+    expect((await s.vectorStats())!.rows).toBe(12);     // manifest-only reads look healthy
+    await expect(s.embeddedUids()).rejects.toThrow(/LanceError\(IO\)/);
+    expect((await s.counts()).events).toBe(20);
+  });
+
+  test("vectorDamage names the version that fails and the newest one that reads", async () => {
+    const s = await damaged(join(tmp, "d-diag"), [1, 2]);
+    expect(await s.vectorDamage()).toMatchObject({ version: 3, rows: 12, restorable: 1, keep: 4 });
+  });
+
+  test("a table that reads, or no table at all, is not damage", async () => {
+    const s = await seed(join(tmp, "d-none"), 4);
+    expect(await s.vectorDamage()).toBeNull();
+    await embedShard(s, fake(8), {});
+    expect(await s.vectorDamage()).toBeNull();
+  });
+
+  test("without --repair the shard is skipped with the damage attached, and nothing is written", async () => {
+    const dir = join(tmp, "d-skip");
+    const s = await damaged(dir, [1, 2]);
+    const r = await embedShard(s, fake(8), { batch: 4 });
+    expect(r.skipped).toMatch(/^vectors table unreadable at v3 — LanceError\(IO\)/);
+    expect(r.damage).toMatchObject({ version: 3, restorable: 1, keep: 4 });
+    expect(r.repaired).toBeUndefined();
+    expect(r.embedded).toBe(0);
+    expect(await versionOf(dir)).toBe(3);
+  });
+
+  test("a dry run never repairs, even with --repair", async () => {
+    const dir = join(tmp, "d-dry");
+    const s = await damaged(dir, [1, 2]);
+    const r = await embedShard(s, fake(8), { batch: 4, repair: true, dryRun: true });
+    expect(r.skipped).toMatch(/unreadable at v3/);
+    expect(r.repaired).toBeUndefined();
+    expect(await versionOf(dir)).toBe(3);
+  });
+
+  test("--repair restores the newest version that reads, and the same run re-embeds the rest", async () => {
+    const dir = join(tmp, "d-restore");
+    const s = await damaged(dir, [1, 2]);
+    const r = await embedShard(s, fake(8), { batch: 4, repair: true });
+    expect(r.repaired).toBe("restored");
+    expect(r.already).toBe(4);          // what v1 kept
+    expect(r.embedded).toBe(16);        // the 8 lost with v2..v3, and the 8 never embedded
+    expect(r.skipped).toBeUndefined();
+    expect(await s.vectorDamage()).toBeNull();
+    expect((await s.embeddedUids()).size).toBe(20);
+    expect((await s.counts()).events).toBe(20);
+    // restore() wrote a new version on top. The damaged ones are still in the history.
+    expect(await versionOf(dir)).toBeGreaterThan(3);
+  });
+
+  test("with no version that reads, --repair drops `vectors` and nothing else", async () => {
+    const s = await damaged(join(tmp, "d-drop"), [0, 1, 2]);
+    expect(await s.vectorDamage()).toMatchObject({ version: 3, restorable: null, keep: 0 });
+    const r = await embedShard(s, fake(8), { batch: 4, repair: true });
+    expect(r.repaired).toBe("dropped");
+    expect(r.embedded).toBe(20);
+    expect((await s.embeddedUids()).size).toBe(20);
+    expect((await s.counts()).events).toBe(20);
+  });
+
+  test("a failure outside `vectors` is rethrown, never repaired", async () => {
+    // Nothing is dropped on a guess: if `vectors` still reads, the fault is elsewhere.
+    const dir = join(tmp, "d-other");
+    const s = await seed(dir, 8);
+    await embedShard(s, fake(8), { batch: 4 });
+    const v = await versionOf(dir);
+    s.unembedded = async () => { throw new Error("events went away"); };
+    await expect(embedShard(s, fake(8), { repair: true })).rejects.toThrow("events went away");
+    expect(await versionOf(dir)).toBe(v);
+  });
+
+  test("the note names the one command that repairs this shard, carrying the run's own flags", () => {
+    const sh: ShardEmbedStat = {
+      key: "hermes/_unresolved", bank: "hermes", repo: "_unresolved", eligible: 1402, already: 0,
+      pending: 0, embedded: 0, failed: 0, model: "ollama:nomic-embed-text", dim: 0, skipped: "…",
+      damage: { version: 3, rows: 192, error: "", restorable: 1, keep: 64 },
+    };
+    const note = damageNote(sh, ["--data-root", "/tmp/scratch root", "--model", "nomic-embed-text"]);
+    expect(note[1]).toBe("  relic embed --repair --bank hermes --repo _unresolved --data-root '/tmp/scratch root' --model nomic-embed-text");
+    expect(note[2]).toBe("that restores v1 (64 of 192 vectors) and re-embeds the rest");
+    expect(damageNote({ ...sh, damage: { ...sh.damage!, restorable: null, keep: 0 } }, [])[2]).toMatch(/drops it/);
+    expect(damageNote({ ...sh, repaired: "restored" }, [])).toEqual(
+      ["repaired: restored v1 of `vectors`, keeping 64 of 192 rows; v3 did not read"]);
+    expect(damageNote({ ...sh, damage: undefined }, [])).toEqual([]);
+  });
+
+  test("the CLI prints that command, with --data-root, where it used to print a bare SKIP", async () => {
+    const root = join(tmp, "cli-root");
+    // Written under the CLI's default model, so the model guard lets the run reach the scan.
+    await damaged(shardDirFor(null, root, false, "hermes"), [1, 2], { ...fake(8), id: "ollama:all-minilm" });
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const run = (...args: string[]) => {
+      const p = Bun.spawnSync(["bun", cli, "embed", "--data-root", root, "--bank", "hermes", "--batch", "4", ...args],
+                              { stdout: "pipe", stderr: "pipe" });
+      return p.stdout.toString();
+    };
+    const before = run();
+    expect(before).toContain("hermes/_unresolved  SKIP  vectors table unreadable at v3 — LanceError(IO)");
+    expect(before).toContain(`relic embed --repair --bank hermes --repo _unresolved --data-root ${root} --batch 4`);
+    // --repair, against a provider that cannot answer: the repair is local, and the
+    // batches that follow fail and stay pending, as any batch against a dead provider does.
+    const after = run("--repair", "--host", "http://127.0.0.1:1");
+    expect(after).toContain("repaired: restored v1 of `vectors`, keeping 4 of 12 rows; v3 did not read");
+    expect(await (await LanceStore.open(shardDirFor(null, root, false, "hermes"))).vectorDamage()).toBeNull();
+  }, 30_000);
 });

@@ -8,7 +8,7 @@ import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath, logSkippedFiles, readSkippedFiles } from "./noise.js";
-import { walkFailures } from "./unreadable.js";
+import { walkFailures, dirUnreadable, walkError } from "./unreadable.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
@@ -39,7 +39,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
          groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
-import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { embedShards, damageNote, DEFAULT_OLLAMA } from "./embed.js";
 import { scanLangs, recommend, renderLangs, renderEmbedCheck } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
@@ -357,7 +357,7 @@ async function recapTarget(arg: string | undefined): Promise<string> {
   // not data. On stdout it lands inside `--json` output and makes it unparseable:
   // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
   // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+  console.error(resolvedBanner(prev));
   return prev.id;
 }
 
@@ -866,23 +866,29 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * line by the time a human types, so without the exclusion `tail` would hand you your
  * own empty transcript.
  */
-async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
-  const { encodeProjectDir, sessionIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
+async function previousSessionFile(cwd: string): Promise<{ file: string; id: string; why: "here" | "session_key" } | null> {
+  const { encodeProjectDir, sessionIdFromEnv, hermesIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
   const { readdirSync, statSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const me = sessionIdFromEnv()?.id ?? "";
+  // A transcript is named by a Claude or Codex id; a Hermes id never names a file.
+  const host = sessionIdFromEnv();
+  const me = host && host.via !== "HERMES_SESSION_ID" ? host.id : "";
   const enc = encodeProjectDir(cwd);
   const found: { file: string; id: string; mtime: number }[] = [];
   for (const root of liveRoots()) {
     const dir = join(root, enc);
-    try {
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith(".jsonl")) continue;
-        const id = name.slice(0, -6);
-        if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
-        try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); } catch {}
-      }
-    } catch { /* root without this project */ }
+    let names: string[];
+    // A root without this project is ENOENT, and quiet. An unreadable one used to give
+    // the same "no earlier session found" while the session sat right there (#99).
+    try { names = readdirSync(dir); }
+    catch (e) { dirUnreadable(dir, e); continue; }
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const id = name.slice(0, -6);
+      if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
+      try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); }
+      catch (e) { walkError(join(dir, name), e); }
+    }
   }
   const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
@@ -892,7 +898,7 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * join the SAME ranking instead of being tried only when the transcripts come up
    * empty. The newest session is the answer, whichever host wrote it.
    */
-  const { hermesSessionsIn } = await import("./live-hermes.js");
+  const { hermesSessionsIn, hermesPredecessor } = await import("./live-hermes.js");
   const cands = [
     ...ranked.map(c => ({ file: c.file, id: c.id, at: c.lastEventMs ?? c.mtimeMs })),
     ...hermesSessionsIn(cwd).map(h => ({ file: h.path, id: h.id, at: h.lastMs })),
@@ -914,10 +920,32 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
-      if (human && p.events.length > 2) return { file: c.file, id: c.id };
+      if (human && p.events.length > 2) return { file: c.file, id: c.id, why: "here" };
     } catch { /* unreadable: try the next */ }
   }
-  return cands[0] ?? null;      // nothing substantial — hand back the newest and say so
+
+  /*
+   * NOTHING HERE WORTH READING, AND THE CALLER IS A HERMES SESSION: follow its own line.
+   *
+   * A gateway session (Discord, say) records no cwd, so no directory can hand it back —
+   * the case #100 reported. It does name itself in HERMES_SESSION_ID, and its row carries
+   * a session_key, so the session before it on that key is the conversation it continues.
+   *
+   * Tried only after the directory comes up empty or stubs-only, never before it: the
+   * environment cannot say which host is innermost, and a Claude session started from a
+   * Hermes shell inherits the variable. It still beats a stub, which is worse than no
+   * answer for the reason above.
+   */
+  const prior = hermesPredecessor(hermesIdFromEnv());
+  if (prior) return { file: prior.path, id: prior.id, why: "session_key" };
+  return cands[0] ? { file: cands[0].file, id: cands[0].id, why: "here" } : null;   // hand back the newest and say so
+}
+
+/** Which session was resolved, and by which rule. STDERR, not stdout — see recapTarget. */
+function resolvedBanner(prev: { id: string; why: "here" | "session_key" }): string {
+  const rule = prev.why === "session_key" ? "the session before this one on its Hermes session_key"
+                                         : "newest session here that is not this one";
+  return `\u2190 ${shortId(prev.id)}  (${rule})`;
 }
 
 /*
@@ -1003,7 +1031,7 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
     // not data. On stdout it lands inside `--json` output and makes it unparseable:
     // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
     // line was an arrow. Found by piping the new default into jq.
-    console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+    console.error(resolvedBanner(prev));
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
@@ -1289,7 +1317,15 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     reset: Boolean(f.reset),
     force: Boolean(f.force),
     scopeArgs: [...embedScopeArgs(f), ...(f.session ? ["--session", String(f.session)] : [])],
+    repair: Boolean(f.repair),
   };
+  // The run's own flags, minus scope and the two that would defeat a repair (a dry run
+  // never repairs; --reset throws away what a repair keeps). A damaged shard's repair
+  // command is this run, narrowed to that shard — see damageNote().
+  const carry: string[] = [];
+  for (const k of ["data-root", "provider", "model", "host", "device", "batch", "limit", "min-chars", "max-chars", "session"] as const)
+    if (typeof f[k] === "string") carry.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) carry.push(`--${k}`);
 
   let last = 0;
   const bar = progress();
@@ -1335,8 +1371,13 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   console.log(`provider  ${r.providerId}${r.dryRun ? "   (dry run — nothing written)" : ""}`);
   console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}\n`);
   const w = Math.max(6, ...touched.map(sh => sh.key.length));
-  for (const sh of touched.slice(0, Number(f.limit ?? 40))) {
-    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); continue; }
+  // A damaged shard is listed even past the --limit display cap, because its line carries
+  // the only command that repairs it.
+  const cap = Number(f.limit ?? 40);
+  const shown = [...touched.slice(0, cap), ...touched.slice(cap).filter(sh => sh.damage)];
+  for (const sh of shown) {
+    const note = damageNote(sh, carry).map(l => `  ${"".padEnd(w)}        ${l}`);
+    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); note.forEach(l => console.log(l)); continue; }
     const cov = sh.eligible ? Math.round((sh.already + sh.embedded) / sh.eligible * 100) : 0;
     console.log(`  ${sh.key.padEnd(w)}  ${String(cov).padStart(3)}%  ` +
                 `${fmt(sh.already + sh.embedded)}/${fmt(sh.eligible)} embedded` +
@@ -1344,6 +1385,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
                 (sh.pending && r.dryRun ? `  ${fmt(sh.pending)} pending` : "") +
                 (sh.failed ? `  ${fmt(sh.failed)} FAILED` : "") +
                 (sh.dim ? `  dim ${sh.dim}` : ""));
+    note.forEach(l => console.log(l));
   }
   const secs = r.ms / 1000;
   console.log(`\n${fmt(r.embedded)} embedded · ${fmt(r.pending)} pending · ${fmt(r.failed)} failed` +
@@ -1586,10 +1628,13 @@ async function cmdNow(f: Record<string, string | boolean>) {
     console.log(`no session transcript for this directory`);
     console.log(`  ${process.cwd()}`);
     console.log(`  relic now --all   to see every active session on this machine`);
+    for (const note of hermesOffNotes()) console.log(`  ${note}`);
     return;
   }
 
-  const all = treeFiles(cur.projectDir, cur.sessionUuid);
+  // Asked BEFORE treeFiles: a Hermes session is a row in state.db, so its projectDir is
+  // a file, and probing a transcript tree beneath it reads as an unreadable path (#99).
+  const all = cur.source === "hermes" ? [] : treeFiles(cur.projectDir, cur.sessionUuid);
   const liveFiles = all.filter(x => x.ageSec <= windowSec);
 
   if (mode === "json") {
@@ -1597,6 +1642,15 @@ async function cmdNow(f: Record<string, string | boolean>) {
     return;
   }
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
+
+  if (cur.source === "hermes") {
+    // Named by HERMES_SESSION_ID: no transcript tree to count and no timeline to draw.
+    console.log(`${cur.title ?? "(untitled)"}\n`);
+    console.log(`${cur.sessionUuid}  ·  last message ${humanAge(cur.eventAgeSec ?? cur.ageSec)} ago`);
+    console.log(cur.confident ? cur.cwd : `(no cwd recorded — a gateway session)`);
+    console.log(`hermes  ${cur.projectDir}`);
+    return;
+  }
 
   console.log(`${cur.title ?? "(untitled)"}\n`);
   console.log(`${cur.sessionUuid}  ·  ${clockLabel(cur.ageSec, cur.eventAgeSec)}`);
@@ -1656,6 +1710,9 @@ async function cmdLineage(arg: string | undefined, f: Record<string, string | bo
       }
       l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
     }
+  } else if (cur?.source === "hermes") {
+    // The caller is a Hermes session (HERMES_SESSION_ID): its line comes from state.db.
+    l = buildHermesLineage(cur.projectDir, cur.sessionUuid, { all });
   } else {
     if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
     if (!isClaudeProjectDir(cur.projectDir)) {

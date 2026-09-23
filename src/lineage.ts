@@ -1,10 +1,11 @@
-import { openSync, readSync, closeSync, statSync, readdirSync, existsSync, createReadStream } from "node:fs";
+import { openSync, readSync, closeSync, statSync, readdirSync, createReadStream } from "node:fs";
 import { join, dirname } from "node:path";
 import { createInterface } from "node:readline";
 import { loadSources, transcriptRoots } from "./sources.js";
 import { encodeProjectDir, treeFiles, lastEventMs } from "./live.js";
 import { dur, zoneOffset } from "./time.js";
 import { stripEnvelope } from "./types.js";
+import { dirUnreadable, reachable } from "./unreadable.js";
 
 /**
  * Which session ids are ONE line of work.
@@ -255,20 +256,23 @@ function claudeRoots(): string[] {
   const seen = new Set<string>();
   for (const s of loadSources())
     if ((s.walk === "claude-tiers" || s.walk === "claude-home") && s.enabled)
-      for (const root of transcriptRoots(s)) if (existsSync(root)) seen.add(root);
+      for (const root of transcriptRoots(s)) if (reachable(root)) seen.add(root);
   return [...seen];
 }
 
+// An unreadable project directory made `lineage` answer "no session matches" about a
+// session that exists — reported now, ENOENT still quiet (#99). The cwd walk-up in
+// findSessions probes a directory per ancestor, and almost none of them exist.
 function jsonlIn(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(dir, e); return []; }
 }
 
 function subdirs(dir: string): string[] {
   try { return readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(dir, e); return []; }
 }
 
 export function isClaudeProjectDir(dir: string): boolean {

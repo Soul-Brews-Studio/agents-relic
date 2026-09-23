@@ -166,3 +166,78 @@ describe("repairing a shard indexed under the basename uid", () => {
     expect(t.skipped).toBe(found.length);
   });
 });
+
+describe("a re-key killed partway loses nothing (the #90 window)", () => {
+  /*
+   * The #58 repair re-imports files that are UNCHANGED on disk, so their manifest rows
+   * still match. The only sign they needed it is their old rows, and flush() deletes
+   * those before it inserts the new ones. A run killed in between used to leave those
+   * files skipped as unchanged on every later run, with 7 of these 9 events gone and
+   * no run that would ever bring them back.
+   *
+   * Each case throws at one commit, which ends flush() there exactly as a kill would.
+   * Nothing after that commit lands. Wherever the kill falls, ONE plain `index`
+   * afterwards must bring back every event on its tree-key uid, drop the legacy vector,
+   * and leave a shard that the run after it skips.
+   */
+  const legacyShard = async (name: string) => {
+    const root = join(tmp, name);
+    const found = writeTree(join(tmp, `src-${name}`));
+    await importFiles(found, { dataRoot: root, inRepo: false, skipNoise: false });
+    const { store, rows } = await shape(root);
+    for (const f of found) await store.deleteEventsOf(f.path);
+    for (const f of found)
+      await store.putEvents(rows.filter(r => r.file_path === f.path)
+        .map(r => ({ ...r, uid: uidOf("claude", basename(r.file_path), Number(r.seq)) })));
+    const nested = found.find(f => f.tier === "workflow_agent")!;
+    await store.putVectors([{ uid: uidOf("claude", basename(nested.path), 1), embedding: [0.5, 0.5, 0.5, 0.5],
+                              model: "test", dim: 4, norm: "l2", embedded_at: "" }]);
+    return { root, found };
+  };
+
+  /**
+   * Make one store method throw on its nth matching call, as the process dying at that
+   * commit. `table` narrows upsert to one table. Returns the undo.
+   */
+  const killAt = (method: string, table?: string, nth = 1) => {
+    const proto = LanceStore.prototype as any, real = proto[method];
+    let calls = 0;
+    proto[method] = async function (this: unknown, ...args: unknown[]) {
+      if ((table === undefined || args[0] === table) && ++calls === nth)
+        throw new Error(`killed at ${method}${table ? `(${table})` : ""}`);
+      return real.apply(this, args);
+    };
+    return () => { proto[method] = real; };
+  };
+
+  // The batch deletes four files, one commit each: both members of each of the two groups.
+  const cases: [string, string, string?, number?][] = [
+    ["after the files are marked stale, before any row is deleted", "deleteVectors"],
+    ["after the legacy vectors are deleted, before the events", "deleteEventsOf"],
+    ["between two files' deletes: one group gone, the other intact", "deleteEventsOf", undefined, 3],
+    ["after the event deletes, before the insert (the reported window)", "upsert", "events"],
+    ["after the insert, before the session rows", "upsert", "sessions"],
+    ["after the session rows, before the files rows", "upsert", "files"],
+  ];
+
+  for (const [i, [when, method, table, nth]] of cases.entries()) {
+    test(`killed ${when}: the next plain index restores every event`, async () => {
+      const { root, found } = await legacyShard(`kill-${i}`);
+      const undo = killAt(method, table, nth);
+      try {
+        await expect(importFiles(found, { dataRoot: root, inRepo: false, skipNoise: false })).rejects.toThrow(/^killed at/);
+      } finally { undo(); }
+
+      await importFiles(found, { dataRoot: root, inRepo: false, skipNoise: false });
+      const s = await shape(root);
+      expect(s.texts.sort()).toEqual([...ALL_TEXTS].sort());
+      expect(s.events).toBe(s.counted);
+      for (const r of s.rows) expect(r.uid).toBe(uidOf("claude", treeKeyOf(r.file_path), Number(r.seq)));
+      expect((await s.store.embeddedUids()).size).toBe(0);
+
+      const again = await importFiles(found, { dataRoot: root, inRepo: false, skipNoise: false });
+      expect(again.imported).toBe(0);
+      expect(again.skipped).toBe(found.length);
+    });
+  }
+});

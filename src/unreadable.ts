@@ -17,6 +17,13 @@ import { clearLine } from "./progress.js";
  * already reported gets none: it is the same failure again, and an unreadable project
  * directory would otherwise report itself once for every probe made inside it.
  *
+ * ENAMETOOLONG is absence too: the kernel saying no such name can exist here. `tail`
+ * and `lineage` probe a directory named after the encoded cwd, and a deep cwd encodes
+ * past the limit. The limit is not one number: measured on APFS it is 255 CHARACTERS
+ * (a 200-character Thai name is 600 bytes and fine), while ext4's is 255 BYTES, where
+ * a Thai path gets there three times sooner. No length check can know which filesystem
+ * it is on; the error does.
+ *
  * Two kinds, both of which drop data:
  *
  *   dir-unreadable   a directory could not be listed or reached — nothing under it is seen
@@ -27,6 +34,9 @@ export type WalkRule = "dir-unreadable" | "walk-error";
 export const WALK_RULES: readonly string[] = ["dir-unreadable", "walk-error"];
 
 export interface WalkFailure { rule: WalkRule; path: string; error: string; ts: string }
+
+/** The errors that mean "not there", as opposed to "there and unreadable". See above. */
+const ABSENT = new Set(["ENOENT", "ENAMETOOLONG"]);
 
 /*
  * Printing and collecting are scoped differently, on purpose. stderr hears about a
@@ -56,7 +66,7 @@ function describe(err: unknown): string {
 }
 
 function report(rule: WalkRule, path: string, err: unknown): void {
-  if ((err as { code?: string } | null)?.code === "ENOENT") return;
+  if (ABSENT.has(String((err as { code?: string } | null)?.code))) return;
   if (covered(collected, path)) return;
   const error = describe(err);
   collected.set(path, { rule, path, error, ts: new Date().toISOString() });
