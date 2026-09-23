@@ -78,6 +78,15 @@ class EventRow(LanceModel):
     dir: str
     mem_type: str
     origin_session: str
+    # Channel facets (#85, #86) — see EventRow in src/store/lance.ts for why `via` sits
+    # beside `source` rather than inside `kind`. Defaulted, like no other column here,
+    # because they are "" on every row that did not arrive through a channel plugin.
+    via: str = ""          # the envelope's `source`, verbatim
+    chat_id: str = ""
+    msg_id: str = ""
+    from_user: str = ""
+    from_user_id: str = ""
+    sent_ts: str = ""      # the sender's clock; `ts` is the transcript's
 
 
 class SessionRow(LanceModel):
@@ -105,6 +114,10 @@ class SessionRow(LanceModel):
     title: str
     git_branch: str
     imported_at: str
+    # Distinct values from the session's channel turns, most frequent first, comma-joined.
+    via: str = ""
+    chat_id: str = ""
+    from_users: str = ""
 
 
 class FileRow(LanceModel):
@@ -305,6 +318,9 @@ class ParsedEvent(BaseModel):
     # Optional because only the Claude shape records cwd per line; codex, vault, omp
     # and hermes have one cwd per file or none, and the importer falls back.
     cwd: Optional[str] = None
+    # Who sent this turn, from which room, when — set only on a user turn that OPENS with a
+    # channel envelope (see parse_channel_envelope). `text` keeps the envelope.
+    channel: Optional[dict] = None
 
 
 ParsedFile.model_rebuild()

@@ -1,6 +1,6 @@
 import { LanceStore, sqlStr, type EventRow } from "./store/lance.js";
 import { pickShards, resolveSession, nameOf, type Scope } from "./query.js";
-import { isHostPreamble } from "./types.js";
+import { isHostPreamble, saidText } from "./types.js";
 
 /**
  * What HAPPENED in one session, as a projection of indexed rows.
@@ -139,7 +139,8 @@ export async function sessionRecap(
     roles.set(role, (roles.get(role) ?? 0) + 1);
     if (role === "user") {
       if (isHarnessTurn(text)) { askedOmitted++; continue; }
-      asked.push({ ts: String(e.ts ?? ""), text: clean(text).slice(0, chars) });
+      // A channel turn reads as `nazt_ (discord): yo` — its envelope alone is past `chars`.
+      asked.push({ ts: String(e.ts ?? ""), text: clean(saidText(text)).slice(0, chars) });
     } else if (role === "tool_use") {
       const n = text.match(TOOL)?.[1];
       if (n) tools.set(n, (tools.get(n) ?? 0) + 1);

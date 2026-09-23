@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from .models import Scope
+from .types import parse_channel_envelope
 
 VERSION = "26.9.18"
 
@@ -59,6 +60,11 @@ TOOLS = [
             "limit": _num("Max hits (default 20)."),
             "all_tiers": {"type": "boolean", "description":
                           "Include subagent and workflow_agent transcripts (73% of the corpus)."},
+            "via": _str("Channel turns only: substring of the plugin a turn came in by — the "
+                        "envelope's `source`, verbatim, so 'discord' matches plugin:discord:discord "
+                        "and arra-oracle-discord. Case-blind."),
+            "chat": _str("Channel turns only: substring of the room or thread id (chat_id)."),
+            "from_user": _str("Channel turns only: substring of who sent the turn, e.g. 'nazt_'."),
         }, "required": ["query"]},
     },
     {
@@ -139,6 +145,33 @@ TOOLS = [
 ]
 
 
+def _facet_arg(name: str, v) -> Optional[str]:
+    """Mirror of facetArg in src/query.ts: a number is converted, a bare flag or an empty
+    value refused — inside the fan-out either one used to read as \"no matches\"."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"{name} needs a value, e.g. {name} discord")
+    # Python's json keeps an int exact, so unlike the TypeScript side a whole chat id sent
+    # as a number is fine. A float is not exact, and a dict or list would be searched for
+    # as its repr.
+    if not isinstance(v, (str, int)):
+        raise ValueError(f"{name} must be a string")
+    out = str(v).strip()
+    if not out:
+        raise ValueError(f"{name} needs a non-empty value")
+    return out
+
+
+def _channel_head(c: dict) -> str:
+    """Mirror of channelHead(c, {full: true}) in src/query.ts: every id whole, because a
+    model replying through the channel plugin addresses the exact chat_id and message_id."""
+    who = c["from_user"] + (f" (user_id {c['from_user_id']})" if c["from_user_id"] else "") if c["from_user"] else ""
+    parts = [who, f"via {c['via']}", c["chat_id"] and f"chat_id {c['chat_id']}",
+             c["msg_id"] and f"message_id {c['msg_id']}", c["sent_ts"] and f"sent {c['sent_ts']}"]
+    return " · ".join(p for p in parts if p)
+
+
 def _scope(a: dict) -> Scope:
     import os
     return Scope(data_root=os.environ.get("RELIC_DATA_ROOT") or None,
@@ -183,20 +216,32 @@ def run(name: str, a: dict) -> str:
             return "relic_search needs a non-empty query"
         if not pick_shards(scope):
             return "no shards match — call relic_status to see what is indexed"
+        try:
+            facets = {k: _facet_arg(k, a.get(k)) for k in ("via", "chat", "from_user")}
+        except ValueError as e:
+            return f"relic_search: {e}"
         limit = int(a.get("limit") or 20)
-        res = search_events(q, scope, limit=limit, all_tiers=bool(a.get("all_tiers")))
+        res = search_events(q, scope, limit=limit,
+                            all_tiers=bool(a.get("all_tiers")), **facets)
+        note = (f'{res["unfaceted_turns"]} channel turns in {res["unfaceted"]} of {res["shards"]} shards '
+                f'predate channel facets and cannot match via/chat/from_user until '
+                f'`relic index --backfill-channel --apply` fills them') if res.get("unfaceted") else ""
         if not res["hits"]:
-            return f'no matches for "{q}" across {res["shards"]} shards ({res["ms"]} ms)'
+            return f'no matches for "{q}" across {res["shards"]} shards ({res["ms"]} ms)' + (f"\n{note}" if note else "")
         narrowed = "" if a.get("all_tiers") else \
             "  ·  main sessions only — pass all_tiers:true for subagent/workflow work"
         floor = floor_note(res["capped"], res["shards"], limit)
         L = [f'{match_count(len(res["hits"]), res["total"], res["capped"])} matches · '
              f'{res["shards"]} shards · {res["ms"]} ms{narrowed}',
-             *([f"{floor}. Pass repo or a higher limit for an exact count."] if floor else []), ""]
+             *([f"{floor}. Pass repo or a higher limit for an exact count."] if floor else []),
+             *([note] if note else []), ""]
         for h in res["hits"]:
             L.append(f"{h.repo}{' [' + h.worktree + ']' if h.worktree else ''} · "
                      f"{h.source}/{h.tier} · {h.role} · {h.ts}")
-            L.append(f"  ...{' '.join(h.text.split())[:260]}...")
+            c = parse_channel_envelope(h.text) if h.role == "user" else None
+            if c:
+                L.append(f"  {_channel_head(c)}")
+            L.append(f"  ...{' '.join((c['body'] if c else h.text).split())[:260]}...")
             L.append(f"  relic_show  file={h.file_path}  seq={int(h.seq)}")
             L.append("")
         return "\n".join(L)

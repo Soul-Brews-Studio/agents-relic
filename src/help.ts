@@ -25,6 +25,13 @@ export function helpText(): string {
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
+          [--backfill-channel [--apply] [--names] [--bank B] [--repo S]]
+                               fill the channel facets of turns indexed before they
+                               existed, IN PLACE: read from the stored text, written
+                               back by uid — nothing deleted, re-imported or re-read.
+                               DRY BY DEFAULT: counts first; --apply writes that plan.
+                               --names also re-reads transcripts whose session name is
+                               still an envelope tag, and rewrites only that row.
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.
@@ -44,6 +51,9 @@ export function helpText(): string {
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
+                  [--via S] [--chat S] [--from-user S]  channel turns only: which plugin
+                  it came in by (discord matches plugin:discord:discord), which room or
+                  thread id, who sent it. Substrings, case-blind.
                   [--semantic] nearest-neighbour over relic-embed vectors instead of
                   BM25. A separate MODE, never blended: measured here, FTS wins
                   known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.

@@ -63,6 +63,24 @@ export interface EventRow {
   // in all seven tools.
   mem_type: string;       // project | feedback | reference | user
   origin_session: string; // the session that produced this memory — the join key
+  /*
+   * CHANNEL FACETS — who sent a turn, from which room, on whose clock (#85, #86).
+   * Parsed at import from a channel plugin's envelope; "" on every other row, the same
+   * trade the memory columns make, for the same reason.
+   *
+   * `via` sits BESIDE `source`, never inside `kind`. `source` is the transcript's
+   * format and `kind` is what a row IS; a turn typed into Discord is still a transcript
+   * turn. Folding the front door into either puts two axes in one column, which is the
+   * tier/kind mistake above. Stored verbatim — nine distinct values in the live index
+   * on m5, among them arra-oracle-discord, mqtt and oracle-inbox; a normaliser would be
+   * guessing at the tenth.
+   */
+  via: string;            // the envelope's source: plugin:discord:discord | mqtt | …
+  chat_id: string;        // which channel or thread
+  msg_id: string;         // the upstream message_id
+  from_user: string;      // who typed it
+  from_user_id: string;
+  sent_ts: string;        // THEIR clock; `ts` is when the transcript was written
 }
 
 export interface SessionRow {
@@ -74,6 +92,13 @@ export interface SessionRow {
   started_at: string; ended_at: string; description: string; imported_at: string;
   title: string;   // the host's own session name; "" when it wrote none
   git_branch: string;
+  /*
+   * The rooms a session lived in and who spoke there: distinct values from its channel
+   * turns, most frequent first, comma-joined. Lists, because one session commonly
+   * spans rooms — measured on m5, 61 of 95 channel transcripts carry more than one
+   * chat_id and 21 more than one sender. "" when nothing arrived by channel.
+   */
+  via: string; chat_id: string; from_users: string;
 }
 
 /** (path, mtime, size) is the import-diff identity — no content hashing. */
@@ -459,7 +484,7 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean; via?: string; chat?: string; fromUser?: string } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     // `--limit 0` means "all" — recap teaches that idiom in its own footer, and honours it
@@ -470,6 +495,22 @@ export class LanceStore {
     let limit = opts.limit ?? 20;
     if (limit <= 0) limit = Math.max(await t.countRows(), 1);
     const filters: string[] = [];
+    /*
+     * CHANNEL FACETS, probed like `kind` below: a shard indexed before they existed has
+     * no such column, and naming one in a filter is a hard error there. That shard holds
+     * no facets, so a facet filter matches nothing in it — an empty answer, not an error
+     * the fan-out would swallow. Substring and case-blind: `--via discord` is both
+     * plugin:discord:discord and arra-oracle-discord.
+     *
+     * strpos, not LIKE: a username is `nazt_`, and in a LIKE pattern `_` matches any
+     * character and `%` matches everything, so `--from-user nazt_` also found `naztX`.
+     */
+    const facets = ([["via", opts.via], ["chat_id", opts.chat], ["from_user", opts.fromUser]] as const)
+      .filter(([, v]) => v);
+    if (facets.length) {
+      if ((await this.missingColumns("events", facets.map(([c]) => c)))?.length) return [];
+      for (const [c, v] of facets) filters.push(`strpos(lower(${c}), ${sqlStr(String(v).toLowerCase())}) > 0`);
+    }
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
     /*
      * The "main" default: the human's own thread plus documents, excluding the
@@ -896,6 +937,88 @@ export class LanceStore {
     return await t.query().where("tier = 'memory'")
       .select(["session_uuid", "file_path", "mem_type", "origin_session", "ts", "text"])
       .toArray() as any;
+  }
+
+  /**
+   * Which of these columns the table lacks: [] when it has them all, null when there is
+   * no such table. A filter or select naming a missing column is a hard error.
+   */
+  async missingColumns(table: string, cols: string[]): Promise<string[] | null> {
+    const t = await this.existing(table);
+    if (!t) return null;
+    const have = new Set((await t.schema()).fields.map(f => f.name));
+    return cols.filter(c => !have.has(c));
+  }
+
+  /**
+   * Every user row holding `<channel`, WHOLE — what `index --backfill-channel` reads.
+   *
+   * `%<channel%`, not a prefix: the parser accepts leading whitespace, so SQL only narrows
+   * and parseChannelEnvelope decides; quoted envelopes come back too and are rejected
+   * there. Whole rows, and plain objects, because the backfill writes each one back
+   * exactly as it was read with only its facets set.
+   */
+  async channelRows(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'`).toArray()).map(r => ({ ...r }));
+  }
+
+  /**
+   * Texts of user rows holding `<channel` that carry no facets — the caller counts the
+   * deliveries among them. Read from the DATA, not the schema: one ordinary index run
+   * widens an old shard, and from then on its schema says "faceted" while every older
+   * channel row in it still says via = "".
+   */
+  async unfacetedChannelTexts(): Promise<string[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const faceted = (await this.missingColumns("events", ["via"]))?.length === 0;
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'` + (faceted ? ` AND via = ''` : ""))
+      .select(["text"]).toArray()).map(r => String(r.text));
+  }
+
+  /**
+   * Session rows whose stored name still opens with an envelope tag — written before #92.
+   * A prefix test by strpos, not LIKE: in `<hook_prompt%` the `_` matches any character.
+   */
+  async namedByEnvelope(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    return (await t.query()
+      .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `strpos(description, ${sqlStr(p)}) = 1`).join(" OR "))
+      .toArray()).map(r => ({ ...r }));
+  }
+
+  /** Session rows for these files, as plain objects — chunked, like every IN (...) here. */
+  async sessionsOf(paths: string[]): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const out: SessionRow[] = [];
+    for (let i = 0; i < paths.length; i += 200)
+      for (const r of await t.query().where(`file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`).toArray())
+        out.push({ ...r } as unknown as SessionRow);
+    return out;
+  }
+
+  /**
+   * Rewrite rows that already exist, matched on `key`: never an insert, never a delete.
+   *
+   * The backfill's only write. Each row is one that was just read, put back with a field
+   * or two set, in ONE commit — so a run killed at any point leaves every row either as
+   * it was or as it should be, and nothing gone. The re-import it replaces deleted a
+   * file's rows in one commit and wrote them back in the next; killed in between, they
+   * were lost, and the unchanged manifest kept `index` from ever re-reading the file.
+   *
+   * No insert branch on purpose: a row that vanished since the read (an index run replaced
+   * its file) is simply not matched, where an upsert would bring it back.
+   */
+  async updateRows(name: "events" | "sessions", key: string, rows: Record<string, unknown>[]): Promise<void> {
+    if (!rows.length) return;
+    const t = await this.existing(name);
+    if (!t) return;
+    await this.widen(name, t, rows[0]);
+    await (await this.existing(name))!.mergeInsert(key).whenMatchedUpdateAll().execute(rows);
   }
 
   /** The session ids this shard holds — the right-hand side of the memory join. */

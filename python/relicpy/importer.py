@@ -24,6 +24,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _facets(c: Optional[dict]) -> dict[str, str]:
+    """The six EventRow facet columns from a parsed envelope — all "" for any other row."""
+    c = c or {}
+    return {k: c.get(k, "") for k in ("via", "chat_id", "msg_id", "from_user", "from_user_id", "sent_ts")}
+
+
 def kind_of(tier: str, source: str) -> str:
     """The second axis, split out of `tier`. Source decides before tier, because
     hermes rows carry tier "session" while being chat messages."""
@@ -34,6 +40,21 @@ def kind_of(tier: str, source: str) -> str:
     if tier == "memory":
         return "memory"
     return "transcript"
+
+
+def rooms_of(channels) -> dict[str, str]:
+    """Mirror of roomsOf in src/import.ts: a session's rooms and senders from its channel
+    turns — distinct values, most frequent first (ties in first-seen order), comma-joined."""
+    tally: dict[str, dict[str, int]] = {"via": {}, "chat_id": {}, "from_users": {}}
+    for c in channels:
+        if not c:
+            continue
+        for col, key in (("via", "via"), ("chat_id", "chat_id"), ("from_users", "from_user")):
+            v = c.get(key) or ""
+            if v:
+                tally[col][v] = tally[col].get(v, 0) + 1
+    return {col: ",".join(v for v, _ in sorted(m.items(), key=lambda kv: -kv[1]))
+            for col, m in tally.items()}
 
 
 class Shards:
@@ -220,6 +241,7 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
                 worktree=ctx["worktree"], cwd=e.cwd or p.cwd or "",
                 org=loc["org"], project=loc["project"], dir=loc["dir"],
                 mem_type=p.mem_type, origin_session=p.origin_session_id,
+                **_facets(e.channel),
             ) for e in p.events]
 
             b = pending.get(shard_key)
@@ -240,6 +262,7 @@ def import_files(found: list[Found], *, data_root: Optional[str] = None,
                 started_at=p.started_at or "", ended_at=p.ended_at or "",
                 description=p.description or "", title=p.title or "",
                 git_branch=p.git_branch or "", imported_at=_now_iso(),
+                **rooms_of(e.channel for e in p.events),
             ))
             b.files.append(FileRow(file_path=f.path, repo_key=repo_col,
                                    mtime=float(f.mtime), size=float(f.size),

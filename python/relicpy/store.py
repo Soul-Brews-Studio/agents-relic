@@ -260,6 +260,42 @@ class LanceStore:
                 clause = f"({clause}) AND ({where})"
             return t.search().where(clause).limit(limit).to_list()
 
+    def missing_columns(self, table: str, cols: list[str]) -> Optional[list[str]]:
+        """Which of these columns the table lacks — [] when it has them all, None when there
+        is no such table. Mirror of missingColumns in src/store/lance.ts: a filter naming a
+        missing column is a hard error, not an empty result."""
+        t = self._existing(table)
+        if t is None:
+            return None
+        have = set(t.schema.names)
+        return [c for c in cols if c not in have]
+
+    def facet_filter(self, via: Optional[str] = None, chat: Optional[str] = None,
+                     from_user: Optional[str] = None) -> Optional[str]:
+        """The channel-facet predicate for this shard: "" when no facet was asked for, None
+        when the shard cannot match one because it predates the columns.
+
+        strpos, not LIKE, as in the TypeScript: a username is `nazt_`, and in a LIKE
+        pattern `_` matches any character and `%` matches everything."""
+        facets = [(c, v) for c, v in (("via", via), ("chat_id", chat), ("from_user", from_user)) if v]
+        if not facets:
+            return ""
+        if self.missing_columns("events", [c for c, _ in facets]):
+            return None
+        q = lambda v: "'" + v.lower().replace("'", "''") + "'"          # noqa: E731
+        return " AND ".join(f"strpos(lower({c}), {q(str(v))}) > 0" for c, v in facets)
+
+    def unfaceted_channel_texts(self) -> list[str]:
+        """Texts of user rows holding `<channel` with no facets — the caller counts the
+        deliveries among them. From the rows, not the schema: one ordinary index run widens
+        an old shard, and its older channel rows still hold via = ""."""
+        t = self._existing("events")
+        if t is None:
+            return []
+        faceted = self.missing_columns("events", ["via"]) == []
+        where = "role = 'user' AND text LIKE '%<channel%'" + (" AND via = ''" if faceted else "")
+        return [str(r.get("text") or "") for r in t.search().where(where).select(["text"]).limit(0).to_list()]
+
     def main_tiers_filter(self) -> str:
         """The "main" predicate: the human's own thread, plus documents.
 
@@ -497,7 +533,29 @@ class LanceStore:
         if t is None:
             self.db.create_table(name, data=data, schema=model.to_arrow_schema())
             return
+        if self._widen(t, data[0]):
+            t = self._existing(name)      # reopen: the handle predates the new columns
         t.merge_insert(key).when_matched_update_all().when_not_matched_insert_all().execute(data)
+
+    def _widen(self, t, row: dict) -> bool:
+        """Mirror of widen() in src/store/lance.ts: add the columns a row has and the table
+        lacks, backfilled with a scalar default. Without it every shard indexed before a
+        column existed rejects the WHOLE batch — "Field 'via' not found in target schema".
+
+        Scalars only, like the TypeScript: add_columns backfills a scalar default, and a
+        list column added that way lands as text. Numbers get 0.0, because every number on
+        disk is float64 (see models.py).
+        """
+        have = set(t.schema.names)
+        missing = [k for k in row if k not in have]
+        if not missing:
+            return False
+        for k in missing:
+            if isinstance(row[k], bool) or not isinstance(row[k], (str, int, float)):
+                raise ValueError(f"lance: refusing to widen with non-scalar column {k!r} "
+                                 f"({type(row[k]).__name__}) — create a table with the right schema")
+        t.add_columns({k: "''" if isinstance(row[k], str) else "0.0" for k in missing})
+        return True
 
     def delete_events_of(self, file_path: str) -> None:
         """Drop a file's rows before its new generation lands, or the two coexist."""
