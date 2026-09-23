@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import { join, dirname, resolve, isAbsolute } from "node:path";
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { dirUnreadable } from "./unreadable.js";
 
 /**
  * Map a session's cwd to the repo that owns it — "github.com/<org>/<repo>".
@@ -59,21 +60,35 @@ export function repoIndex(): Map<string, string[]> {
   if (repoIndexCache) return repoIndexCache;
   const out = new Map<string, string[]>();
   const host = join(ghqRoot(), "github.com");
-  try {
-    for (const org of readdirSync(host, { withFileTypes: true })) {
-      if (!org.isDirectory()) continue;
-      for (const repo of readdirSync(join(host, org.name), { withFileTypes: true })) {
-        if (!repo.isDirectory()) continue;
-        const name = normalizeRepo(repo.name);
-        const key = `github.com/${org.name}/${name}`;
-        const prior = out.get(name) ?? [];
-        if (!prior.includes(key)) prior.push(key);
-        out.set(name, prior);
-      }
+  /*
+   * One listing per directory, not one try around the whole walk. The single try read
+   * "no ghq root here" correctly, and still does — ENOENT is quiet — but it also turned
+   * ONE unreadable org into the end of the walk: every org listed after it vanished
+   * from the index, and their repos fell back to `_unresolved` in silence (#99).
+   */
+  for (const org of listing(host)) {
+    if (!org.isDirectory()) continue;
+    for (const repo of listing(join(host, org.name))) {
+      if (!repo.isDirectory()) continue;
+      const name = normalizeRepo(repo.name);
+      const key = `github.com/${org.name}/${name}`;
+      const prior = out.get(name) ?? [];
+      if (!prior.includes(key)) prior.push(key);
+      out.set(name, prior);
     }
-  } catch { /* no ghq root here — the fallbacks simply never fire */ }
+  }
   repoIndexCache = out;
   return out;
+}
+
+/**
+ * A directory's entries, or none — and a line on stderr when "none" is not "missing"
+ * (#99). listShards walks the index with it too: an unreadable bank or org used to make
+ * its shards vanish from every search and status without a word.
+ */
+function listing(p: string) {
+  try { return readdirSync(p, { withFileTypes: true }); }
+  catch (e) { dirUnreadable(p, e); return []; }
 }
 
 /** Exactly one repo of this name, or null. AMBIGUITY IS NOT RESOLVED BY GUESSING. */
@@ -481,13 +496,12 @@ export interface Shard {
  */
 export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
   const out: Shard[] = [];
-  const ls = (p: string) => { try { return readdirSync(p, { withFileTypes: true }); } catch { return []; } };
   // `.lance` is a LanceDB TABLE directory. A pre-bank in-repo shard is
   // `<repo>/.relic/{events,sessions,files}.lance`, and without this filter each of those
   // enumerates as a bank whose store opens fine with zero tables — three phantom 0-row
   // shards per legacy repo, inflating every "shards searched" count.
   const banks = (p: string) =>
-    ls(p).filter(e => e.isDirectory() && !e.name.startsWith(".") && !e.name.endsWith(".lance"));
+    listing(p).filter(e => e.isDirectory() && !e.name.startsWith(".") && !e.name.endsWith(".lance"));
 
   if (!dataRoot && !inRepo) dataRoot = defaultRoot();
 
@@ -498,9 +512,9 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
       for (const host of banks(base)) {
         if (host.name === "_unresolved") continue;
         const gh = join(base, host.name);
-        for (const org of ls(gh)) {
+        for (const org of listing(gh)) {
           if (!org.isDirectory()) continue;
-          for (const repo of ls(join(gh, org.name))) {
+          for (const repo of listing(join(gh, org.name))) {
             if (!repo.isDirectory()) continue;
             const key = `${host.name}/${org.name}/${repo.name}`;
             out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name), bank: bank.name, repo: key });
@@ -515,11 +529,11 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
 
   const root = ghqRoot();
   // Domain-named dirs only: the ghq root also holds plain checkouts, and walking those two levels deep costs readdirs for nothing.
-  for (const host of ls(root).filter(e => e.isDirectory() && e.name.includes(".") && !e.name.startsWith("."))) {
+  for (const host of listing(root).filter(e => e.isDirectory() && e.name.includes(".") && !e.name.startsWith("."))) {
     const gh = join(root, host.name);
-    for (const org of ls(gh)) {
+    for (const org of listing(gh)) {
       if (!org.isDirectory()) continue;
-      for (const repo of ls(join(gh, org.name))) {
+      for (const repo of listing(join(gh, org.name))) {
         if (!repo.isDirectory()) continue;
         const key = `${host.name}/${org.name}/${repo.name}`;
         // in-repo: the bank sits INSIDE the checkout's .relic/, so one repo can hold

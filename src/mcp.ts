@@ -297,6 +297,11 @@ async function run(name: string, a: any): Promise<string> {
     const cur = await currentSession(a?.cwd ? String(a.cwd) : undefined);
     if (!cur) return `no session transcript for ${a?.cwd ?? "the current directory"}\n` +
                      `call again with all=true to see every active session`;
+    // A row in state.db named by HERMES_SESSION_ID. Hermes strips that variable from the
+    // env it gives MCP servers, so this is only reached from a shell that carries it.
+    if (cur.source === "hermes")
+      return [cur.title ?? "(untitled)", `${cur.sessionUuid} · last message ${humanAge(cur.eventAgeSec ?? cur.ageSec)} ago`,
+              cur.confident ? cur.cwd : "(no cwd recorded — a gateway session)", `hermes  ${cur.projectDir}`].join("\n");
 
     const all = treeFiles(cur.projectDir, cur.sessionUuid);
     const agents = all.filter(x => x.tier !== "session" && x.ageSec <= windowSec);

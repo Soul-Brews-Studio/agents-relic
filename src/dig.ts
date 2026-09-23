@@ -5,6 +5,7 @@ import { resolveRepoKey, repoKeyOf } from "./repo.js";
 import { loadSources } from "./sources.js";
 import { localDateTime } from "./time.js";
 import { defaultRoot } from "./repo.js";
+import { dirUnreadable, reachable } from "./unreadable.js";
 
 /**
  * `dig` — the fleet's session-timeline scan, with the tier it was missing.
@@ -45,16 +46,18 @@ export type DigRow = DigEntry | { type: "gap"; gapMin?: number; label: string } 
 
 const GAP_THRESHOLD_MIN = 30;
 
+// An unreadable project directory used to read as "no sessions here" — reported now,
+// ENOENT still quiet (#99). See unreadable.ts.
 function jsonlIn(d: string): string[] {
   try {
     return readdirSync(d, { withFileTypes: true })
       .filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(d, e); return []; }
 }
 function dirsIn(d: string): string[] {
   try {
     return readdirSync(d, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(d, e); return []; }
 }
 
 interface Cand { path: string; dir: string; tier: string; run: string | null }
@@ -83,7 +86,7 @@ function collect(projectDirs: string[], deep: boolean): { files: Cand[]; skipped
 
     for (const uuid of dirsIn(d)) {
       const sub = join(d, uuid, "subagents");
-      if (!existsSync(sub)) continue;
+      if (!reachable(sub)) continue;
       for (const f of jsonlIn(sub)) keep({ path: join(sub, f), dir: d, tier: "subagent", run: null });
 
       // THE MISSING TIER.
