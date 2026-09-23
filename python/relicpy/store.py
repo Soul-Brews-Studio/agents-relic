@@ -396,6 +396,66 @@ class LanceStore:
         self.db.drop_table("vectors")
         return True
 
+    def vector_damage(self) -> Optional[dict]:
+        """Whether `vectors` still reads end to end, and if it does not, the newest
+        version that does. None means healthy, or no table. Mirrors
+        LanceStore.vectorDamage(), which has the measurements (#105).
+
+        In short: a data file that the current version references ends up 0 bytes, so
+        every scan fails while count_rows(), which reads only the manifest, still
+        answers. A kill alone did not produce that. Lance commits its manifest last, so a
+        killed commit leaves only unreferenced files, including 0-byte `.tmpXXXXXX`
+        staging files. That is why the check is a READ, not a file-size guess. The
+        newest readable version is found by bisection, since an embed only appends:
+        once a version references a damaged file, every later one does too.
+        """
+        t = self._existing("vectors")
+        if t is None:
+            return None
+
+        def reads(tbl) -> str:
+            try:
+                tbl.search().select(["uid"]).limit(0).to_arrow()
+                return ""
+            except Exception as err:          # noqa: BLE001 — any failed read is the finding
+                return str(err)
+
+        error = reads(t)
+        if not error:
+            return None
+        version, rows = t.version, t.count_rows()
+        # A second handle: checkout() is in place, and `t` must stay on the latest.
+        h = self.db.open_table("vectors")
+        older = sorted(v["version"] for v in h.list_versions() if v["version"] < version)
+
+        def reads_at(v: int) -> bool:
+            h.checkout(v)
+            return not reads(h)
+
+        if not older or not reads_at(older[0]):
+            return {"version": version, "rows": rows, "error": error, "restorable": None, "keep": 0}
+        lo, hi = 0, len(older)          # older[lo] reads; older[hi] (or `version`) does not
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if reads_at(older[mid]):
+                lo = mid
+            else:
+                hi = mid
+        h.checkout(older[lo])
+        return {"version": version, "rows": rows, "error": error,
+                "restorable": older[lo], "keep": h.count_rows()}
+
+    def repair_vectors(self, d: dict) -> str:
+        """Put a damaged `vectors` table back to a version that reads. When no version
+        reads, drop it. Restoring loses the least, because the anti-join re-embeds only
+        what that version lacks. restore() writes a NEW version, so the damaged ones stay
+        in the history. Either way only `vectors` is touched."""
+        if d["restorable"] is None:
+            self.drop_vectors()
+            return "dropped"
+        self.db.open_table("vectors").restore(d["restorable"])
+        return "restored"
+
     def _merge(self, name: str, model, key: str, rows: Iterable) -> None:
         data = [r.model_dump() for r in rows]
         if not data:

@@ -513,6 +513,12 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+A file that is being rewritten, whether it changed on disk or the #58 re-key is
+repairing it, has its manifest row marked stale **before** its old rows are deleted. A
+run killed partway through the rewrite leaves the file looking changed, and the next
+run finishes the job. Before this, a killed re-key left the file skipped as unchanged
+and its events gone, for good.
+
 ### `--source-path` — run one source against another root
 
 ```bash
@@ -1152,8 +1158,29 @@ already complete, and it is resumable, scoped, and free to skip.
 relic embed --dry-run                      # what would this cost? no provider call
 relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
 relic embed --model bge-m3 --reset         # change model: drops `vectors` first
+relic embed --repair --bank hermes         # a shard whose `vectors` no longer reads (#105)
 relic-py embed --provider st --model intfloat/multilingual-e5-small
 ```
+
+**An interrupted embed.** Re-running resumes it, because the anti-join is against what
+is on disk. A kill mid-write costs at most the batch in flight: Lance writes data files
+first and the manifest last. One state does not resume. That is a table whose current
+version references data files that are 0 bytes, which is what #105 hit. `countRows`
+still answers, but every scan fails. `embed` now says so and prints the one command
+that repairs that shard:
+
+```
+  hermes/_unresolved  SKIP  vectors table unreadable at v3 — LanceError(IO): Generic LocalFileSystem error: failed to fill whole buffer
+                            `events` and the full-text index are untouched. To repair this shard's vectors only:
+                              relic embed --repair --bank hermes --repo _unresolved
+                            that restores v1 (64 of 192 vectors) and re-embeds the rest
+```
+
+`--repair` bisects the table's versions for the newest one that reads and restores it,
+as a new version on top, so the history is kept. The same run then re-embeds what that
+version lacks. If no version reads, it drops that one shard's `vectors`, as `--reset`
+would. It never touches `events`, `sessions`, `files` or the full-text index, and it
+never touches a table that reads. A dry run never repairs.
 
 ```
 provider  ollama:all-minilm
