@@ -574,6 +574,9 @@ def cmd_index(a) -> int:
           f"built in {t.fts_ms/1000:.1f}s")
     if t.fts_upgraded:
         print(f"  fts:         {t.fts_upgraded} shard(s) rebuilt from `simple` to ICU")
+    if t.fts_drifted:
+        print(f"  fts:         {t.fts_drifted} shard(s) rebuilt — the old index dropped stop words, "
+              f"\"nas\" and \"bin\" among them (#97)")
     if t.fts_simple:
         print(f"  ! fts:       {len(t.fts_simple)} shard(s) on the `simple` tokenizer — this LanceDB "
               f"build has no ICU. Thai substring search degraded on this shard; a later run "

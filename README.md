@@ -1525,7 +1525,7 @@ SQL.
                        │  source  tier            │   push down into the FTS scan
                        └────────────┬─────────────┘
                                     │
-                            text_idx(text)          ICU · stem:false · maxToken 128
+                            text_idx(text)          ICU · stem:false · stop words kept · maxToken 128
                                     │
                                     ▼
                                BM25 search
@@ -1649,6 +1649,14 @@ word segmentation — verified with `table.tokenize()`:
 One store, one index, no query routing, no second thing to drift. `stem: false` is set
 deliberately — the English stemmer mangles identifiers (`structured_output_mode` →
 `structured_output_mod`).
+
+So is `removeStopWords: false`. LanceDB removes stop words by default, and under ICU the
+list is not English but 21 languages at once: 5,200 words, `nas`, `bin`, `min`, `var`
+and `del` among them. `relic search nas` answered 0 on an index where a rebuild without
+the filter finds 9,971 rows (#97). An index keeps the settings it was built with, so
+after a change like this run `relic index --fts-rebuild` once per machine. It rebuilds
+every shard on disk, including the ones a normal run never reaches: 1,136 shards in
+128 s here.
 
 ---
 

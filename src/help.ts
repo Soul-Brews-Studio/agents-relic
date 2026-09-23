@@ -18,6 +18,10 @@ export function helpText(): string {
   return `relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--keep-noise] [--dry-run] [--prune]
+          [--fts-rebuild]      rebuild the full-text index of EVERY shard on disk, every
+                               bank, and import nothing. Once per machine after an FTS
+                               setting changes: an index keeps the settings it was built
+                               with, and a run only reaches the shards it discovers.
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
