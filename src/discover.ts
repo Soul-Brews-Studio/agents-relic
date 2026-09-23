@@ -451,7 +451,8 @@ function progressLine(msg: string): void {
  * mtime changes constantly while its rows mostly do not, so keying on the file would
  * re-import every session on every run.
  */
-function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+/** Every Hermes state.db under a root — one per profile, at most 3 levels down. */
+export function hermesDbs(root: string): string[] {
   const dbs: string[] = [];
   const scan = (dir: string, depth: number) => {
     if (depth > 3) return;
@@ -459,8 +460,11 @@ function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: 
     for (const d of dirs(dir)) scan(join(dir, d), depth + 1);
   };
   scan(root, 0);
+  return dbs;
+}
 
-  for (const db of dbs) {
+function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  for (const db of hermesDbs(root)) {
     for (const s of hermesSessions(db)) {
       if (sinceMs && s.mtime * 1000 < sinceMs) continue;
       out.push({

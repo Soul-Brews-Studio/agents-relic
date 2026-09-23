@@ -56,6 +56,9 @@ export function helpText(): string {
                                the transcripts (SessionStart hook, the /clear turn, the
                                old file's final write), never the index. NO ID = this
                                session. --all draws every chain in the directory.
+                               A Hermes id links by state.db rows instead: a shared
+                               session_key is one line, a parent_session_id spawn is
+                               drawn as that parent's agents, never as continuation.
   read    <file> [--prose]     whole transcript as readable conversation, any format
   tail    [id|prefix|file] [-n 10] [--chars N] [--role user] [--flat] [--harness]
           [--handoff]          the block to paste as the next session's FIRST prompt:
