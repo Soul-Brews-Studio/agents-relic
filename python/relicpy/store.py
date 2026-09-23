@@ -16,6 +16,34 @@ import lancedb
 from .models import EventRow, FileRow, SessionRow, vector_row_model
 
 
+# The fallback index's NAME is the per-shard record — same name as src/store/fts.ts.
+SIMPLE_INDEX = "text_fts_simple"
+
+
+def _no_icu(err: Exception) -> bool:
+    return "unknown base tokenizer" in str(err).lower()
+
+
+def _create_fts(t, tokenizer: str, name: Optional[str]) -> None:
+    # EVERY ONE OF THESE MATCHES src/store/fts.ts, and each has a reason.
+    #
+    # base_tokenizer="icu" — real Thai word segmentation. Thai has no spaces, and
+    # `simple` splits on whitespace, so a whole Thai sentence becomes ONE token and
+    # nothing inside it is findable. I shipped `simple` here first: measured on one
+    # Thai sentence, the index could find 1 of 12 substrings against ICU's 11.
+    # ngram(3) is the other option and it MISSES 2-character queries entirely.
+    #
+    # stem=False — this is a CODE corpus and the English stemmer mangles
+    # identifiers: structured_output_mode -> structured_output_mod. The cost is
+    # that `sessions` no longer matches `session`, which is the right trade when a
+    # 3,000-event sample holds 354 distinct identifiers over 21 characters.
+    #
+    # max_token_length=128 — long identifiers and 64-char hashes survive whole.
+    t.create_fts_index("text", use_tantivy=False, base_tokenizer=tokenizer,
+                       stem=False, remove_stop_words=False, max_token_length=128,
+                       replace=True, name=name)
+
+
 class LanceStore:
     """A shard. Opened lazily; tables are created on first write, never on read.
 
@@ -373,26 +401,38 @@ class LanceStore:
         safe = file_path.replace("'", "''")
         t.delete(f"file_path = '{safe}'")
 
-    def ensure_fts_index(self) -> None:
+    def fts_tokenizer(self) -> Optional[str]:
+        """"icu", "simple" (Thai substring search degraded), or None when there is no index."""
         t = self._existing("events")
         if t is None:
-            return
-        for idx in t.list_indices():
-            if idx.index_type == "FTS":
-                return
-        # EVERY ONE OF THESE MATCHES src/store/lance.ts, and each has a reason.
-        #
-        # base_tokenizer="icu" — real Thai word segmentation. Thai has no spaces, and
-        # `simple` splits on whitespace, so a whole Thai sentence becomes ONE token and
-        # nothing inside it is findable. I shipped `simple` here first: measured on one
-        # Thai sentence, the index could find 1 of 12 substrings against ICU's 11.
-        # ngram(3) is the other option and it MISSES 2-character queries entirely.
-        #
-        # stem=False — this is a CODE corpus and the English stemmer mangles
-        # identifiers: structured_output_mode -> structured_output_mod. The cost is
-        # that `sessions` no longer matches `session`, which is the right trade when a
-        # 3,000-event sample holds 354 distinct identifiers over 21 characters.
-        #
-        # max_token_length=128 — long identifiers and 64-char hashes survive whole.
-        t.create_fts_index("text", use_tantivy=False, base_tokenizer="icu",
-                           stem=False, remove_stop_words=False, max_token_length=128)
+            return None
+        names = [i.name for i in t.list_indices() if "text" in i.columns]
+        if not names:
+            return None
+        return "icu" if any(n != SIMPLE_INDEX for n in names) else "simple"
+
+    def ensure_fts_index(self, rebuild: bool = False, create=None) -> Optional[dict]:
+        """Mirrors src/store/fts.ts; `create` is injectable so the no-ICU path is testable."""
+        t = self._existing("events")
+        if t is None:
+            return None
+        create = create or _create_fts
+        names = [i.name for i in t.list_indices() if "text" in i.columns]
+        simple = SIMPLE_INDEX in names
+        icu = any(n != SIMPLE_INDEX for n in names)
+        if icu and not rebuild:
+            if simple:
+                t.drop_index(SIMPLE_INDEX)  # an upgrade interrupted between create and drop
+            return {"tokenizer": "icu", "built": False}
+        try:
+            create(t, "icu", None)
+        except Exception as err:
+            if not _no_icu(err):
+                raise
+            if simple and not rebuild:
+                return {"tokenizer": "simple", "built": False, "fell_back": str(err)}
+            create(t, "simple", SIMPLE_INDEX)
+            return {"tokenizer": "simple", "built": True, "fell_back": str(err)}
+        if simple:
+            t.drop_index(SIMPLE_INDEX)
+        return {"tokenizer": "icu", "built": True, "upgraded": simple}

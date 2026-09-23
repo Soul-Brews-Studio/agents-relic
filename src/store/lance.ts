@@ -1,6 +1,7 @@
 import * as lancedb from "@lancedb/lancedb";
 import { Index } from "@lancedb/lancedb";
 import { mkdirSync } from "node:fs";
+import { ensureFtsIndex as ensureFts, tokenizerOf, type FtsOutcome, type Tokenizer } from "./fts.js";
 
 /**
  * The only store. LanceDB holds events, sessions and the manifest; there is no
@@ -319,30 +320,16 @@ export class LanceStore {
    * (The "tantivy is 10-200x slower than FTS5" note in lance-indexer predates this
    * engine. Re-measured here, FTS is 7-28x FASTER than the LIKE scan it replaced.)
    */
-  async ensureFtsIndex(): Promise<void> {
+  async ensureFtsIndex(opts: { rebuild?: boolean } = {}, config?: (tok: Tokenizer) => Index): Promise<FtsOutcome | null> {
     const t = await this.existing("events");
-    if (!t) return;
-    const has = (await t.listIndices()).some(i => i.columns.includes("text"));
-    if (has) return;
-    await t.createIndex("text", {
-      config: Index.fts({
-        baseTokenizer: "icu",
+    if (!t) return null;
+    return ensureFts(t, opts, config);
+  }
 
-        // stem:false — this is a CODE corpus, and the English stemmer mangles identifiers.
-        // Proven with table.tokenize():
-        //   stem:true    structured_output_mode -> structured_output_mod
-        //                CLAUDE_..._AGENT_TEAMS -> claude_..._agent_team
-        //   stem:false   both exact
-        // The cost is that `sessions` no longer matches `session`. That is the right
-        // trade here: a 3,000-event sample held 354 distinct identifiers over 21 chars
-        // (env vars, git SHAs, index names), and searching for a precise identifier is
-        // the common case — searching for an English plural is not.
-        stem: false,
-
-        // Long identifiers and 64-char hashes must survive whole.
-        maxTokenLength: 128,
-      }),
-    });
+  /** "simple" marks a shard where Thai substring search is degraded; null = no index, LIKE scan. */
+  async ftsTokenizer(): Promise<Tokenizer | null> {
+    const t = await this.existing("events");
+    return t ? tokenizerOf(t) : null;
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
