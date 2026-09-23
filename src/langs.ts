@@ -123,6 +123,8 @@ export interface LangsOpts extends Scope {
   mainTiers?: boolean;
   minChars?: number;
   maxChars?: number;
+  /** The CLI flags that set this scope, echoed into every printed embed command. */
+  scopeArgs?: string[];
   onProgress?: (done: number, total: number, key: string) => void;
 }
 
@@ -141,15 +143,17 @@ export interface LangsResult {
   byRole: Record<string, { events: number; thai: number }>;
   scripts: Scripts;         // letters, summed over every sampled slice
   vectors: VectorsOnDisk[];
+  scopeArgs: string[];
   ms: number;
 }
 
-export function emptyLangs(o: { sample?: number; mainTiers?: boolean; minChars?: number; maxChars?: number } = {}): LangsResult {
+export function emptyLangs(o: { sample?: number; mainTiers?: boolean; minChars?: number; maxChars?: number; scopeArgs?: string[] } = {}): LangsResult {
   const sample = o.sample ?? 64;
   return {
     shards: 0, read: 0, failed: [], sample, rate: sampleWhere(sample).rate,
     mainTiers: o.mainTiers ?? true, minChars: o.minChars ?? 24, maxChars: o.maxChars ?? 2000,
-    events: 0, estimated: 0, byLang: {}, anyThai: 0, byRole: {}, scripts: zero(), vectors: [], ms: 0,
+    events: 0, estimated: 0, byLang: {}, anyThai: 0, byRole: {}, scripts: zero(), vectors: [],
+    scopeArgs: o.scopeArgs ?? [], ms: 0,
   };
 }
 
@@ -178,8 +182,8 @@ export async function scanLangs(o: LangsOpts = {}): Promise<LangsResult> {
     o.onProgress?.(i + 1, shards.length, sh.key);
     try {
       const store = await LanceStore.open(sh.dir);
-      const rows = await store.langRows({ where, mainTiers: r.mainTiers, minChars: r.minChars });
-      for (const row of rows) tallyLang(r, row.role, row.text.slice(0, r.maxChars));
+      const rows = await store.langRows({ where, mainTiers: r.mainTiers, minChars: r.minChars, maxChars: r.maxChars });
+      for (const row of rows) tallyLang(r, row.role, row.text);
       const v = await store.vectorStats();
       if (v && v.rows > 0) {
         const k = `${v.model}|${v.dim}`;
@@ -210,12 +214,23 @@ export const MULTILINGUAL_AT = 0.01;
 
 export interface Candidate extends MeasuredModel { gib: number }
 
+/**
+ * How a model already on disk relates to this corpus. `unmeasured` is not a verdict:
+ * a model relic has no numbers for is not therefore English-only, and calling it that
+ * would advise a --reset nobody can justify.
+ */
+export type Fit = "fits" | "english-only" | "unmeasured";
+
+export interface OnDisk { model: string; dim: number; fit: Fit; shards: number; keys: string[] }
+
 export interface Recommendation {
   verdict: "multilingual" | "english";
   thaiShare: number;        // anyThai / events
   otherShare: number;       // events whose dominant script is neither Latin nor Thai
   reason: string;
-  current: { model: string; dim: number; ok: boolean; shards: number; keys: string[] }[];
+  current: OnDisk[];        // most shards first
+  kept: OnDisk | null;      // the fitting model most shards hold
+  odd: OnDisk[];            // every other model on disk, named where it sits
   /**
    * The vectors already on disk fit the corpus, so the advice is to keep that model.
    * Switching is not free: embed refuses a second model in a shard (--reset drops the
@@ -224,16 +239,22 @@ export interface Recommendation {
    */
   keep: boolean;
   candidates: Candidate[];
-  command: string;
+  command: string;          // carries the scope the corpus was measured in
 }
 
 const NOT_OTHER = new Set<string>(["th", "th+en", "en", "latin", "none"]);
 
 const idOf = (m: MeasuredModel) => `${m.provider}:${m.model}`;
 
+/** Stored ids carry extras the table does not: st's `+passage:` prefix, Ollama's default `:latest` tag. */
+export const baseId = (stored: string) => stored.replace(/\+.*$/, "").replace(/^(ollama:[^:]+):latest$/, "$1");
+
+const quote = (a: string) => /^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`;
+const withScope = (cmd: string, scope: string[]) => cmd && scope.length ? `${cmd} ${scope.map(quote).join(" ")}` : cmd;
+
 /** `st:intfloat/multilingual-e5-small+passage:` -> the embed command that continues it. */
 export function embedCommandFor(storedId: string): string {
-  const m = /^(ollama|st):([^+]+)/.exec(storedId);
+  const m = /^(ollama|st):([^+]+)/.exec(baseId(storedId));
   if (!m) return "";
   return m[1] === "ollama" ? `relic embed --model ${m[2]}` : `relic embed --provider st --model ${m[2]}`;
 }
@@ -260,9 +281,10 @@ export function recommend(r: LangsResult, models: MeasuredModel[] = MEASURED_MOD
           : a.provider === "ollama" ? -1 : 1)
       : (a, b) => a.dim - b.dim || (a.provider === b.provider ? 0 : a.provider === "ollama" ? -1 : 1));
 
-  const current = r.vectors.map(v => {
-    const m = models.find(x => v.model === idOf(x) || v.model.startsWith(idOf(x) + "+"));
-    return { model: v.model, dim: v.dim, ok: multi ? Boolean(m?.multilingual) : true, shards: v.shards, keys: v.keys };
+  const current: OnDisk[] = r.vectors.map(v => {
+    const m = models.find(x => baseId(v.model) === idOf(x));
+    const fit: Fit = !m ? "unmeasured" : !multi || m.multilingual ? "fits" : "english-only";
+    return { model: v.model, dim: v.dim, fit, shards: v.shards, keys: v.keys };
   });
 
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
@@ -275,15 +297,22 @@ export function recommend(r: LangsResult, models: MeasuredModel[] = MEASURED_MOD
       : `${pct(thaiShare)} Thai${others || ", no other non-Latin script"}, below ${pct(MULTILINGUAL_AT)}. ` +
         `An English model is enough, and fewer dims cost less.`;
 
-  const keep = r.events > 0 && current.length > 0 && current.every(c => c.ok);
+  // Keep the fitting model most shards hold, and name everything else where it sits. A
+  // continue command never needs --reset: embed skips a shard that holds another model
+  // (with the reason), so it only fills gaps. A --reset is advised ONLY when nothing on
+  // disk fits, and even then it carries the measured scope, never the whole index.
+  const kept = r.events ? current.find(c => c.fit === "fits") ?? null : null;
+  const odd = kept ? current.filter(c => c !== kept) : [];
   const top = candidates[0];
+  const unmeasured = current.some(c => c.fit === "unmeasured");
   const command = !r.events ? ""
-    : keep ? embedCommandFor(current[0].model)
-    : !top ? ""
-    : (top.provider === "ollama" ? `relic embed --model ${top.model}` : `relic embed --provider st --model ${top.model}`) +
-      (current.length ? " --reset" : "");
+    : kept ? withScope(embedCommandFor(kept.model), r.scopeArgs)
+    : unmeasured || !top ? ""                   // measure it before replacing it
+    : withScope((top.provider === "ollama" ? `relic embed --model ${top.model}` : `relic embed --provider st --model ${top.model}`) +
+                (current.length ? " --reset" : ""), r.scopeArgs);
 
-  return { verdict: multi ? "multilingual" : "english", thaiShare, otherShare, reason, current, keep, candidates, command };
+  return { verdict: multi ? "multilingual" : "english", thaiShare, otherShare, reason, current,
+           kept, odd, keep: Boolean(kept), candidates, command };
 }
 
 // ------------------------------------------------------------------------- render
@@ -302,8 +331,9 @@ export function renderLangs(r: LangsResult, rec: Recommendation): string {
   const tiers = r.mainTiers ? "main tiers" : "all tiers";
   out.push(`scope    ${num(r.read)}/${num(r.shards)} shards · ${tiers} · events >= ${r.minChars} chars, ` +
            `first ${num(r.maxChars)} chars of each (the slice embed sends)`);
-  out.push(`sample   ${r.sample > 1 ? `1 in ${r.sample} by uid` : "every event"} -> ${num(r.events)} events` +
-           (r.sample > 1 ? ` · ~${num(r.estimated)} eligible` : "") + ` · ${(r.ms / 1000).toFixed(1)} s`);
+  // The cut is floored to whole hex steps, so print the rate actually sampled, not the N asked.
+  out.push(`sample   ${r.rate < 1 ? `1 in ${num(Math.round(1 / r.rate))} by uid` : "every event"} -> ${num(r.events)} events` +
+           (r.rate < 1 ? ` · ~${num(r.estimated)} eligible` : "") + ` · ${(r.ms / 1000).toFixed(1)} s`);
   if (r.failed.length) out.push(`failed   ${r.failed.length} shards unreadable, first: ${r.failed[0]}`);
   if (!r.events) {
     out.push("", "nothing eligible in scope: no event passes the filter. " +
@@ -334,9 +364,13 @@ export function renderLangs(r: LangsResult, rec: Recommendation): string {
 
   out.push("");
   if (!r.vectors.length) out.push("vectors  none on disk in this scope: relic embed has not run here");
+  const FIT_NOTE: Record<Fit, string> = {
+    "fits": "", "english-only": "   <- English-only for this corpus",
+    "unmeasured": "   <- not measured here: MEASURED_MODELS has no numbers for it",
+  };
   for (const [i, v] of r.vectors.entries())
     out.push(`vectors  ${v.model} · ${v.dim}d · ${num(v.rows)} rows in ${num(v.shards)} shards` +
-             (rec.current[i]?.ok === false ? "   <- English-only for this corpus" : ""));
+             FIT_NOTE[rec.current[i]?.fit ?? "fits"]);
 
   out.push("", `model    ${rec.verdict === "multilingual" ? "MULTILINGUAL" : "ENGLISH is enough"}. ${rec.reason}`);
   // Two sentence-transformers ids run past 50 chars; padding every row to them would
@@ -345,19 +379,24 @@ export function renderLangs(r: LangsResult, rec: Recommendation): string {
   for (const c of rec.candidates)
     out.push(`         ${c.provider.padEnd(6)} ${String(c.dim).padStart(4)}d  ${`~${c.gib.toFixed(1)}`.padStart(6)} GiB  ` +
              `${c.model.padEnd(w)}  ${evidence(c)}`);
-  if (rec.keep) {
-    const [kept, ...odd] = rec.current;
-    out.push(`         -> keep the model on disk (${kept.model}, ${num(kept.shards)} shards). It already covers this mix, ` +
-             `and one model across shards keeps semantic search comparable. Continue with: ${rec.command}`);
-    // Two models in one index: each shard answers with its own, so scores across them
-    // are not on one scale. Name where the odd ones sit instead of hiding them.
-    for (const o of odd)
-      out.push(`            ${o.model} is on ${num(o.shards)} other shards (${o.keys.slice(0, 3).join(", ")}` +
-               `${o.keys.length > 3 ? ", ..." : ""}): re-embed them with the kept model and --reset to make it one.`);
+  const where = (o: OnDisk) => `${o.keys.slice(0, 3).join(", ")}${o.keys.length > 3 ? ", ..." : ""}`;
+  if (rec.kept) {
+    out.push(`         -> keep the model on disk (${rec.kept.model}, ${num(rec.kept.shards)} shards). It already covers ` +
+             `this mix, and one model across shards keeps semantic search comparable. Continue with: ${rec.command}`);
+    // Each shard answers semantic search with its own model, so scores across models are
+    // not on one scale. Name the odd shards; never widen a --reset to the ones that fit.
+    for (const o of rec.odd)
+      out.push(`            ${o.model} is on ${num(o.shards)} other shards (${where(o)}): ` +
+               (o.fit === "english-only" ? "English-only for this corpus. Re-embed those shards with the kept model; embed refuses a second model per shard, so they need --reset, scoped to them."
+                : o.fit === "unmeasured" ? "not measured here. Bench it before trusting it on Thai, or re-embed those shards with the kept model."
+                : "it fits too, but a second model splits the score scale. Re-embed those shards with the kept model and --reset, scoped to them."));
   }
+  else if (rec.current.some(c => c.fit === "unmeasured"))
+    out.push("         -> the vectors on disk come from a model relic has not measured. Measure it (bench/) before " +
+             "replacing it; if it loses, embed with a candidate above.");
   else if (rec.command)
     out.push(`         -> ${rec.command}` +
-             (rec.current.length ? "   (--reset drops the vectors on disk: embed refuses a second model per shard)" : ""));
+             (rec.current.length ? "   (nothing on disk fits; --reset drops those vectors in the scope shown)" : ""));
   out.push("         GiB = eligible events x dim x 4 bytes. FTS still beats every model on known-item " +
            "(MRR 0.890 vs 0.600, bench/); vectors earn their place on paraphrase queries.");
   return out.join("\n");

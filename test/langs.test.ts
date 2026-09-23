@@ -114,7 +114,7 @@ describe("recommend", () => {
     const r = corpus(10, 90);
     r.vectors = [{ model: "ollama:all-minilm", dim: 384, rows: 5, shards: 1, keys: ["projects/a"] }];
     const rec = recommend(r);
-    expect(rec.current).toEqual([{ model: "ollama:all-minilm", dim: 384, ok: false, shards: 1, keys: ["projects/a"] }]);
+    expect(rec.current).toEqual([{ model: "ollama:all-minilm", dim: 384, fit: "english-only", shards: 1, keys: ["projects/a"] }]);
     expect(rec.keep).toBe(false);
     expect(rec.command).toBe("relic embed --model bge-m3 --reset");
   });
@@ -143,7 +143,60 @@ describe("recommend", () => {
     expect(rec.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
     const text = renderLangs(r, rec);
     expect(text).toContain("309 shards");
-    expect(text).toContain("ollama:bge-m3 is on 3 other shards (projects/x, projects/y, projects/z)");
+    expect(text).toContain("ollama:bge-m3 is on 3 other shards (projects/x, projects/y, projects/z): it fits too");
+  });
+
+  /*
+   * The review's case, 2026-09-23: one English-only shard used to turn "keep" into an
+   * index-wide `--model bge-m3 --reset`, dropping 129,351 e5 vectors that fit.
+   */
+  test("one English-only shard among fitting ones: keep the majority, never widen a --reset", () => {
+    const r = corpus(10, 90);
+    r.vectors = [
+      { model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 129_351, shards: 309, keys: ["projects/a"] },
+      { model: "ollama:all-minilm", dim: 384, rows: 40, shards: 1, keys: ["projects/old"] },
+    ];
+    const rec = recommend(r);
+    expect(rec.kept?.model).toBe("st:intfloat/multilingual-e5-small+passage:");
+    expect(rec.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
+    expect(rec.command).not.toContain("--reset");
+    expect(rec.odd.map(o => o.fit)).toEqual(["english-only"]);
+    expect(renderLangs(r, rec)).toContain("ollama:all-minilm is on 1 other shards (projects/old): English-only for this corpus");
+  });
+
+  test("the printed command carries the scope that was measured", () => {
+    const r = corpus(10, 90);
+    r.scopeArgs = ["--repo", "laris-co/neo-oracle", "--all-tiers", "--data-root", "/tmp/a b"];
+    r.vectors = [{ model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 5, shards: 1, keys: ["projects/a"] }];
+    expect(recommend(r).command).toBe(
+      "relic embed --provider st --model intfloat/multilingual-e5-small --repo laris-co/neo-oracle --all-tiers --data-root '/tmp/a b'");
+    r.vectors = [{ model: "ollama:all-minilm", dim: 384, rows: 5, shards: 1, keys: ["projects/a"] }];
+    expect(recommend(r).command).toBe(
+      "relic embed --model bge-m3 --reset --repo laris-co/neo-oracle --all-tiers --data-root '/tmp/a b'");
+  });
+
+  test("a model relic never measured is unmeasured, not English-only, and earns no --reset", () => {
+    const r = corpus(10, 90);
+    r.vectors = [{ model: "ollama:nomic-embed-text-v2-moe", dim: 768, rows: 5, shards: 1, keys: ["projects/a"] }];
+    const rec = recommend(r);
+    expect(rec.current[0].fit).toBe("unmeasured");
+    expect(rec.keep).toBe(false);
+    expect(rec.command).toBe("");
+    expect(renderLangs(r, rec)).toContain("not measured here");
+  });
+
+  test("Ollama's default :latest tag still matches the measured model", () => {
+    const r = corpus(10, 90);
+    r.vectors = [{ model: "ollama:bge-m3:latest", dim: 1024, rows: 5, shards: 1, keys: ["projects/a"] }];
+    const rec = recommend(r);
+    expect(rec.kept?.fit).toBe("fits");
+    expect(rec.command).toBe("relic embed --model bge-m3");
+  });
+
+  test("the sample line prints the rate actually sampled, not the N asked", () => {
+    const r = emptyLangs({ sample: 40_000 });
+    tallyLang(r, "user", PROSE);
+    expect(renderLangs(r, recommend(r))).toContain("1 in 65,536 by uid");
   });
 
   test("a trace of another script stays out of the verdict", () => {
