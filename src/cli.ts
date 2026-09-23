@@ -1100,7 +1100,10 @@ async function cmdReport(f: Record<string, string | boolean>) {
   const { rows, shards } = await listSessions({
     ...scope, since, until: f.until as string, worktree: f.worktree as string,
     group: false, limit: 1_000_000,
-    tiers: f["all-tiers"] ? undefined : undefined,
+    // [] means "no tier predicate at all" in store.sessions(); undefined falls back to
+    // TRANSCRIPT_TIERS. Both arms read `undefined` before, so --all-tiers was accepted
+    // and silently did nothing here while it worked everywhere else.
+    tiers: f["all-tiers"] ? [] : undefined,
   });
   void shards;
 
