@@ -36,7 +36,9 @@ export function hermesSessions(dbPath: string): { id: string; mtime: number; row
     db = new Database(dbPath, { readonly: true });
     const rows = db.query(`
       SELECT s.id AS id,
-             COALESCE(s.last_activity_at, s.started_at, 0) AS ts,
+             COALESCE(
+               (SELECT MAX(m.timestamp) FROM messages m2 WHERE m2.session_id = s.id AND m2.active = 1),
+               s.ended_at, s.started_at, 0) AS ts,
              COUNT(m.id) AS n
       FROM sessions s
       LEFT JOIN messages m ON m.session_id = s.id AND m.active = 1
