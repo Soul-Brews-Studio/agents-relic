@@ -1133,6 +1133,7 @@ already complete, and it is resumable, scoped, and free to skip.
 relic embed --dry-run                      # what would this cost? no provider call
 relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
 relic embed --model bge-m3 --reset         # change model: drops `vectors` first
+relic embed --force                        # an English-only model on a Thai scope, on purpose
 relic-py embed --provider st --model intfloat/multilingual-e5-small
 ```
 
@@ -1144,6 +1145,41 @@ scope     main tiers, text >= 24 chars, truncated at 2000
 
 74,102 embedded · 46,886 pending · 0 failed · 1 shards · 512.0s  (145/s)
 ```
+
+**The default model is English-only, so embed checks the scope first.** Before any
+provider call, `embed` samples the population it is about to embed with the same uid
+sample and the same rule as [`langs`](#langs--which-languages-so-which-model). When the
+model is English-only in `MEASURED_MODELS` and 1% or more of the eligible events carry
+Thai (or another non-Latin script), it **refuses**, exits 1, and prints why:
+
+```
+$ relic embed --repo neo-oracle --dry-run
+  ⚠ ollama:all-minilm is English-only, and this scope is not. Without --force, a real run stops here.
+    11.0% of eligible events carry Thai, at or above 1.0%. An English-only model embeds them as noise (all-minilm: Thai paraphrase MRR 0.006, bench/).
+    measured 1 in 64 by uid -> 4,238 events · ~271,232 eligible in 9 shards · 2.2 s
+    multilingual, measured here:
+      ollama 1024d    ~1.0 GiB  bge-m3                          cos en-th +0.626 (smoke test, no ranking bench yet)
+      ollama 1024d    ~1.0 GiB  qwen3-embedding:0.6b            cos en-th +0.572 (smoke test, no ranking bench yet)
+      st      384d    ~0.4 GiB  intfloat/multilingual-e5-small  MRR 0.600 · Thai paraphrase 0.214
+      st      384d    ~0.4 GiB  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2  MRR 0.430 · Thai paraphrase 0.078
+    -> relic embed --provider st --model intfloat/multilingual-e5-small --repo neo-oracle   (st:intfloat/multilingual-e5-small+passage: is already on disk here, and fits)
+    --force embeds with ollama:all-minilm anyway. The whole mix, by role, and the vectors on disk: relic langs --repo neo-oracle
+...
+0 embedded · 118,782 pending · 0 failed · 8 shards · 6.0s
+```
+
+2026-09-23, trimmed. Without the check, that command would have embedded 118,782 events
+with the English-only default, into six shards beside two that already hold e5. Without
+`--dry-run` the first line reads `embed REFUSED`, and the embed pass never starts. A
+multilingual model passes without a word. A model relic has never measured gets a note,
+not a refusal: no numbers is not "English-only".
+
+| | |
+|---|---|
+| refuse, not warn | A warning prints once, above a progress bar that then runs for hours, often in a pane nobody watches. The wrong model is paid for twice: once to embed, then again after the `--reset` that changing model needs. A refusal costs one flag, `--force`. |
+| the same scope | `--repo`, `--bank`, `--all-tiers`, `--min-chars`, `--max-chars` and `--data-root` narrow the check exactly as they narrow the embed. `--session` reads every event of that one session. |
+| a thin sample | 1 in 64 of a small repo can be a handful of events, which cannot see 1%. Under 1,000 sampled events the check reads every event: such a scope is under ~64,000 events. |
+| both front ends | `relic-py embed` runs the same check (it has no `--session`), and a test runs both CLIs over one shard and compares the result field by field, and the printed block word for word. |
 
 **Vectors go to a `vectors` table, never a column on `events`.** That is not a style
 preference — it is the only shape that works:

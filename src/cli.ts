@@ -39,7 +39,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
-import { scanLangs, recommend, renderLangs } from "./langs.js";
+import { scanLangs, recommend, renderLangs, renderEmbedCheck } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
@@ -1162,6 +1162,18 @@ async function cmdReport(f: Record<string, string | boolean>) {
 
 // ---- status ----------------------------------------------------------------
 /**
+ * Every flag that narrowed a language measurement rides into the embed command it prints,
+ * so "continue with" acts on the scope that was measured — never silently on the whole index.
+ */
+function embedScopeArgs(f: Record<string, string | boolean>): string[] {
+  const out: string[] = [];
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+    if (typeof f[k] === "string") out.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) out.push(`--${k}`);
+  return out;
+}
+
+/**
  * `relic langs` — the language mix of the embeddable corpus, and which measured model
  * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
  */
@@ -1171,12 +1183,7 @@ async function cmdLangs(f: Record<string, string | boolean>) {
     console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
     process.exit(1);
   }
-  // Every flag that narrowed the measurement rides into the printed embed command, so
-  // "continue with" acts on the scope that was measured — never silently on the whole index.
-  const scopeArgs: string[] = [];
-  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
-    if (typeof f[k] === "string") scopeArgs.push(`--${k}`, f[k] as string);
-  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) scopeArgs.push(`--${k}`);
+  const scopeArgs = embedScopeArgs(f);
   const bar = progress();
   const r = await scanLangs({
     scopeArgs,
@@ -1208,6 +1215,8 @@ async function cmdLangs(f: Record<string, string | boolean>) {
  * full-text index WINS (MRR@20 0.890 vs 0.600 for the best of three models, bench/),
  * so embedding is opt-in, resumable, and scoped: `--repo`, `--bank` and `--limit` all
  * narrow it, and `--dry-run` answers "how much would this cost" without an HTTP call.
+ * Either way the scope's languages are measured first, and an English-only model on a
+ * scope that carries Thai is refused unless --force: see checkEmbedModel in langs.ts.
  */
 async function cmdEmbed(f: Record<string, string | boolean>) {
   const o = {
@@ -1229,12 +1238,22 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     dryRun: Boolean(f["dry-run"]),
     session: f.session ? String(f.session) : undefined,
     reset: Boolean(f.reset),
+    force: Boolean(f.force),
+    scopeArgs: [...embedScopeArgs(f), ...(f.session ? ["--session", String(f.session)] : [])],
   };
 
   let last = 0;
   const bar = progress();
   const r = await embedShards({
     ...o,
+    // The check reads every shard in scope, which is seconds on a whole index: on a
+    // terminal, show where it is. Piped, it stays silent unless it has something to say.
+    onCheckProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty" && process.stderr.isTTY)
+        bar.tick(`  language check  ${done}/${total} shards  ${key}   `, (done / total) * 100);
+    },
+    // Before any provider call, and on stderr, so --json stays one parseable document.
+    onCheck: c => { bar.clear(); const s = renderEmbedCheck(c, o.dryRun); if (s) console.error(s + "\n"); },
     onProgress: p => {
       // Was `!== "text"`, a value outFmt never returns, so it never drew; the Python port says "pretty".
       if (outFmt(f) !== "pretty" || p.done - last < 200) return;
@@ -1244,8 +1263,14 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   });
   bar.clear();
 
-  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
-  if (outFmt(f) === "jsonl") { for (const sh of r.shards) console.log(JSON.stringify(sh)); return; }
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); if (r.refused) process.exit(1); return; }
+  if (outFmt(f) === "jsonl") {
+    for (const sh of r.shards) console.log(JSON.stringify(sh));
+    if (r.refused) { console.log(JSON.stringify({ refused: true, check: r.check })); process.exit(1); }
+    return;
+  }
+  // Why is already on stderr: the check printed it before the embed pass began.
+  if (r.refused) process.exit(1);
 
   const touched = r.shards.filter(sh => sh.eligible > 0 || sh.skipped);
   if (!touched.length) {
@@ -1277,6 +1302,10 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
               (r.embedded && secs > 0 ? `  (${(r.embedded / secs).toFixed(0)}/s)` : ""));
   if (r.dryRun) console.log(`\nre-run without --dry-run to write. Vectors go to the per-shard`);
   if (r.dryRun) console.log(`\`vectors\` table; \`events\` and the full-text index are untouched.`);
+  // The check's block printed above the shard list, which can run 40 lines; say it again here.
+  if (r.dryRun && r.check.action === "refuse")
+    console.log(`\nBut the language check refuses ${r.providerId} for this scope, so a real run stops before` +
+                ` embedding anything: pick a multilingual model above, or add --force.`);
 }
 
 async function cmdStatus(f: Record<string, string | boolean>) {

@@ -6,12 +6,21 @@ resume, the dim guard — and never about whether ollama happens to be running.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import subprocess
+
 import lancedb
 import pytest
 
-from relicpy.embed import Provider, embed_shard, l2_normalise, provider_for
-from relicpy.models import EventRow, FileRow
+from relicpy.embed import Provider, embed_shard, embed_shards, l2_normalise, provider_for, provider_id
+from relicpy.langs import CHECK_MIN_EVENTS, MEASURED_MODELS, check_embed_model, lang_of, render_embed_check
+from relicpy.models import EventRow, FileRow, Scope
+from relicpy.repo import shard_dir_for
 from relicpy.store import LanceStore
+from relicpy.types import uid_of
 
 
 def fake(dim: int, tag: str = "fake") -> Provider:
@@ -186,12 +195,220 @@ def test_st_provider_id_matches_the_typescript_contract():
     from relicpy import embed as E
 
     assert E.st_provider.__doc__  # the function exists and is documented
-    # Mirror of provider_for()'s prefix rule, which is what produces the id.
+    # provider_id() is the id provider_for() writes, read without loading a model.
     for model, want in [
         ("intfloat/multilingual-e5-small", "st:intfloat/multilingual-e5-small+passage:"),
         ("sentence-transformers/all-MiniLM-L6-v2",
          "st:sentence-transformers/all-MiniLM-L6-v2"),
     ]:
-        doc = "passage: " if "e5" in model.lower() else ""
-        tag = f"st:{model}" + (f"+{doc.strip()}" if doc else "")
-        assert tag == want
+        assert E.provider_id("st", model) == want
+    assert E.provider_id("ollama", "all-minilm") == provider_for("ollama", "all-minilm").id
+
+
+# ------------------------------------------------- the language check (#101)
+#
+# `embed` measures the scope it is about to embed before any provider is built, and
+# refuses an English-only model on a scope that carries Thai unless --force. The rule
+# and its reasons live in src/langs.ts; these pin the port to the same behaviour, and
+# the two parity tests at the end run the TypeScript CLI over the same shard.
+
+THAI = "สวัสดีครับ วันนี้อากาศดีมาก ขอบคุณมาก"
+PROSE = "Fix the bug in the parser and add a test for it please"
+THAI_MIX = [THAI] * 10 + [PROSE] * 20     # a third of the scope carries Thai
+
+
+def mkroot(root, repos: dict, bank: str = "default") -> str:
+    """One shard per repo under a data root; an event is text, or (text, tier)."""
+    for repo, events in repos.items():
+        s = LanceStore.open(shard_dir_for(f"github.com/o/{repo}", str(root), bank=bank))
+        rows = [e if isinstance(e, tuple) else (e, "session") for e in events]
+        s.put_events([EventRow(
+            uid=uid_of("claude", f"{repo}.jsonl", i), session_uuid="s", file_path=f"/{repo}.jsonl",
+            repo_key=f"github.com/o/{repo}", seq=float(i), role="user", ts="", text=text,
+            source="claude", tier=tier, kind="transcript", worktree="", cwd="", org="o",
+            project="", dir="", mem_type="", origin_session="") for i, (text, tier) in enumerate(rows)])
+    return str(root)
+
+
+def counting(pid: str):
+    """A provider under a real model's id that counts calls: a refusal comes before the first."""
+    calls = {"n": 0}
+
+    def encode(texts):
+        calls["n"] += 1
+        return fake(8).encode(texts)
+
+    return Provider(id=pid, encode=encode), calls
+
+
+def vectors_in(root: str, repo: str):
+    return LanceStore.open(shard_dir_for(f"github.com/o/{repo}", root)).vector_stats()
+
+
+def test_an_english_only_model_on_a_thai_scope_is_refused_before_any_provider_call(tmp_path):
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    p, calls = counting("ollama:all-minilm")
+    seen = []
+    t = embed_shards(Scope(data_root=root), p=p, on_check=seen.append)
+    assert t.refused and seen == [t.check]
+    assert (t.check.action, t.check.fit, t.check.verdict) == ("refuse", "english-only", "multilingual")
+    assert abs(t.check.thai_share - 1 / 3) < 1e-9
+    assert t.shards == [] and calls["n"] == 0 and vectors_in(root, "mix") is None
+    assert [c.m.model for c in t.check.candidates] == [
+        "bge-m3", "qwen3-embedding:0.6b", "intfloat/multilingual-e5-small",
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]
+    text = render_embed_check(t.check)
+    assert "embed REFUSED — ollama:all-minilm is English-only, and this scope is not" in text
+    assert "33.3% of eligible events carry Thai, at or above 1.0%" in text
+    assert "-> relic embed --model bge-m3" in text
+    assert "--force embeds with ollama:all-minilm anyway." in text
+
+
+def test_force_proceeds_and_says_what_it_is_forcing(tmp_path):
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    p, calls = counting("ollama:all-minilm")
+    t = embed_shards(Scope(data_root=root), p=p, force=True)
+    assert not t.refused and t.check.action == "forced"
+    assert t.embedded == 30 and calls["n"] > 0
+    assert vectors_in(root, "mix")["model"] == "ollama:all-minilm"
+    assert "--force: embedding with ollama:all-minilm, which is English-only" in render_embed_check(t.check)
+
+
+def test_a_multilingual_model_passes_silently_under_every_form_of_its_id(tmp_path):
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    for pid in ("ollama:bge-m3", "ollama:bge-m3:latest", "st:intfloat/multilingual-e5-small+passage:"):
+        c = embed_shards(Scope(data_root=root), p=counting(pid)[0], dry_run=True).check
+        assert (c.action, c.fit) == ("pass", "fits")
+        assert render_embed_check(c) == ""
+    assert embed_shards(Scope(data_root=root), p=counting("ollama:bge-m3")[0]).embedded == 30
+
+
+def test_an_unmeasured_model_gets_a_note_not_a_refusal(tmp_path):
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    t = embed_shards(Scope(data_root=root), p=counting("ollama:nomic-embed-text-v2-moe")[0])
+    assert not t.refused and (t.check.action, t.check.fit) == ("note", "unmeasured")
+    assert t.embedded == 30
+    text = render_embed_check(t.check)
+    assert "ollama:nomic-embed-text-v2-moe is not measured here" in text and "REFUSED" not in text
+
+
+def test_an_english_only_model_on_an_english_scope_passes_silently(tmp_path):
+    root = mkroot(tmp_path, {"en": [PROSE] * 20})
+    t = embed_shards(Scope(data_root=root), p=counting("ollama:all-minilm")[0])
+    assert (t.check.action, t.check.verdict, t.check.thai_share) == ("pass", "english", 0)
+    assert render_embed_check(t.check) == "" and t.embedded == 20
+
+
+def test_dry_run_shows_the_same_check_and_still_counts_without_writing(tmp_path):
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    p, calls = counting("ollama:all-minilm")
+    t = embed_shards(Scope(data_root=root), p=p, dry_run=True)
+    assert not t.refused and t.check.action == "refuse"
+    assert t.pending == 30 and calls["n"] == 0 and vectors_in(root, "mix") is None
+    assert "Without --force, a real run stops here" in render_embed_check(t.check, True)
+
+
+def test_a_thin_sample_is_read_in_full_and_a_thick_one_stays_a_sample(tmp_path):
+    # 1 in 64 of 30 events is zero or one event, which cannot see 1% of anything.
+    thin = check_embed_model("ollama:all-minilm", Scope(data_root=mkroot(tmp_path / "a", {"mix": THAI_MIX})))
+    assert (thin.rate, thin.events, thin.action) == (1.0, 30, "refuse")
+    thick = check_embed_model("ollama:all-minilm",
+                              Scope(data_root=mkroot(tmp_path / "b", {"big": [PROSE] * 2500})), sample=2)
+    assert thick.rate == 0.5 and thick.events >= CHECK_MIN_EVENTS
+
+
+def test_the_scope_flags_reach_the_check(tmp_path):
+    root = mkroot(tmp_path, {"en": [PROSE] * 20})
+    mkroot(tmp_path, {"notes": THAI_MIX}, bank="vault")
+    act = lambda **kw: embed_shards(Scope(data_root=root, **kw), p=counting("ollama:all-minilm")[0],
+                                    dry_run=True).check.action  # noqa: E731
+    assert (act(), act(bank="default"), act(bank="vault"), act(repo="en"), act(repo="notes")) == \
+        ("refuse", "pass", "refuse", "pass", "refuse")
+
+    long = PROSE * 40 + " " + THAI            # 2,200 chars of English, then Thai
+    flags = mkroot(tmp_path / "flags", {"en": [PROSE] * 20 + [(THAI, "subagent")] * 10
+                                        + ["สวัสดีครับ"] * 10 + [long] * 10})
+
+    def check(**kw):
+        c = embed_shards(Scope(data_root=flags), p=counting("ollama:all-minilm")[0], dry_run=True, **kw).check
+        return c.action, c.events
+
+    assert check() == ("pass", 30)
+    assert check(main_tiers=False) == ("refuse", 40)     # --all-tiers
+    assert check(min_chars=4) == ("refuse", 40)
+    assert check(max_chars=3000) == ("refuse", 30)
+
+
+def test_the_cli_refuses_with_exit_1_and_json_stays_one_document(tmp_path, capsys):
+    from relicpy.cli import main
+
+    root = mkroot(tmp_path, {"mix": THAI_MIX})
+    assert main(["embed", "--data-root", root]) == 1
+    out = capsys.readouterr()
+    assert "embed REFUSED — ollama:all-minilm is English-only" in out.err and out.out == ""
+    assert main(["embed", "--data-root", root, "--json"]) == 1
+    j = json.loads(capsys.readouterr().out)
+    assert j["refused"] is True and j["shards"] == [] and j["check"]["action"] == "refuse"
+    assert main(["embed", "--data-root", root, "--dry-run"]) == 0
+    out = capsys.readouterr()
+    assert "Without --force, a real run stops here" in out.err
+    assert "30 pending" in out.out and "the language check refuses ollama:all-minilm" in out.out
+
+
+def test_lang_of_agrees_with_the_typescript_table():
+    """The fixtures and answers of test/langs.test.ts, verbatim."""
+    for text, want in [
+        (THAI, "th"),
+        ("ใช้ rg แทน grep ทุกครั้ง please check the repo first", "th+en"),
+        (PROSE, "en"),
+        ('{"file_path":"/opt/Code/x.ts","old_string":"const a = b","new_string":"const a = c"}', "latin"),
+        ("你好，世界。这是一个测试", "zh/ja"),
+        ("안녕하세요 반갑습니다", "ko"),
+        ("Привет, как дела у тебя сегодня?", "cyrillic"),
+        ("12345 --- !!! 2026-09-23", "none"),
+    ]:
+        assert lang_of(text) == want, text
+
+
+TS_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _bun(args: list[str], home) -> subprocess.CompletedProcess:
+    if not shutil.which("bun"):
+        pytest.skip("bun not installed — cannot run the reference implementation")
+    return subprocess.run(["bun", *args], cwd=TS_REPO, capture_output=True, text=True, timeout=300,
+                          env={**os.environ, "HOME": str(home)})
+
+
+def test_measured_models_match_the_typescript_table(tmp_path):
+    out = _bun(["-e", "import { MEASURED_MODELS } from './src/embed.ts';"
+                      " console.log(JSON.stringify(MEASURED_MODELS))"], tmp_path)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == [m.to_json() for m in MEASURED_MODELS]
+
+
+def test_the_check_matches_typescript_over_one_shard(tmp_path):
+    """Both CLIs, one data root: the same shares, verdict, action, candidates and commands.
+
+    The root has what the rule reads: Thai, a non-Latin script that is not Thai, a
+    subagent tier, a short event, and vectors already on disk that fit.
+    """
+    zh = "你好，世界。这是一个测试的句子" * 2
+    root = mkroot(tmp_path / "root", {"mix": THAI_MIX + [zh] * 3 + [(THAI, "subagent")] * 4 + ["ok"] * 5})
+    mkroot(tmp_path / "root", {"notes": [PROSE] * 12 + [zh]}, bank="vault")
+    embed_shard(LanceStore.open(shard_dir_for("github.com/o/mix", root)),
+                counting("st:intfloat/multilingual-e5-small+passage:")[0])
+
+    ts = _bun(["src/cli.ts", "embed", "--data-root", root, "--dry-run", "--json"], tmp_path)
+    assert ts.returncode == 0, ts.stderr
+    want = json.loads(ts.stdout)["check"]
+    check = embed_shards(Scope(data_root=root), dry_run=True, scope_args=["--data-root", root]).check
+    got = check.to_json()
+    for c in (want, got):
+        c.pop("ms")
+    assert got == want
+    assert got["kept"] == "st:intfloat/multilingual-e5-small+passage:" and got["otherShare"] > 0
+    # and the words: the block TypeScript printed is the block Python prints, but for the clock
+    clock = lambda s: re.sub(r"· \d+\.\d s", "· N s", s).strip()  # noqa: E731
+    assert clock(render_embed_check(check, True)) == clock(ts.stderr)
+    assert "multilingual, measured here:" in ts.stderr

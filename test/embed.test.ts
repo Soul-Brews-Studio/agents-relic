@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lancedb from "@lancedb/lancedb";
 import { LanceStore } from "../src/store/lance.js";
-import { l2normalise, providerFor, queryProviderFor, embedShard, type EmbedProvider } from "../src/embed.js";
+import { l2normalise, providerFor, queryProviderFor, embedShard, embedShards, type EmbedProvider } from "../src/embed.js";
+import { checkEmbedModel, renderEmbedCheck, CHECK_MIN_EVENTS, type EmbedCheck } from "../src/langs.js";
+import { shardDirFor } from "../src/repo.js";
+import { uidOf } from "../src/types.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "relic-embed-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -278,5 +281,216 @@ describe("vectorSearch", () => {
     const s = await LanceStore.open(join(tmp, "vs-none"));
     await s.putFiles([{ file_path: "/a", repo_key: "r", mtime: 1, size: 2, imported_at: "" }]);
     expect(await s.vectorSearch([1, 0], { limit: 5 })).toEqual([]);
+  });
+});
+
+describe("the language check — embed measures its scope before any provider call (#101)", () => {
+  const THAI = "สวัสดีครับ วันนี้อากาศดีมาก ขอบคุณมาก";
+  const PROSE = "Fix the bug in the parser and add a test for it please";
+  type Ev = { text: string; session?: string; tier?: string };
+  const times = (n: number, e: Ev): Ev[] => Array.from({ length: n }, () => e);
+  // 10 Thai events in 30: a third of the scope, far over the 1% line.
+  const THAI_MIX = [...times(10, { text: THAI }), ...times(20, { text: PROSE })];
+
+  /** One shard per repo under a data root; calling it again with the same name adds shards. */
+  const mkRoot = async (name: string, repos: Record<string, Ev[]>, bank?: string) => {
+    const root = join(tmp, name);
+    for (const [repo, events] of Object.entries(repos)) {
+      const store = await LanceStore.open(shardDirFor(`github.com/o/${repo}`, root, false, bank));
+      await store.putEvents(events.map((e, seq) => ({
+        uid: uidOf("claude", `${repo}.jsonl`, seq), session_uuid: e.session ?? "s", file_path: `/${repo}.jsonl`,
+        repo_key: `github.com/o/${repo}`, seq, role: "user", ts: "", text: e.text, source: "claude",
+        tier: e.tier ?? "session", kind: "transcript", worktree: "", cwd: "", org: "o", project: "",
+        dir: "", mem_type: "", origin_session: "",
+      })));
+    }
+    return root;
+  };
+
+  /** Under a real model's id, and counting calls: a refusal must come before the first one. */
+  const provider = (id: string) => {
+    let calls = 0;
+    return { id, calls: () => calls, embed: async (texts: string[]) => { calls++; return fake(8).embed(texts); } };
+  };
+  const vectorsIn = async (root: string, repo: string) =>
+    (await LanceStore.open(shardDirFor(`github.com/o/${repo}`, root))).vectorStats();
+
+  test("an English-only model on a Thai scope is refused: nothing embedded, no provider call", async () => {
+    const root = await mkRoot("check-refuse", { mix: THAI_MIX });
+    const p = provider("ollama:all-minilm");
+    let seen: EmbedCheck | undefined;
+    const r = await embedShards({ dataRoot: root, onCheck: c => { seen = c; } }, p);
+    expect(r.refused).toBe(true);
+    expect(seen).toBe(r.check);
+    expect(r.check).toMatchObject({ action: "refuse", fit: "english-only", verdict: "multilingual" });
+    expect(r.check.thaiShare).toBeCloseTo(1 / 3);
+    expect(r.shards).toEqual([]);
+    expect(p.calls()).toBe(0);
+    expect(await vectorsIn(root, "mix")).toBeNull();
+
+    // The multilingual candidates come from recommend(): Ollama first, as embed's default provider.
+    expect(r.check.candidates.map(c => c.model)).toEqual(["bge-m3", "qwen3-embedding:0.6b",
+      "intfloat/multilingual-e5-small", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]);
+    const text = renderEmbedCheck(r.check);
+    expect(text).toContain("embed REFUSED — ollama:all-minilm is English-only, and this scope is not");
+    expect(text).toContain("33.3% of eligible events carry Thai, at or above 1.0%");
+    expect(text).toContain("-> relic embed --model bge-m3");
+    expect(text).toContain("--force embeds with ollama:all-minilm anyway. The whole mix, by role, and the vectors on disk: relic langs");
+  });
+
+  test("--force proceeds, and still says what it is forcing", async () => {
+    const root = await mkRoot("check-force", { mix: THAI_MIX });
+    const p = provider("ollama:all-minilm");
+    const r = await embedShards({ dataRoot: root, force: true }, p);
+    expect(r.refused).toBe(false);
+    expect(r.check.action).toBe("forced");
+    expect(r.embedded).toBe(30);
+    expect(p.calls()).toBeGreaterThan(0);
+    expect((await vectorsIn(root, "mix"))?.model).toBe("ollama:all-minilm");
+    expect(renderEmbedCheck(r.check)).toContain("--force: embedding with ollama:all-minilm, which is English-only");
+  });
+
+  test("a multilingual model passes silently, under every form of its id", async () => {
+    const root = await mkRoot("check-multi", { mix: THAI_MIX });
+    // st records its e5 prefix in the id, and Ollama may carry its default tag.
+    for (const id of ["ollama:bge-m3", "ollama:bge-m3:latest", "st:intfloat/multilingual-e5-small+passage:"]) {
+      const c = (await embedShards({ dataRoot: root, dryRun: true }, provider(id))).check;
+      expect(c).toMatchObject({ action: "pass", fit: "fits" });
+      expect(renderEmbedCheck(c)).toBe("");
+    }
+    expect((await embedShards({ dataRoot: root }, provider("ollama:bge-m3"))).embedded).toBe(30);
+  });
+
+  test("an unmeasured model gets a note, not a refusal", async () => {
+    const root = await mkRoot("check-unmeasured", { mix: THAI_MIX });
+    const r = await embedShards({ dataRoot: root }, provider("ollama:nomic-embed-text-v2-moe"));
+    expect(r.refused).toBe(false);
+    expect(r.check).toMatchObject({ action: "note", fit: "unmeasured" });
+    expect(r.embedded).toBe(30);
+    const text = renderEmbedCheck(r.check);
+    expect(text).toContain("ollama:nomic-embed-text-v2-moe is not measured here");
+    expect(text).not.toContain("REFUSED");
+  });
+
+  test("an English-only model on an English scope passes silently", async () => {
+    const root = await mkRoot("check-english", { en: times(20, { text: PROSE }) });
+    const r = await embedShards({ dataRoot: root }, provider("ollama:all-minilm"));
+    expect(r.check).toMatchObject({ action: "pass", verdict: "english", thaiShare: 0 });
+    expect(renderEmbedCheck(r.check)).toBe("");
+    expect(r.embedded).toBe(20);
+  });
+
+  test("--dry-run shows the same check, and still counts without writing", async () => {
+    const root = await mkRoot("check-dry", { mix: THAI_MIX });
+    const p = provider("ollama:all-minilm");
+    const r = await embedShards({ dataRoot: root, dryRun: true }, p);
+    expect(r.refused).toBe(false);
+    expect(r.check.action).toBe("refuse");
+    expect(r.pending).toBe(30);
+    expect(p.calls()).toBe(0);
+    expect(await vectorsIn(root, "mix")).toBeNull();
+    expect(renderEmbedCheck(r.check, true)).toContain("Without --force, a real run stops here");
+  });
+
+  test("a thin sample is read in full; a thick one stays a sample", async () => {
+    // 1 in 64 of 30 events is zero or one event, which cannot see 1% of anything.
+    const thin = (await embedShards({ dataRoot: await mkRoot("check-thin", { mix: THAI_MIX }), dryRun: true },
+                                     provider("ollama:all-minilm"))).check;
+    expect(thin).toMatchObject({ rate: 1, events: 30, action: "refuse" });
+    const thick = await checkEmbedModel("ollama:all-minilm",
+      { dataRoot: await mkRoot("check-thick", { big: times(2_500, { text: PROSE }) }), sample: 2 });
+    expect(thick.rate).toBe(0.5);
+    expect(thick.events).toBeGreaterThanOrEqual(CHECK_MIN_EVENTS);
+  });
+
+  test("--repo and --bank narrow the check to the shards embed would read", async () => {
+    const root = await mkRoot("check-bank", { en: times(20, { text: PROSE }) });
+    await mkRoot("check-bank", { notes: THAI_MIX }, "vault");
+    const check = async (o: { repo?: string; bank?: string }) =>
+      (await embedShards({ dataRoot: root, dryRun: true, ...o }, provider("ollama:all-minilm"))).check.action;
+    expect(await check({})).toBe("refuse");
+    expect(await check({ bank: "default" })).toBe("pass");
+    expect(await check({ bank: "vault" })).toBe("refuse");
+    expect(await check({ repo: "en" })).toBe("pass");
+    expect(await check({ repo: "notes" })).toBe("refuse");
+  });
+
+  test("--all-tiers, --min-chars and --max-chars move the population the check measures", async () => {
+    const LONG = PROSE.repeat(40) + " " + THAI;      // 2,200 chars of English, then Thai
+    const root = await mkRoot("check-flags", { en: [
+      ...times(20, { text: PROSE }),
+      ...times(10, { text: THAI, tier: "subagent" }), // not a main tier
+      ...times(10, { text: "สวัสดีครับ" }),            // under --min-chars 24
+      ...times(10, { text: LONG }),                   // its Thai is past --max-chars 2000
+    ] });
+    const check = async (o: { mainTiers?: boolean; minChars?: number; maxChars?: number }) =>
+      (await embedShards({ dataRoot: root, dryRun: true, ...o }, provider("ollama:all-minilm"))).check;
+    expect(await check({})).toMatchObject({ action: "pass", events: 30 });
+    expect(await check({ mainTiers: false })).toMatchObject({ action: "refuse", events: 40 });
+    expect(await check({ minChars: 4 })).toMatchObject({ action: "refuse", events: 40 });
+    expect(await check({ maxChars: 3000 })).toMatchObject({ action: "refuse", events: 30 });
+  });
+
+  test("--session reads every event of that one session, and nothing else", async () => {
+    const root = await mkRoot("check-session", { two: [
+      ...times(5, { text: THAI, session: "th" }), ...times(40, { text: PROSE, session: "en" })] });
+    const run = (session: string) => embedShards({ dataRoot: root, session, dryRun: true,
+      scopeArgs: ["--session", session] }, provider("ollama:all-minilm"));
+    const th = (await run("th")).check;
+    expect(th).toMatchObject({ action: "refuse", rate: 1, events: 5, thaiShare: 1 });
+    expect(th.command).toBe("relic embed --model bge-m3 --session th");
+    expect(th.langsCommand).toBe("relic langs");     // langs takes no --session
+    expect((await run("en")).check).toMatchObject({ action: "pass", events: 40 });
+  });
+
+  test("the printed commands carry the scope that was measured", async () => {
+    const root = await mkRoot("check-scope-args", { mix: THAI_MIX });
+    const c = (await embedShards({ dataRoot: root, repo: "mix", dryRun: true,
+      scopeArgs: ["--data-root", root, "--repo", "mix"] }, provider("ollama:all-minilm"))).check;
+    expect(c.command).toBe(`relic embed --model bge-m3 --data-root ${root} --repo mix`);
+    expect(c.langsCommand).toBe(`relic langs --data-root ${root} --repo mix`);
+  });
+
+  test("vectors already on disk that fit are the next step, not a candidate that starts over", async () => {
+    const root = await mkRoot("check-kept", { mix: THAI_MIX });
+    await embedShards({ dataRoot: root }, provider("st:intfloat/multilingual-e5-small+passage:"));
+    const c = (await embedShards({ dataRoot: root, dryRun: true }, provider("ollama:all-minilm"))).check;
+    expect(c.kept).toBe("st:intfloat/multilingual-e5-small+passage:");
+    expect(c.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
+    expect(renderEmbedCheck(c, true)).toContain("(st:intfloat/multilingual-e5-small+passage: is already on disk here, and fits)");
+  });
+
+  describe("the CLI", () => {
+    const cli = join(import.meta.dir, "..", "src", "cli.ts");
+    const relic = (root: string, ...args: string[]) => {
+      // HOME is a temp dir, so nothing can reach the live index even if --data-root were dropped.
+      const out = Bun.spawnSync(["bun", cli, "embed", "--data-root", root, ...args],
+                                { env: { ...process.env, HOME: tmp }, stdout: "pipe", stderr: "pipe" });
+      return { code: out.exitCode, stdout: out.stdout.toString(), stderr: out.stderr.toString() };
+    };
+
+    test("a refusal exits 1 with the reason on stderr, and --json stays one document", async () => {
+      const root = await mkRoot("check-cli", { mix: THAI_MIX });
+      const plain = relic(root);
+      expect(plain.code).toBe(1);
+      expect(plain.stderr).toContain("embed REFUSED — ollama:all-minilm is English-only");
+      expect(plain.stdout).toBe("");
+      const json = relic(root, "--json");
+      expect(json.code).toBe(1);
+      expect(JSON.parse(json.stdout)).toMatchObject({ refused: true, shards: [], check: { action: "refuse" } });
+    });
+
+    test("--dry-run prints the check, the counts, and the refusal again under them", async () => {
+      const root = await mkRoot("check-cli-dry", { mix: THAI_MIX });
+      const dry = relic(root, "--dry-run");
+      expect(dry.code).toBe(0);
+      expect(dry.stderr).toContain("Without --force, a real run stops here");
+      expect(dry.stdout).toContain("30 pending");
+      expect(dry.stdout).toContain("the language check refuses ollama:all-minilm for this scope");
+      // A model that fits prints nothing about languages at all.
+      const multi = relic(root, "--dry-run", "--model", "bge-m3");
+      expect(multi.code).toBe(0);
+      expect(multi.stderr).toBe("");
+    });
   });
 });
