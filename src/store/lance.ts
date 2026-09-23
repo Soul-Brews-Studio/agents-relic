@@ -402,9 +402,9 @@ export class LanceStore {
   }
 
   /**
-   * List sessions, newest first. Filtered on started_at, which is the session's own
-   * first timestamp — NOT file mtime, which moves every time a transcript is appended
-   * to and would make an old session look new.
+   * List sessions, newest first. A session matches a window it was ACTIVE in — started
+   * before it closed, last event after it opened — on its own event timestamps, NOT file
+   * mtime, which moves every time a transcript is appended to.
    */
   /**
    * Find a session by NAME rather than id — the host's `title`, falling back to the
@@ -457,7 +457,8 @@ export class LanceStore {
     const t = await this.existing("sessions");
     if (!t) return [];
     const where: string[] = [];
-    if (opts.since)    where.push(`started_at >= ${sqlStr(opts.since)}`);
+    // Overlap, not start-in-window: a session still running inside the window was active in it.
+    if (opts.since)    where.push(`(ended_at >= ${sqlStr(opts.since)} OR (ended_at = '' AND started_at >= ${sqlStr(opts.since)}))`);
     if (opts.until)    where.push(`started_at <= ${sqlStr(opts.until)}`);
     if (opts.worktree) where.push(`worktree LIKE '%${opts.worktree.replace(/'/g, "''")}%'`);
     /*
