@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { loadSources, transcriptRoots } from "./sources.js";
+import { dirUnreadable, walkError, reachable } from "./unreadable.js";
 
 /**
  * What is running RIGHT NOW — answered from the filesystem, never from the index.
@@ -139,20 +140,23 @@ export interface LiveFile {
   eventAgeSec?: number;
 }
 
+// An unreadable directory would hide an ACTIVE session from now/live with no
+// diagnostic, so anything but ENOENT is reported (#99) — see unreadable.ts.
 function jsonlIn(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(dir, e); return []; }
 }
 function subdirs(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isDirectory()).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(dir, e); return []; }
 }
 function statOf(p: string) {
-  try { const s = statSync(p); return { mtimeMs: s.mtimeMs, size: s.size }; } catch { return null; }
+  try { const s = statSync(p); return { mtimeMs: s.mtimeMs, size: s.size }; }
+  catch (e) { walkError(p, e); return null; }
 }
 
 /**
@@ -498,7 +502,7 @@ export function liveRoots(): string[] {
   const seen = new Set<string>();
   for (const src of loadSources())
     for (const root of transcriptRoots(src))
-      if (existsSync(root)) seen.add(root);
+      if (reachable(root)) seen.add(root);
   return [...seen];
 }
 

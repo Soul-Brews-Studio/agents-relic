@@ -17,7 +17,9 @@ parses most of the corpus at all.
 Four gates, from widest to narrowest:
 
   1. the run must be UNFILTERED — no --since, no --repo
-  2. nothing may have FAILED to parse; a file that failed is not a file that is gone
+  2. nothing may have FAILED to parse; a file that failed is not a file that is gone.
+     Nor may discovery have failed to READ a path (#99): every file under an
+     unreadable directory is missing from the scan, and would look deleted
   3. only shards this run actually reached are considered — a bank whose source was not
      in --corpus, or whose root was missing, is never touched
   4. a shard losing more than `max_drop_pct` of its files is REFUSED, not pruned
@@ -60,8 +62,10 @@ class PrunePlan:
     applied: bool = False
 
 
-def prune_refusal(t: ImportTally, since_ms: Optional[int], repo_filter: Optional[str]) -> Optional[str]:
-    """Why this run may not prune, or None."""
+def prune_refusal(t: ImportTally, since_ms: Optional[int], repo_filter: Optional[str],
+                  unreadable: int = 0) -> Optional[str]:
+    """Why this run may not prune, or None. `unreadable` is len(walk_failures()) for this
+    run's discovery — gate 2 reads it."""
     if since_ms is not None:
         return ("--since narrows discovery to recent files, so every older file would "
                 "look deleted. Prune needs a full scan.")
@@ -72,19 +76,24 @@ def prune_refusal(t: ImportTally, since_ms: Optional[int], repo_filter: Optional
         return (f"{t.failed:,} file{'' if t.failed == 1 else 's'} failed to parse. A file "
                 "that failed to parse is not a file that is gone — re-run with --verbose, "
                 "fix it, then prune.")
+    if unreadable:
+        return (f"{unreadable:,} path{'' if unreadable == 1 else 's'} could not be read during "
+                "discovery. Files under an unreadable directory are not files that are gone — "
+                "fix access to the paths named above, then prune.")
     return None
 
 
 def prune(t: ImportTally, *, apply: bool, max_drop_pct: float = DEFAULT_MAX_DROP_PCT,
           force: bool = False, data_root: Optional[str] = None, in_repo: bool = False,
-          since_ms: Optional[int] = None, repo_filter: Optional[str] = None) -> PrunePlan:
+          since_ms: Optional[int] = None, repo_filter: Optional[str] = None,
+          unreadable: int = 0) -> PrunePlan:
     """Compare discovery against the index and, if `apply`, remove the difference.
 
     The dry run and the real run are the SAME call with a flag, down into
     `LanceStore.prune_files` — so the count a human approved is produced by the code
     that executes, not by a second query that resembles it.
     """
-    refused = prune_refusal(t, since_ms, repo_filter)
+    refused = prune_refusal(t, since_ms, repo_filter, unreadable)
     if refused:
         return PrunePlan(refused=refused)
 

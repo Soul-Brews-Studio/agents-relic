@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { defaultRoot } from "./repo.js";
+import { WALK_RULES, type WalkFailure } from "./unreadable.js";
 /**
  * tool_result text is capped at 4000 by flattenContent, NOT at MAX_TEXT. The first
  * version of this rule compared against MAX_TEXT (16000) and therefore matched nothing
@@ -175,11 +176,7 @@ export function skippedPath(dataRoot: string | null): string {
   return join(dataRoot ?? defaultRoot(), "skipped.jsonl");
 }
 
-/** The proof log: one line per dropped event, enough to judge the rule by. */
-export function logSkipped(
-  rows: { uid: string; file_path: string; seq: number; role: string; rule: string; bytes: number; head: string }[],
-  dataRoot: string | null,
-): void {
+function appendLog(rows: object[], dataRoot: string | null): void {
   if (!rows.length) return;
   try {
     const p = skippedPath(dataRoot);
@@ -189,6 +186,28 @@ export function logSkipped(
     appendFileSync(p, rows.map(r => JSON.stringify(r)).join("\n") + "\n");
   } catch { /* an unwritable proof log must not fail an index run */ }
 }
+
+/** The proof log: one line per dropped event, enough to judge the rule by. */
+export function logSkipped(
+  rows: { uid: string; file_path: string; seq: number; role: string; rule: string; bytes: number; head: string }[],
+  dataRoot: string | null,
+): void {
+  appendLog(rows, dataRoot);
+}
+
+/**
+ * The same log, one level up: a PATH the walk could not read, so nothing under it was
+ * indexed (#99). A dropped event is logged as proof; a dropped directory drops every
+ * event beneath it, and used to leave no line at all.
+ *
+ * File rows carry `path`/`error`/`ts` instead of `uid`/`seq`/`bytes`, and a rule from
+ * WALK_RULES — that is how the two readers below tell the kinds apart.
+ */
+export function logSkippedFiles(rows: WalkFailure[], dataRoot: string | null): void {
+  appendLog(rows, dataRoot);
+}
+
+const isFileRow = (r: { rule?: unknown }) => WALK_RULES.includes(String(r.rule));
 
 export interface SkipStats {
   total: number;
@@ -209,6 +228,7 @@ export function readSkipped(dataRoot: string | null, samplesPerRule = 2): SkipSt
     if (!line.trim()) continue;
     let r: any;
     try { r = JSON.parse(line); } catch { continue; }
+    if (isFileRow(r)) continue;          // a path, not an event — readSkippedFiles counts those
     total++; bytes += Number(r.bytes ?? 0);
     const a = agg.get(r.rule) ?? { n: 0, bytes: 0 };
     a.n++; a.bytes += Number(r.bytes ?? 0); agg.set(r.rule, a);
@@ -224,5 +244,38 @@ export function readSkipped(dataRoot: string | null, samplesPerRule = 2): SkipSt
     total, bytes,
     byRule: [...agg].map(([rule, a]) => ({ rule, ...a })).sort((x, y) => y.bytes - x.bytes),
     samples,
+  };
+}
+
+export interface SkippedFiles {
+  /** Distinct paths. The log is append-only, so one unreadable directory recurs once per run. */
+  total: number;
+  byRule: { rule: string; n: number }[];
+  /** One row per path — its newest record, plus how many runs logged it. Newest first. */
+  paths: (WalkFailure & { runs: number })[];
+}
+
+export function readSkippedFiles(dataRoot: string | null): SkippedFiles | null {
+  const p = skippedPath(dataRoot);
+  if (!existsSync(p)) return null;
+  const byPath = new Map<string, WalkFailure & { runs: number }>();
+  for (const line of readFileSync(p, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let r: any;
+    try { r = JSON.parse(line); } catch { continue; }
+    if (!isFileRow(r)) continue;
+    const prev = byPath.get(String(r.path));
+    const row = { rule: r.rule, path: String(r.path), error: String(r.error ?? ""), ts: String(r.ts ?? "") };
+    byPath.set(row.path, !prev || row.ts >= prev.ts ? { ...row, runs: (prev?.runs ?? 0) + 1 }
+                                                    : { ...prev, runs: prev.runs + 1 });
+  }
+  if (!byPath.size) return null;
+  const paths = [...byPath.values()].sort((a, b) => b.ts.localeCompare(a.ts));
+  const byRule = new Map<string, number>();
+  for (const x of paths) byRule.set(x.rule, (byRule.get(x.rule) ?? 0) + 1);
+  return {
+    total: paths.length,
+    byRule: [...byRule].map(([rule, n]) => ({ rule, n })).sort((a, b) => b.n - a.n),
+    paths,
   };
 }
