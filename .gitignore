@@ -11,3 +11,6 @@ rust/target/
 
 # scratch probes — never committed
 .tmp/
+
+# bench/ scripts import shared modules (bench_models, report_lang)
+__pycache__/
