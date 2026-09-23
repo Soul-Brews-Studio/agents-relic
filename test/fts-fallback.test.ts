@@ -8,7 +8,7 @@ import { LanceStore } from "../src/store/lance.js";
 import { shardDirFor } from "../src/repo.js";
 import { indexStatus, searchEvents, degradedNote } from "../src/query.js";
 
-// Issue #63: some LanceDB builds refuse ICU. Every machine here HAS ICU, so the refusal is injected.
+// Issue #63: some LanceDB builds refuse ICU. The refusal is injected, so the fallback is tested on every host.
 const tmp = mkdtempSync(join(tmpdir(), "relic-fts-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
 
@@ -25,8 +25,22 @@ async function table() {
 }
 const names = async (t: lancedb.Table) => (await t.listIndices()).map(i => i.name).sort();
 
+/*
+ * #104: the tests that need a REAL ICU cannot pass on a build without one (macOS x86_64).
+ * Probed once, through the production path: it answers `simple` only on the "unknown base
+ * tokenizer" refusal and throws on anything else, so a real failure cannot pass for a
+ * missing ICU. RELIC_REQUIRE_ICU=1 runs them anyway, so a host that should have ICU fails.
+ */
+const HAS_ICU = (await ensureFtsIndex(await table())).tokenizer === "icu";
+const REQUIRE_ICU = process.env.RELIC_REQUIRE_ICU === "1";
+const icuTest = test.skipIf(!HAS_ICU && !REQUIRE_ICU);
+if (!HAS_ICU)
+  console.warn(`⚠ this LanceDB build has no ICU (#104) — ` +
+               (REQUIRE_ICU ? "RELIC_REQUIRE_ICU=1, so the ICU tests run and fail"
+                            : "the ICU tests are skipped; RELIC_REQUIRE_ICU=1 fails them instead"));
+
 describe("ensureFtsIndex — ICU first, `simple` only on a build without ICU", () => {
-  test("ICU available: one ICU index, no fallback", async () => {
+  icuTest("ICU available: one ICU index, no fallback", async () => {
     const t = await table();
     expect(await ensureFtsIndex(t)).toEqual({ tokenizer: "icu", built: true, upgraded: false });
     expect(await names(t)).toEqual(["text_idx"]);
@@ -52,7 +66,7 @@ describe("ensureFtsIndex — ICU first, `simple` only on a build without ICU", (
     expect(await names(t)).toEqual([SIMPLE_INDEX]);
   });
 
-  test("a later run WITH ICU upgrades the shard and drops the fallback", async () => {
+  icuTest("a later run WITH ICU upgrades the shard and drops the fallback", async () => {
     const t = await table();
     await ensureFtsIndex(t, {}, noIcu);
     expect(await ensureFtsIndex(t)).toEqual({ tokenizer: "icu", built: true, upgraded: true });
@@ -61,7 +75,7 @@ describe("ensureFtsIndex — ICU first, `simple` only on a build without ICU", (
     expect((await t.search("ความ", "fts").limit(5).toArray()).length).toBe(2);
   });
 
-  test("an upgrade interrupted between create and drop is finished on the next run", async () => {
+  icuTest("an upgrade interrupted between create and drop is finished on the next run", async () => {
     const t = await table();
     await ensureFtsIndex(t, {}, noIcu);
     await t.createIndex("text", { config: ftsConfig("icu") });
@@ -77,7 +91,7 @@ describe("ensureFtsIndex — ICU first, `simple` only on a build without ICU", (
     expect(await names(t)).toEqual([]);
   });
 
-  test("an existing ICU index is left alone", async () => {
+  icuTest("an existing ICU index is left alone", async () => {
     const t = await table();
     await ensureFtsIndex(t);
     expect(await ensureFtsIndex(t, {}, noIcu)).toEqual({ tokenizer: "icu", built: false });
@@ -85,17 +99,22 @@ describe("ensureFtsIndex — ICU first, `simple` only on a build without ICU", (
 });
 
 describe("the record is read where people look — status and the search header", () => {
-  const root = join(tmp, "root");
   const ev = (uid: string, text: string) => ({
     uid, session_uuid: "s1", file_path: `/x/${uid}.jsonl`, repo_key: "github.com/o/thai", seq: 1, role: "user",
     ts: "2026-09-23T00:00:00.000Z", text, source: "claude", tier: "session", kind: "transcript", worktree: "",
     cwd: "/x", org: "o", project: "", dir: "", mem_type: "", origin_session: "",
   });
-
-  test("a `simple` shard is named by indexStatus and by searchEvents", async () => {
+  // One root per test: the ICU half below skips on a build without ICU, and the `simple` half must not need it.
+  async function simpleShard(root: string) {
     const st = await LanceStore.open(shardDirFor("github.com/o/thai", root));
     await st.putEvents([ev("a", "Air4Thai sensor ความ"), ev("b", "hello world")]);
     expect(await st.ensureFtsIndex({}, noIcu)).toMatchObject({ tokenizer: "simple" });
+    return st;
+  }
+
+  test("a `simple` shard is named by indexStatus and by searchEvents", async () => {
+    const root = join(tmp, "root");
+    await simpleShard(root);
 
     const { rows } = await indexStatus({ dataRoot: root, freshness: false });
     expect(rows.map(r => r.fts)).toEqual(["simple"]);
@@ -104,8 +123,13 @@ describe("the record is read where people look — status and the search header"
     expect(res.hits.length).toBe(1);
     expect(res.degraded).toEqual([rows[0].key]);
     expect(degradedNote(res.degraded, res.shards)).toContain("Thai word-internal matches are missed");
+  });
 
-    // Rebuilt with ICU: the warning goes away on its own.
+  icuTest("rebuilt with ICU, the warning goes away on its own", async () => {
+    const root = join(tmp, "root-icu");
+    const st = await simpleShard(root);
+    expect((await searchEvents("Air4Thai", { dataRoot: root, warnGeneric: false })).degraded).toHaveLength(1);
+
     expect(await st.ensureFtsIndex()).toMatchObject({ tokenizer: "icu", upgraded: true });
     expect((await searchEvents("Air4Thai", { dataRoot: root, warnGeneric: false })).degraded).toEqual([]);
     expect((await indexStatus({ dataRoot: root, freshness: false })).rows[0].fts).toBe("icu");
