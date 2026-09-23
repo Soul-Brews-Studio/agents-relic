@@ -1572,7 +1572,8 @@ function cmdSkippedFiles(f: Record<string, string | boolean>) {
   const r = readSkippedFiles(dataRoot);
   if (outFmt(f) === "json") { console.log(JSON.stringify(r ?? { total: 0, byRule: [], paths: [] }, null, 2)); return; }
   if (!r) { console.log(`no unreadable paths logged — ${skippedPath(dataRoot)}`); return; }
-  console.log(`${fmt(r.total)} path${r.total === 1 ? "" : "s"} the walk could not read — nothing in them was indexed\n`);
+  console.log(`${fmt(r.total)} path${r.total === 1 ? "" : "s"} the walk could not read — ` +
+              `nothing in ${r.total === 1 ? "it" : "them"} was indexed\n`);
   for (const b of r.byRule) console.log(`  ${b.rule.padEnd(26)} ${String(fmt(b.n)).padStart(7)}`);
   const limit = Number(f.limit ?? 20);
   for (const b of r.byRule) {

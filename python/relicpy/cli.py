@@ -839,7 +839,7 @@ def cmd_skipped_files(a) -> int:
         print("no unreadable paths logged")
         return 0
     print(f"{r['total']:,} path{'' if r['total'] == 1 else 's'} the walk could not read — "
-          f"nothing in them was indexed\n")
+          f"nothing in {'it' if r['total'] == 1 else 'them'} was indexed\n")
     for b in r["by_rule"]:
         print(f"  {b['rule']:<26} {b['n']:>7,}")
     for b in r["by_rule"]:
