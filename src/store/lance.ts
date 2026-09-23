@@ -396,7 +396,8 @@ export class LanceStore {
       if (filters.length) s = s.where(filters.join(" AND "));
       return await s.toArray() as unknown as Hit[];
     } catch {
-      const where = [`text LIKE '%${q.replace(/'/g, "''")}%'`, ...filters];
+      // FTS lower-cases its tokens; a raw LIKE does not, so fold both sides.
+      const where = [`lower(text) LIKE '%${q.toLowerCase().replace(/'/g, "''")}%'`, ...filters];
       return await t.query().where(where.join(" AND ")).limit(limit).toArray() as unknown as Hit[];
     }
   }
