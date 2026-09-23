@@ -28,6 +28,8 @@ export interface EmbedProvider {
 }
 
 export const DEFAULT_OLLAMA = "http://localhost:11434";
+/** embed's default: the best vector model bench/ measured on this corpus, with its prompts (#101). */
+export const DEFAULT_MODEL = "embeddinggemma";
 
 export interface MeasuredModel {
   provider: "ollama" | "st";
@@ -49,8 +51,10 @@ export interface MeasuredModel {
  * ranking quality.
  *
  * `knownItem` / `paraphrase`: bench/ (3,000 docs, 400 with Thai, 200 queries each). The
- * ranking numbers, but only for the three sentence-transformers models. FTS scored
- * 0.890 (Thai 0.768) on known-item there, above every model below.
+ * ranking numbers, for the three sentence-transformers models. FTS scored 0.890 (Thai
+ * 0.768) on known-item there, above every model below. `embeddinggemma`'s come from the
+ * second pool (#122, drawn from all banks, where FTS scored 0.941), so they place it
+ * against the others roughly, not to the third decimal.
  */
 export const MEASURED_MODELS: MeasuredModel[] = [
   { provider: "ollama", model: "all-minilm", dim: 384, multilingual: false, enTh: 0.187 },
@@ -58,6 +62,10 @@ export const MEASURED_MODELS: MeasuredModel[] = [
   { provider: "ollama", model: "mxbai-embed-large", dim: 1024, multilingual: false, enTh: 0.479 },
   { provider: "ollama", model: "qwen3-embedding:0.6b", dim: 1024, multilingual: true, enTh: 0.572 },
   { provider: "ollama", model: "bge-m3", dim: 1024, multilingual: true, enTh: 0.626 },
+  // With OLLAMA_PROMPTS on both sides; raw text scores 0.557 / 0.170. `th` is the Thai
+  // share of each set; the Thai-only known-item set (200 targets) scored 0.476.
+  { provider: "ollama", model: "embeddinggemma", dim: 768, multilingual: true,
+    knownItem: { all: 0.646, th: 0.398 }, paraphrase: { all: 0.318, th: 0.398 } },
   { provider: "st", model: "intfloat/multilingual-e5-small", dim: 384, multilingual: true,
     knownItem: { all: 0.600, th: 0.308 }, paraphrase: { all: 0.140, th: 0.214 } },
   { provider: "st", model: "sentence-transformers/all-MiniLM-L6-v2", dim: 384, multilingual: false,
@@ -65,6 +73,24 @@ export const MEASURED_MODELS: MeasuredModel[] = [
   { provider: "st", model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", dim: 384, multilingual: true,
     knownItem: { all: 0.430, th: 0.203 }, paraphrase: { all: 0.081, th: 0.078 } },
 ];
+
+/**
+ * Model-card prompts, for the Ollama models that want them. Ollama's /api/embed sends
+ * text as given, so a model trained with a task prompt gets raw text unless the caller
+ * adds it — and embeddinggemma without its prompts falls from 0.318 to 0.170 paraphrase
+ * MRR, back among the models it otherwise beats (bench/README.md, #122).
+ *
+ * Asymmetric like e5: `doc` goes on everything embed writes, `query` on the search
+ * string. Keyed by model name without its Ollama tag, so `embeddinggemma:300m` matches.
+ * A model with no entry is sent raw text, as it always was.
+ */
+export const OLLAMA_PROMPTS: Record<string, { doc: string; query: string }> = {
+  embeddinggemma: { doc: "title: none | text: ", query: "task: search result | query: " },
+};
+
+export function ollamaPrompts(model: string): { doc: string; query: string } | undefined {
+  return OLLAMA_PROMPTS[model.replace(/:[^:/]*$/, "")];
+}
 
 /**
  * Ollama over HTTP. Chosen as the default because it needs NOTHING added to this
@@ -77,14 +103,17 @@ export const MEASURED_MODELS: MeasuredModel[] = [
  * 384 dims on an English corpus, not for this one, which is en+th. `relic langs`
  * measures how en+th it actually is.
  */
-export function ollamaProvider(model: string, host = DEFAULT_OLLAMA): EmbedProvider {
+export function ollamaProvider(model: string, host = DEFAULT_OLLAMA, prefix?: string): EmbedProvider {
+  // The document prompt from OLLAMA_PROMPTS unless a caller names one: queryProviderFor
+  // passes the query prompt, or "" for a shard written raw. Recorded in the id as st does.
+  const pre = prefix ?? ollamaPrompts(model)?.doc ?? "";
   return {
-    id: `ollama:${model}`,
+    id: `ollama:${model}` + (pre ? `+${pre.trim()}` : ""),
     async embed(texts) {
       const res = await fetch(`${host.replace(/\/$/, "")}/api/embed`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model, input: texts }),
+        body: JSON.stringify({ model, input: pre ? texts.map(t => pre + t) : texts }),
       });
       if (!res.ok) throw new Error(`ollama ${res.status}: ${(await res.text()).slice(0, 200)}`);
       const j = await res.json() as { embeddings?: number[][]; error?: string };
@@ -192,7 +221,8 @@ export function stProvider(model: string, opts: { device?: string; pythonRoot?: 
  * ASYMMETRIC PREFIXES ARE THE TRAP. e5 wants "passage: " on documents and "query: " on
  * queries; using the document prefix for a query costs recall silently. So the stored
  * `+passage:` suffix is read as "this family is asymmetric" and the QUERY side is built
- * with "query: " instead.
+ * with "query: " instead. Ollama's `+title: none | text:` is looked up in OLLAMA_PROMPTS
+ * the same way, and its entry's query prompt is used.
  */
 export function queryProviderFor(storedId: string, device?: string): EmbedProvider {
   const m = /^([^:]+):(.*)$/.exec(storedId);
@@ -201,7 +231,16 @@ export function queryProviderFor(storedId: string, device?: string): EmbedProvid
   const plus = rest.lastIndexOf("+");
   const model = plus >= 0 ? rest.slice(0, plus) : rest;
   const docPrefix = plus >= 0 ? rest.slice(plus + 1) : "";
-  if (kind === "ollama") return ollamaProvider(model);
+  if (kind === "ollama") {
+    // No suffix is a shard written raw — before OLLAMA_PROMPTS, or for a model without
+    // an entry — so its queries go raw too, even for a model that now has prompts.
+    if (!docPrefix) return ollamaProvider(model, DEFAULT_OLLAMA, "");
+    const p = ollamaPrompts(model);
+    if (!p || p.doc.trim() !== docPrefix)
+      throw new Error(`no query prompt known for ${JSON.stringify(storedId)}: OLLAMA_PROMPTS ` +
+                      `has ${p ? JSON.stringify(p.doc.trim()) : "no entry"} for ${model}`);
+    return ollamaProvider(model, DEFAULT_OLLAMA, p.query);
+  }
   if (kind === "st")
     return stProvider(model, { device, prefix: docPrefix === "passage:" ? "query: " : "" });
   throw new Error(`unknown stored provider "${kind}" in ${JSON.stringify(storedId)}`);
@@ -409,7 +448,7 @@ export async function embedShard(store: LanceStore, p: EmbedProvider, o: EmbedOp
 /** `p` comes from the flags unless a caller hands one in, which is how the tests run offline. */
 export async function embedShards(
   o: EmbedOpts = {},
-  p: EmbedProvider = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device),
+  p: EmbedProvider = providerFor(o.provider ?? "ollama", o.model ?? DEFAULT_MODEL, o.host, o.device),
 ): Promise<EmbedTally> {
   const t0 = Date.now();
   // The scope's languages against the model, BEFORE any provider call: the population is

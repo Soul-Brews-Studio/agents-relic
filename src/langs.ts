@@ -6,7 +6,7 @@ import { MEASURED_MODELS, type MeasuredModel } from "./embed.js";
  * `relic langs` — which languages the embeddable corpus is written in, measured, so the
  * embedding model is picked from the text rather than from a default.
  *
- * WHY. The default model is `all-minilm`, which is English-only: bench/ measured it at
+ * WHY. `all-minilm`, the default until #101, is English-only: bench/ measured it at
  * MRR 0.006 on Thai paraphrase queries, and cos(en, th-translation) at +0.187. If a
  * tenth of the corpus carries Thai, a tenth of it embeds as noise and nothing says so.
  * "Which model" is a question about the corpus, and the corpus can answer it.
@@ -276,17 +276,19 @@ export function recommend(r: LangsResult, models: MeasuredModel[] = MEASURED_MOD
   const gib = (dim: number) => (r.estimated * dim * 4) / 2 ** 30;
 
   // Ollama first — it is embed's default provider and needs no Python. Within a provider,
-  // rank by the evidence that provider has: the en-th smoke test for Ollama, the bench/
-  // Thai paraphrase MRR for sentence-transformers. The two are NOT comparable, so they
-  // are never ranked against each other. On an English corpus, fewest dims first.
+  // rank by the best evidence each model has: bench/'s Thai paraphrase MRR where it was
+  // ranked there, else the en-th smoke test. The two are NOT comparable, so a model with
+  // ranking numbers goes above every smoke-test-only one rather than being scored against
+  // it. On an English corpus, fewest dims first.
+  const benched = (m: MeasuredModel) => m.paraphrase !== undefined;
   const candidates = models
     .filter(m => !multi || m.multilingual)
     .map(m => ({ ...m, gib: gib(m.dim) }))
     .sort(multi
-      ? (a, b) => (a.provider === b.provider
-          ? (a.provider === "ollama" ? (b.enTh ?? 0) - (a.enTh ?? 0)
-                                     : (b.paraphrase?.th ?? 0) - (a.paraphrase?.th ?? 0))
-          : a.provider === "ollama" ? -1 : 1)
+      ? (a, b) => (a.provider !== b.provider ? (a.provider === "ollama" ? -1 : 1)
+          : benched(a) !== benched(b) ? (benched(a) ? -1 : 1)
+          : benched(a) ? (b.paraphrase?.th ?? 0) - (a.paraphrase?.th ?? 0)
+          : (b.enTh ?? 0) - (a.enTh ?? 0))
       : (a, b) => a.dim - b.dim || (a.provider === b.provider ? 0 : a.provider === "ollama" ? -1 : 1));
 
   const current: OnDisk[] = r.vectors.map(v =>

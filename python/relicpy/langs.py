@@ -58,6 +58,8 @@ MEASURED_MODELS: list[MeasuredModel] = [
     MeasuredModel("ollama", "mxbai-embed-large", 1024, False, en_th=0.479),
     MeasuredModel("ollama", "qwen3-embedding:0.6b", 1024, True, en_th=0.572),
     MeasuredModel("ollama", "bge-m3", 1024, True, en_th=0.626),
+    MeasuredModel("ollama", "embeddinggemma", 768, True,
+                  known_item={"all": 0.646, "th": 0.398}, paraphrase={"all": 0.318, "th": 0.398}),
     MeasuredModel("st", "intfloat/multilingual-e5-small", 384, True,
                   known_item={"all": 0.600, "th": 0.308}, paraphrase={"all": 0.140, "th": 0.214}),
     MeasuredModel("st", "sentence-transformers/all-MiniLM-L6-v2", 384, False,
@@ -295,9 +297,9 @@ class Recommendation:
 
 
 def recommend(r: LangsResult, models: Optional[list[MeasuredModel]] = None) -> Recommendation:
-    """src/langs.ts recommend(), rule for rule. Ollama candidates rank by their en-th smoke
-    test, sentence-transformers ones by bench/'s Thai paraphrase MRR, and the two are never
-    ranked against each other."""
+    """src/langs.ts recommend(), rule for rule. Within a provider, a model ranked by
+    bench/ goes above every smoke-test-only one; bench/'s Thai paraphrase MRR orders the
+    first group, the en-th smoke test the second, and the two are never compared."""
     models = MEASURED_MODELS if models is None else models
     n = max(1, r.events)
     thai = r.any_thai / n
@@ -306,9 +308,9 @@ def recommend(r: LangsResult, models: Optional[list[MeasuredModel]] = None) -> R
     cands = [Candidate(m, r.estimated * m.dim * 4 / 2 ** 30)
              for m in models if not multi or m.multilingual]
     if multi:
-        cands.sort(key=lambda c: (c.m.provider != "ollama",
-                                  -(c.m.en_th or 0) if c.m.provider == "ollama"
-                                  else -((c.m.paraphrase or {}).get("th") or 0)))
+        cands.sort(key=lambda c: (c.m.provider != "ollama", c.m.paraphrase is None,
+                                  -(c.m.en_th or 0) if c.m.paraphrase is None
+                                  else -(c.m.paraphrase.get("th") or 0)))
     else:
         cands.sort(key=lambda c: (c.m.dim, c.m.provider != "ollama"))
 

@@ -112,13 +112,15 @@ export function helpText(): string {
                                names them — session id, repo, bank, newest first.
                                --paths adds the full session id and absolute path.
                                --tree groups them by directory — which RUN is missing.
-  embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
+  embed   [--model embeddinggemma] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--max-chars 2000]
                                [--dry-run] [--reset] [--force] [--repair]
                                [--session ID]  embed ONE session — the /forward + /new unit
-                               --model all-minilm, the default, is ENGLISH-ONLY: all-MiniLM
-                               scored 0.006 on Thai paraphrase (bench/). For Thai: --model
-                               bge-m3, or --provider st --model intfloat/multilingual-e5-small.
+                               --model embeddinggemma, the default, is multilingual and sent
+                               with its model-card prompts, recorded in the stored id (#101).
+                               --model all-minilm is ENGLISH-ONLY: all-MiniLM scored 0.006 on
+                               Thai paraphrase (bench/). An index already holding another
+                               model keeps it: a shard never mixes two, --reset switches it.
                                Before any provider call, embed samples the scope's languages
                                as langs does, and REFUSES an English-only model when 1% or
                                more of the events carry Thai, or another non-Latin script.

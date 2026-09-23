@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { LanceStore } from "../src/store/lance.js";
 import { shardDirFor } from "../src/repo.js";
 import { uidOf } from "../src/types.js";
-import { MEASURED_MODELS } from "../src/embed.js";
+import { MEASURED_MODELS, DEFAULT_MODEL } from "../src/embed.js";
 import {
   scriptsOf, langOf, englishProse, sampleWhere, scanLangs, recommend, emptyLangs, tallyLang,
   embedCommandFor, renderLangs, MULTILINGUAL_AT,
@@ -93,10 +93,33 @@ describe("recommend", () => {
     expect(rec.verdict).toBe("multilingual");
     expect(rec.thaiShare).toBeCloseTo(0.1);
     expect(rec.candidates.every(c => c.multilingual)).toBe(true);
-    // Ollama first (embed's default provider), ranked by its en-th smoke test.
-    expect(rec.candidates[0].model).toBe("bge-m3");
-    expect(rec.command).toBe("relic embed --model bge-m3");
+    // Ollama first (embed's default provider). Within it, the model bench/ ranked goes
+    // above those with only the en-th smoke test, which order the rest.
+    expect(rec.candidates.map(c => c.model).slice(0, 3)).toEqual(["embeddinggemma", "bge-m3", "qwen3-embedding:0.6b"]);
+    expect(rec.command).toBe("relic embed --model embeddinggemma");
     expect(rec.keep).toBe(false);
+  });
+
+  test("embed's default is the model langs recommends on a Thai corpus with nothing on disk", () => {
+    expect(recommend(corpus(10, 90)).candidates[0].model).toBe(DEFAULT_MODEL);
+  });
+
+  test("a fitting e5 index is never told to switch to the default (#101)", () => {
+    const r = corpus(10, 90);
+    r.vectors = [{ model: "st:intfloat/multilingual-e5-small+passage:", dim: 384, rows: 5, shards: 309, keys: ["projects/a"] }];
+    const rec = recommend(r);
+    expect(rec.candidates[0].model).toBe("embeddinggemma");
+    expect(rec.keep).toBe(true);
+    expect(rec.command).toBe("relic embed --provider st --model intfloat/multilingual-e5-small");
+    expect(rec.command).not.toContain("--reset");
+  });
+
+  test("a default-model index is kept under its prompted id", () => {
+    const r = corpus(10, 90);
+    r.vectors = [{ model: "ollama:embeddinggemma+title: none | text:", dim: 768, rows: 5, shards: 1, keys: ["projects/a"] }];
+    const rec = recommend(r);
+    expect(rec.kept?.fit).toBe("fits");
+    expect(rec.command).toBe("relic embed --model embeddinggemma");
   });
 
   test("the threshold is inclusive", () => {
@@ -116,7 +139,7 @@ describe("recommend", () => {
     const rec = recommend(r);
     expect(rec.current).toEqual([{ model: "ollama:all-minilm", dim: 384, fit: "english-only", shards: 1, keys: ["projects/a"] }]);
     expect(rec.keep).toBe(false);
-    expect(rec.command).toBe("relic embed --model bge-m3 --reset");
+    expect(rec.command).toBe("relic embed --model embeddinggemma --reset");
   });
 
   test("multilingual vectors already on disk are kept, not replaced", () => {
@@ -172,7 +195,7 @@ describe("recommend", () => {
       "relic embed --provider st --model intfloat/multilingual-e5-small --repo laris-co/neo-oracle --all-tiers --data-root '/tmp/a b'");
     r.vectors = [{ model: "ollama:all-minilm", dim: 384, rows: 5, shards: 1, keys: ["projects/a"] }];
     expect(recommend(r).command).toBe(
-      "relic embed --model bge-m3 --reset --repo laris-co/neo-oracle --all-tiers --data-root '/tmp/a b'");
+      "relic embed --model embeddinggemma --reset --repo laris-co/neo-oracle --all-tiers --data-root '/tmp/a b'");
   });
 
   test("a model relic never measured is unmeasured, not English-only, and earns no --reset", () => {
