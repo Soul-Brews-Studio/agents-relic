@@ -116,3 +116,64 @@ def test_the_writer_widens_a_table_that_predates_the_columns(tmp_path):
     rows = lancedb.connect(shard).open_table("events").to_arrow().to_pylist()
     assert {r["uid"]: r["via"] for r in rows}["old"] == ""                # backfilled with the default
     assert sum(1 for r in rows if r["via"]) == 3
+
+
+def _faceted_shard(root, rows, facets=True):
+    """A shard written the way the TypeScript importer writes it — with or without the
+    facet columns — through lancedb directly, so relicpy's READ path is what is tested."""
+    shard = shard_dir_for("github.com/acme/widget", root, False, "projects")
+    os.makedirs(shard, exist_ok=True)
+    base = dict(session_uuid="s", file_path="/f.jsonl", repo_key="github.com/acme/widget", role="user",
+                ts="2026-09-23T00:00:00Z", source="claude", tier="session", kind="transcript", worktree="",
+                cwd=CWD, org="acme", project="", dir="", mem_type="", origin_session="")
+    data = []
+    for i, (text, user) in enumerate(rows):
+        # Distinct ts per row: search collapses events sharing (ts, role, text) as copies.
+        r = dict(base, uid=f"u{i}", seq=float(i + 1), text=text, ts=f"2026-09-23T00:00:0{i}Z")
+        if facets:
+            c = parse_channel_envelope(text) or {}
+            r.update({k: c.get(k, "") for k in ("via", "chat_id", "msg_id", "from_user", "from_user_id", "sent_ts")})
+            if user is not None:
+                r["from_user"] = user
+        data.append(r)
+    db = lancedb.connect(shard)
+    t = db.create_table("events", data=data)
+    t.create_index("text", config=__import__("lancedb.index", fromlist=["FTS"]).FTS(base_tokenizer="icu"))
+    return shard
+
+
+def test_python_search_filters_by_facet_literally(tmp_path):
+    from relicpy.models import Scope
+    from relicpy.query import search_events
+    root = str(tmp_path / "root")
+    _faceted_shard(root, [(TURNS[0][2], "nazt_"), (TURNS[0][2], "naztX"), (TURNS[0][2], "100%")])
+    def who(**kw):
+        return sorted(h.uid for h in search_events("relay", Scope(data_root=root), **kw)["hits"])
+    assert who(from_user="nazt_") == ["u0"]      # `_` is a character, not a wildcard
+    assert who(from_user="%") == ["u2"]
+    assert who(from_user="NAZT") == ["u0", "u1"]
+    assert search_events("relay", Scope(data_root=root), via="discord")["unfaceted"] == 0
+
+
+def test_python_search_on_a_shard_without_the_columns_counts_the_turns(tmp_path):
+    from relicpy.models import Scope
+    from relicpy.query import search_events
+    root = str(tmp_path / "root")
+    _faceted_shard(root, [(TURNS[0][2], None), (TURNS[2][2], None), ("plain relay words", None)], facets=False)
+    res = search_events("relay", Scope(data_root=root), via="discord")
+    assert (res["hits"], res["unfaceted"], res["unfaceted_turns"]) == ([], 1, 2)
+    assert len(search_events("relay", Scope(data_root=root))["hits"]) == 3
+
+
+def test_python_mcp_facet_args_and_full_ids():
+    from relicpy.mcp import _channel_head, _facet_arg
+    assert _facet_arg("chat", 214730) == "214730"
+    assert _facet_arg("via", None) is None
+    with pytest.raises(ValueError, match="needs a value"):
+        _facet_arg("via", True)
+    with pytest.raises(ValueError, match="non-empty"):
+        _facet_arg("from_user", "  ")
+    # The same string test/channel.test.ts pins for channelHead(c, { full: true }).
+    assert _channel_head(parse_channel_envelope(FIX["parse"][0]["text"])) == (
+        "nazt_ (user_id 691531480689541170) · via plugin:discord:discord · chat_id 1512079809021214730 · "
+        "message_id 1540006806481535127 · sent 2026-08-20T14:37:14.608Z")

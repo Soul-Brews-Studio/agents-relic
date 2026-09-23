@@ -19,7 +19,7 @@ from .models import (BankGroup, Hit, PendingFile, PendingGroup, PendingReport,
 from .repo import default_root, list_shards, repo_key_of, resolve_repo_key
 from .store import LanceStore
 from .types import block_role, flatten_content
-from .types import is_host_preamble, strip_envelope
+from .types import is_host_preamble, parse_channel_envelope, strip_envelope
 
 T = TypeVar("T")
 
@@ -167,7 +167,8 @@ def index_status(s: Scope, freshness: bool = True) -> tuple[str, list[ShardStat]
 
 
 def search_events(query: str, s: Scope, limit: int = 20,
-                  all_tiers: bool = False) -> dict:
+                  all_tiers: bool = False, via: Optional[str] = None,
+                  chat: Optional[str] = None, from_user: Optional[str] = None) -> dict:
     """Fan out over the scoped shards, rank ACROSS them, then slice.
 
     Each shard returns its own top-`limit`, so slicing before the global sort would
@@ -177,9 +178,19 @@ def search_events(query: str, s: Scope, limit: int = 20,
     shards = pick_shards(s)
     t0 = time.time()
 
-    def one(sh: Shard) -> list[dict]:
+    faceting = bool(via or chat or from_user)
+
+    def one(sh: Shard) -> tuple[list[dict], int]:
+        stale = 0
         try:
             st = LanceStore.open(sh.dir)
+            # Channel facets, as in src/query.ts: turns indexed before the columns cannot
+            # match, so count them — from the rows, never the schema — and say so.
+            if faceting:
+                stale = sum(1 for t in st.unfaceted_channel_texts() if parse_channel_envelope(t))
+            facet = st.facet_filter(via, chat, from_user)
+            if facet is None:
+                return [], stale
             # PER SHARD, not once: the filter depends on whether THIS shard has the
             # `kind` column, and 509 of the 817 on disk do not. A single filter computed
             # up front is invalid SQL on one of the two populations, and the per-shard
@@ -190,25 +201,34 @@ def search_events(query: str, s: Scope, limit: int = 20,
             # TypeScript implementation included them — the two answered the same query
             # differently, and neither reported a problem.
             where = None if all_tiers else st.main_tiers_filter()
+            if facet:
+                where = facet if where is None else f"({where}) AND {facet}"
             rows = st.search(query, limit=limit, where=where)
         except Exception:
-            return []
+            return [], stale
         for r in rows:
             r["repo"] = sh.repo
             r["bank"] = sh.bank
-        return rows
+        return rows, stale
 
     hits: list[dict] = []
+    unfaceted = unfaceted_turns = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        for rows in pool.map(one, shards):
+        for rows, stale in pool.map(one, shards):
             hits.extend(rows)
+            if stale:
+                unfaceted += 1
+                unfaceted_turns += stale
 
     hits.sort(key=lambda r: r.get("_score") or 0.0, reverse=True)
     hits = dedupe_hits(hits)
     total = len(hits)
-    return {"hits": [_to_hit(h) for h in hits[:limit]],
-            "shards": len(shards), "total": total,
-            "ms": int((time.time() - t0) * 1000)}
+    out = {"hits": [_to_hit(h) for h in hits[:limit]],
+           "shards": len(shards), "total": total,
+           "ms": int((time.time() - t0) * 1000)}
+    if faceting:
+        out.update(unfaceted=unfaceted, unfaceted_turns=unfaceted_turns)
+    return out
 
 
 def _to_hit(h: dict) -> Hit:
