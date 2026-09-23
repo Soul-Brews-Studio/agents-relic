@@ -2,7 +2,7 @@ import { openSync, readSync, closeSync, statSync, readdirSync, existsSync, creat
 import { join, dirname } from "node:path";
 import { createInterface } from "node:readline";
 import { loadSources } from "./sources.js";
-import { encodeProjectDir, treeFiles } from "./live.js";
+import { encodeProjectDir, treeFiles, lastEventMs } from "./live.js";
 import { dur, zoneOffset } from "./time.js";
 
 /**
@@ -65,13 +65,15 @@ export interface Lineage {
 export const WINDOWS = { flushMs: 5_000, relaunchMs: 60_000, adjacencyMs: 120_000 };
 
 const CHUNK = 64 * 1024;
+// Metadata and file-history snapshots can fill a big transcript's first 64 KB (#67).
+const HEAD_STEPS = [CHUNK, 512 * 1024, 4 * 1024 * 1024];
 
-function readChunk(path: string, fromEnd: boolean): { text: string; whole: boolean } {
+function readChunk(path: string, fromEnd: boolean, size = CHUNK): { text: string; whole: boolean } {
   let fd: number | null = null;
   try {
     fd = openSync(path, "r");
     const total = statSync(path).size;
-    const len = Math.min(CHUNK, total);
+    const len = Math.min(size, total);
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, fromEnd ? total - len : 0);
     return { text: buf.toString("utf8"), whole: len === total };
@@ -82,8 +84,8 @@ function readChunk(path: string, fromEnd: boolean): { text: string; whole: boole
   }
 }
 
-function records(path: string, fromEnd: boolean): any[] {
-  const { text, whole } = readChunk(path, fromEnd);
+function records(path: string, fromEnd: boolean, size = CHUNK): { recs: any[]; whole: boolean } {
+  const { text, whole } = readChunk(path, fromEnd, size);
   const parts = text.split("\n");
   // The chunk edge cuts one line in half; drop it rather than misparse it.
   if (!whole) { if (fromEnd) parts.shift(); else parts.pop(); }
@@ -92,7 +94,7 @@ function records(path: string, fromEnd: boolean): any[] {
     if (!p.trim()) continue;
     try { out.push(JSON.parse(p)); } catch { /* half-written line on a live file */ }
   }
-  return out;
+  return { recs: out, whole };
 }
 
 function textOf(content: unknown): string {
@@ -106,8 +108,13 @@ const tsOf = (r: any) => (typeof r?.timestamp === "string" ? Date.parse(r.timest
 
 /** Everything but marks and agents, from the first and last 64 KB only. */
 export function probe(path: string, id: string): LineageNode {
-  const head = records(path, false);
-  const tail = records(path, true);
+  let head: any[] = [];
+  for (const size of HEAD_STEPS) {
+    const r = records(path, false, size);
+    head = r.recs;
+    if (r.whole || head.some(x => Number.isFinite(tsOf(x)))) break;
+  }
+  const tail = records(path, true).recs;
   let startMs = Infinity, endMs = -Infinity;
   let started: StartKind | null = null, cwd: string | null = null, prompt: string | null = null;
   let custom: string | null = null, ai: string | null = null;
@@ -136,6 +143,8 @@ export function probe(path: string, id: string): LineageNode {
     if (r.type === "ai-title" && typeof r.aiTitle === "string") ai = r.aiTitle;
   }
 
+  const last = lastEventMs(path);
+  if (last !== null) endMs = Math.max(endMs, last);
   let mtimeMs = NaN;
   try { mtimeMs = statSync(path).mtimeMs; } catch { /* vanished between readdir and stat */ }
   return { id, path, cwd, startMs, endMs, mtimeMs, started, title: custom ?? ai, prompt,
@@ -382,7 +391,7 @@ export function renderLineage(l: Lineage, opts: { now?: number; current?: string
   out.push(`lineage · ${n} session${n === 1 ? "" : "s"} · ${l.cwd ?? l.projectDir} · UTC${zoneOffset()}`);
 
   const nodeLine = (x: LineageNode) => {
-    const live = now - x.mtimeMs <= liveMs;
+    const live = now - x.endMs <= liveMs;
     const end = live ? "now" : stamp(x.endMs, !sameDay(x.startMs, x.endMs));
     const label = x.title ?? (x.prompt ? `"${x.prompt}"` : "(untitled)");
     const here = x.id === opts.current ? "   ← you are here" : "";

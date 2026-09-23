@@ -1,4 +1,4 @@
-import { readdirSync, statSync, existsSync } from "node:fs";
+import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
@@ -10,13 +10,80 @@ import { loadSources } from "./sources.js";
  *
  * The index is always behind live work by definition: a transcript is being appended to
  * while it is being read, and an import that just ran cannot include the line written a
- * second later. So liveness here is mtime, which is exactly as fresh as the work itself.
+ * second later. So liveness comes from the files — mtime as a cheap prefilter, then the
+ * last timestamped record, because hosts rewrite metadata without a timestamp (#67).
  *
  * This is the one part of relic that deliberately does NOT consult LanceDB.
  */
 
 /** Seconds since a file was last written. */
 const age = (mtimeMs: number) => Math.max(0, Math.round((Date.now() - mtimeMs) / 1000));
+
+const TAIL_STEPS = [64 * 1024, 512 * 1024, 4 * 1024 * 1024];
+
+function stampOf(r: any): number {
+  const t = r?.timestamp;
+  if (typeof t === "string") return Date.parse(t);
+  if (typeof t === "number" && t > 1e12) return t;
+  return NaN;
+}
+
+/** Newest timestamped record near the end of a transcript — when the WORK last happened. */
+export function lastEventMs(path: string): number | null {
+  let fd: number | null = null;
+  try {
+    const size = statSync(path).size;
+    if (!size) return null;
+    fd = openSync(path, "r");
+    for (const step of TAIL_STEPS) {
+      const len = Math.min(step, size);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const lines = buf.toString("utf8").split("\n");
+      if (len < size) lines.shift();          // cut by the window edge
+      let best = -Infinity;
+      for (const line of lines) {
+        if (!line.includes('"timestamp"')) continue;
+        try { const t = stampOf(JSON.parse(line)); if (t > best) best = t; } catch { /* half-written */ }
+      }
+      if (Number.isFinite(best)) return best;
+      if (len === size) return null;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+// Last event never follows the last write, so mtime bounds it; the slack covers clock skew.
+const SKEW_MS = 60_000;
+
+/**
+ * Rank by last event, reading tails newest-mtime first and stopping once no unread file
+ * could beat the `want`-th best. A file with no timestamp keeps its mtime as its clock.
+ */
+export function rankByLastEvent<T extends { path: string; mtimeMs: number }>(cands: T[], want = 1):
+  (T & { lastEventMs: number | null })[] {
+  const key = (x: { mtimeMs: number; lastEventMs: number | null }) => x.lastEventMs ?? x.mtimeMs;
+  const done: (T & { lastEventMs: number | null })[] = [];
+  for (const c of [...cands].sort((a, b) => b.mtimeMs - a.mtimeMs)) {
+    if (done.length >= want) {
+      const kth = done.map(key).sort((a, b) => b - a)[want - 1];
+      if (c.mtimeMs + SKEW_MS < kth) break;
+    }
+    done.push({ ...c, lastEventMs: lastEventMs(c.path) });
+  }
+  return done.sort((a, b) => key(b) - key(a));
+}
+
+/** "last write 30m ago", plus the event clock when the two disagree by minutes. */
+export function clockLabel(writeAgeSec: number, eventAgeSec: number | null): string {
+  const w = `last write ${humanAge(writeAgeSec)} ago`;
+  if (eventAgeSec === null || Math.abs(eventAgeSec - writeAgeSec) <= 180) return w;
+  return `${w}  ·  last event ${humanAge(eventAgeSec)} ago`;
+}
 
 /**
  * cwd -> project directory name.
@@ -69,6 +136,7 @@ export interface LiveFile {
   mtimeMs: number;
   ageSec: number;
   size: number;
+  eventAgeSec?: number;
 }
 
 function jsonlIn(dir: string): string[] {
@@ -127,6 +195,8 @@ export interface CurrentSession {
   cwd: string;
   title: string | null;
   ageSec: number;
+  lastEventMs: number | null;
+  eventAgeSec: number | null;
   confident: boolean;   // false when the transcript's own cwd did not match
 }
 
@@ -257,13 +327,15 @@ async function sessionByUuid(uuid: string, cwd: string): Promise<CurrentSession 
         const st = statOf(path);
         if (!st) continue;
         const { cwd: own, title } = await peek(path);
+        const ev = lastEventMs(path);
         // The ID is authoritative — the host handed it over. `confident` is NOT about
         // the id, it is about the cwd claim, so it stays false when the transcript did
         // not record one and this falls back to the caller's directory. Reporting
         // certainty for a value that was substituted is the failure this flag exists
         // to prevent.
         return { sessionUuid: uuid, projectDir: dir, path, cwd: own ?? cwd, title,
-                 ageSec: age(st.mtimeMs), confident: own !== null };
+                 ageSec: age(st.mtimeMs), lastEventMs: ev, eventAgeSec: ev === null ? null : age(ev),
+                 confident: own !== null };
       }
     }
   }
@@ -279,7 +351,7 @@ async function sessionIn(cand: string, cwd: string): Promise<CurrentSession | nu
   // CLAUDE transcript in the same worktree — a different agent's conversation — every
   // single time, with no error to notice. Observed live: omp got 04d1d650 back, which
   // was the lead Claude session actively writing beside it.
-  let best: { uuid: string; path: string; mtimeMs: number; dir: string } | null = null;
+  const cands: { uuid: string; path: string; mtimeMs: number; dir: string }[] = [];
 
   for (const src of loadSources()) {
     if (src.walk === "flat") continue;              // Codex has no project-dir layout
@@ -288,16 +360,16 @@ async function sessionIn(cand: string, cwd: string): Promise<CurrentSession | nu
 
     for (const f of jsonlIn(dir)) {
       const st = statOf(join(dir, f));
-      if (!st) continue;
-      if (best && st.mtimeMs <= best.mtimeMs) continue;
-      best = { uuid: uuidFromFile(src.walk, f), path: join(dir, f), mtimeMs: st.mtimeMs, dir };
+      if (st) cands.push({ uuid: uuidFromFile(src.walk, f), path: join(dir, f), mtimeMs: st.mtimeMs, dir });
     }
   }
+  const best = rankByLastEvent(cands, 1)[0];
   if (!best) return null;
 
   const { cwd: own, title } = await peek(best.path);
   return { sessionUuid: best.uuid, projectDir: best.dir, path: best.path,
            cwd: own ?? cand, title, ageSec: age(best.mtimeMs),
+           lastEventMs: best.lastEventMs, eventAgeSec: best.lastEventMs === null ? null : age(best.lastEventMs),
            // The transcript's own cwd is the authority. It matches the directory we
            // walked up to, not necessarily the one the caller is standing in.
            confident: own === cand };
@@ -310,6 +382,7 @@ export interface LiveSession {
   title: string | null;
   files: LiveFile[];      // only those inside the window
   ageSec: number;         // freshest write in the tree
+  eventAgeSec: number;    // freshest event in the tree — what the window is judged on
   agents: number;         // live children
 }
 
@@ -445,15 +518,19 @@ export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSes
   // runs here regardless of which engine produced the candidates.
   for (const { project: pdir, uuids } of await freshCandidates(liveRoots(), windowSec)) {
     for (const uuid of uuids) {
-      const files = treeFiles(pdir, uuid).filter(f => f.ageSec <= windowSec);
+      // A metadata-only rewrite freshens mtime without any work happening (#67).
+      const files = treeFiles(pdir, uuid).filter(f => f.ageSec <= windowSec)
+        .map(f => { const ev = lastEventMs(f.path); return { ...f, eventAgeSec: ev === null ? f.ageSec : age(ev) }; })
+        .filter(f => f.eventAgeSec <= windowSec);
       if (!files.length) continue;
       const { cwd, title } = await peek(join(pdir, `${uuid}.jsonl`));
       found.push({ sessionUuid: uuid, projectDir: pdir, cwd, title, files,
                    ageSec: Math.min(...files.map(f => f.ageSec)),
+                   eventAgeSec: Math.min(...files.map(f => f.eventAgeSec)),
                    agents: files.filter(f => f.tier !== "session").length });
     }
   }
-  found.sort((a, b) => a.ageSec - b.ageSec);
+  found.sort((a, b) => a.eventAgeSec - b.eventAgeSec);
   return found.slice(0, limit);
 }
 
