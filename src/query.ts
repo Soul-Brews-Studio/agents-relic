@@ -1,5 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble, stripLeadingEnvelope } from "./types.js";
+import { isHostPreamble, stripEnvelope } from "./types.js";
 export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
@@ -965,7 +965,7 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   if (isHostPreamble(d)) return "(untitled)";
 
   // Rows indexed before import stripped envelopes still carry them, cut at 200 chars.
-  d = stripLeadingEnvelope(d.replace(/\.\.\.\[\+\d+\]$/, ""));
+  d = stripEnvelope(d.replace(/\.\.\.\[\+\d+\]$/, ""));
   if (isHostPreamble(d)) return "(untitled)";
 
   d = d.replace(/<local-command-caveat>[\s\S]*$/, "")

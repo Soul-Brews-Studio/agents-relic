@@ -181,12 +181,14 @@ _STRUCTURAL_TAGS = {
     "local-command-caveat", "local-command-stdout", "local-command-stderr",
 }
 _ENVELOPE = re.compile(r"^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)")
+# The channel tag itself, anywhere (from #80); `<channel-id>` in quoted CLI usage is not it.
+_CHANNEL_TAG = re.compile(r"</?channel(?=[\s>])[^>]*>", re.I)
 
 
-def strip_leading_envelope(text) -> str:
-    """Mirror of stripLeadingEnvelope in src/types.ts — same cases, same results."""
+def strip_envelope(text) -> str:
+    """Mirror of stripEnvelope in src/types.ts — same cases, same results."""
     raw = str(text or "")
-    t, changed = raw, False
+    t = raw
     for _ in range(8):
         m = _ENVELOPE.match(t)
         if not m or m.group(1).lower() in _STRUCTURAL_TAGS or is_host_preamble(t):
@@ -195,5 +197,5 @@ def strip_leading_envelope(text) -> str:
         close = t.find(f"</{m.group(1)}>")
         if close >= 0:
             t = t[:close] + " " + t[close + len(m.group(1)) + 3:]
-        changed = True
-    return t.strip() if changed else raw
+    t = _CHANNEL_TAG.sub(" ", t)
+    return raw if t == raw else t.strip()

@@ -12,7 +12,7 @@ import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
-import { stripLeadingEnvelope } from "./types.js";
+import { stripEnvelope } from "./types.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
@@ -877,7 +877,7 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
 
   for (const e of tail) {
     // A channel envelope is ~180 chars of routing before a word the human typed.
-    const t = (e.role === "user" ? stripLeadingEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
+    const t = (e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
     if (!t) continue;
     const cut = handoffBudget(e.role, chars);
     const body = t.length > cut ? t.slice(0, cut) + " …" : t;
