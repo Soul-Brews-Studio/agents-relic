@@ -113,7 +113,7 @@ describe("both surfaces say it", () => {
     const j = (limit: string) => JSON.parse(cli("--limit", limit, "--json"));
     expect([j("2").exhaustive, j("2").capped]).toEqual([false, 2]);
     expect([j("5").exhaustive, j("5").capped, j("5").total]).toEqual([true, 0, 10]);
-  });
+  }, 30_000);   // spawns the CLI twice; 5 s bun default flaked at 5.36 s under a full suite
 
   /*
    * The MCP server in its own process, over stdio, as a model reaches it. It reads
