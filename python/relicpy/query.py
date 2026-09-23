@@ -19,7 +19,7 @@ from .models import (BankGroup, Hit, PendingFile, PendingGroup, PendingReport,
 from .repo import default_root, list_shards, repo_key_of, resolve_repo_key
 from .store import LanceStore
 from .types import block_role, flatten_content
-from .types import is_host_preamble
+from .types import is_host_preamble, strip_envelope
 
 T = TypeVar("T")
 
@@ -258,6 +258,11 @@ def name_of(row: dict) -> str:
     if is_host_preamble(d):
         return "(untitled)"
 
+    # Rows indexed before import stripped envelopes still carry them, cut at 200 chars.
+    d = strip_envelope(re.sub(r"\.\.\.\[\+\d+\]$", "", d))
+    if is_host_preamble(d):
+        return "(untitled)"
+
     d = re.sub(r"<local-command-caveat>[\s\S]*$", "", d)
     d = re.sub(r"^\s*Caveat: The messages below were generated[\s\S]*$", "", d)
     # A pasted image carries a long tag the {1,40} scrubber cannot reach, and a message
@@ -319,10 +324,10 @@ def group_transcripts(rows: list[dict]) -> list[dict]:
 def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str] = None,
                   worktree: Optional[str] = None, limit: int = 40,
                   tiers: Optional[list[str]] = None, group: bool = True) -> dict:
-    """Newest first, filtered on the session's OWN first timestamp — not file mtime.
+    """Newest first, filtered on the session's OWN event timestamps — not file mtime.
 
-    An old session that got one new line stays old, which is what someone asking
-    "what was I working on last Tuesday" means.
+    A session matches any window it was active in (started before it closed, last
+    event after it opened); its row still shows its own start.
 
     TIER, BECAUSE `sessions` HOLDS ONE ROW PER INDEXED FILE — of any kind. A vault
     note is a row here, and the vault dwarfs everything else. Measured 2026-09-22
@@ -358,7 +363,9 @@ def list_sessions(scope: Scope, since: Optional[str] = None, until: Optional[str
     rows = [r for r in rows if (r.get("tier") or "") in keep]
     if since:
         lo = to_iso(since)
-        rows = [r for r in rows if (r.get("started_at") or "") >= lo]
+        # Overlap, not start-in-window: a session still running inside the window was active in it.
+        rows = [r for r in rows if (r.get("ended_at") or "") >= lo
+                or (not r.get("ended_at") and (r.get("started_at") or "") >= lo)]
     if until:
         hi = to_iso(until)
         rows = [r for r in rows if (r.get("started_at") or "") <= hi]
@@ -542,6 +549,15 @@ def to_iso(spec: str) -> str:
         n = int(m.group(1))
         delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[m.group(2)]
         return (datetime.now(timezone.utc) - delta).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    # Stored stamps are UTC text, so an offset or a bare local time must be converted first.
+    if "T" in (spec or ""):
+        try:
+            dt = datetime.fromisoformat(spec.replace("Z", "+00:00"))
+        except ValueError:
+            return spec
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return spec
 
 

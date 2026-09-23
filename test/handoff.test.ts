@@ -1,6 +1,7 @@
 import { expect, test, describe } from "bun:test";
-import { dur, handoffStats } from "../src/time.js";
+import { dur, handoffStats, usableStamps } from "../src/time.js";
 import { handoffBudget, isHarnessTurn, isInboundTurn } from "../src/recap.js";
+import { stripEnvelope } from "../src/types.js";
 
 /**
  * `relic tail --handoff` exists so the NEXT session is handed the pacing of this one
@@ -55,6 +56,36 @@ describe("handoffStats", () => {
     const base = Date.parse("2026-09-22T04:00:00Z");
     const st = handoffStats([base, base + 5 * 60_000])!;
     expect(st.spanMs).toBe(5 * 60_000);
+  });
+});
+
+/*
+ * `handoffStats` returning null carried two meanings at the print site: "nothing here
+ * parses" and "one stamp, nothing to space it against". The header said the first when
+ * it meant the second, so a session of one human turn — the NORMAL shape on a host that
+ * opens a session per inbound message — read as a damaged transcript. These pin the
+ * split: the arithmetic still refuses to invent a span, the stamps stay countable.
+ */
+describe("usableStamps", () => {
+  test("one usable stamp is still one stamp, even though there is no span", () => {
+    const one = usableStamps([null, "2026-09-21T13:58:00Z", "not a date", undefined]);
+    expect(one).toHaveLength(1);
+    expect(handoffStats(one)).toBeNull();          // the span refuses, as designed
+  });
+
+  test("none usable stays none — the two cases must not collapse into each other", () => {
+    expect(usableStamps([])).toHaveLength(0);
+    expect(usableStamps([null, undefined, "", "not a date"])).toHaveLength(0);
+  });
+
+  test("sorted ascending, so a caller can date a block from the first element", () => {
+    const ms = usableStamps(["2026-09-22T04:30:00Z", "2026-09-22T04:00:00Z"]);
+    expect(ms[0]).toBe(Date.parse("2026-09-22T04:00:00Z"));
+  });
+
+  test("feeds handoffStats unchanged — one parse, same answer", () => {
+    const raw = ["2026-09-22T00:00:00Z", null, "2026-09-22T02:00:00Z"];
+    expect(handoffStats(usableStamps(raw))).toEqual(handoffStats(raw));
   });
 });
 
@@ -131,5 +162,44 @@ describe("isInboundTurn", () => {
   test("a real human turn is neither", () => {
     expect(isHarnessTurn("merge it")).toBe(false);
     expect(isInboundTurn("merge it")).toBe(false);
+  });
+});
+
+/**
+ * Ported from #80 (Yutthakit / ChaiKlang Oracle). A channel plugin wraps every human
+ * turn in an envelope of ids and a timestamp. `--handoff` promises the human's turns in
+ * full; left in, the envelope spends that budget on metadata.
+ */
+describe("channel envelope in a handoff turn", () => {
+  const ENVELOPE =
+    '<channel source="plugin:discord:discord" chat_id="1512079809021214730" ' +
+    'message_id="1552137023371083839" user="nazt_" user_id="691531480689541170" ' +
+    'ts="2026-09-23T01:58:23.683Z">\nfix the bug and submit a PR\n</channel>';
+
+  test("the request survives, the envelope does not", () => {
+    const t = stripEnvelope(ENVELOPE).replace(/\s+/g, " ").trim();
+    expect(t).toBe("fix the bug and submit a PR");
+  });
+
+  test("it fits a budget the envelope alone would have exhausted", () => {
+    // handoffBudget gives a user turn the full allowance; 90 chars is smaller than
+    // the envelope's ~180, so before this the request never reached the block.
+    const cut = handoffBudget("user", 90);
+    const raw = ENVELOPE.replace(/\s+/g, " ").trim();
+    expect(raw.slice(0, cut)).not.toContain("fix the bug");
+
+    const cleaned = stripEnvelope(ENVELOPE).replace(/\s+/g, " ").trim();
+    expect(cleaned.slice(0, cut)).toContain("fix the bug and submit a PR");
+  });
+
+  test("an unclosed envelope is still stripped — description truncates at 200 chars", () => {
+    const t = stripEnvelope('<channel source="plugin:discord:discord" user="nazt_">\nready?')
+      .replace(/\s+/g, " ").trim();
+    expect(t).toBe("ready?");
+  });
+
+  test("a turn with no envelope is returned unchanged, Thai included", () => {
+    const plain = "ลองแล้ว — relic lineage ยังไม่มีในเครื่องผม";
+    expect(stripEnvelope(plain)).toBe(plain);
   });
 });

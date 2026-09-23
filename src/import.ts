@@ -1,6 +1,7 @@
 import { LanceStore, type EventRow, type SessionRow, type FileRow } from "./store/lance.js";
 import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
+import { progress } from "./progress.js";
 import { kindOf } from "./discover.js";
 import { resolveRepoKey, repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
 
@@ -176,15 +177,16 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
    * look dead. The ETA uses the scan rate, which is the thing that actually paces the
    * run — an unchanged file still costs a parse.
    */
+  const bar = progress();
   const progressTick = () => {
     const secs = (Date.now() - t0) / 1000;
     const rate = secs > 0 ? done / secs : 0;
     const eta = rate > 0 ? Math.round((found.length - done) / rate) : 0;
     const pct = Math.round((done / Math.max(1, found.length)) * 100);
-    process.stderr.write(
-      `\r  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} scanned` +
+    bar.tick(
+      `  ${String(pct).padStart(3)}%  ${fmt(done)}/${fmt(found.length)} scanned` +
       `  ${fmt(imported)} imported  ${fmt(skipped)} unchanged  ${fmt(added)} events` +
-      `  ${shards.size} shards  ${rate.toFixed(0)}/s  eta ${eta}s   `);
+      `  ${shards.size} shards  ${rate.toFixed(0)}/s  eta ${eta}s   `, pct);
   };
 
   let sinceFlush = 0;
@@ -288,7 +290,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       if (o.verbose) process.stderr.write(`  FAIL ${file.path}: ${String(err).slice(0, 160)}\n`);
     }
   }
-  if (o.progress && done >= 100) process.stderr.write("\r" + " ".repeat(96) + "\r");
+  if (o.progress) bar.clear();
 
   // A scan writes nothing, so there is nothing to flush and no index to rebuild.
   if (o.noWrite)
@@ -311,8 +313,10 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   const keys = shards.keys();
   let ftsBuilt = 0, ftsFailed = 0, ftsUpgraded = 0, ftsNoIcu = "";
   const ftsSimple: string[] = [];
+  const ftsBar = progress();
   for (let i = 0; i < keys.length; i++) {
-    if (o.progress) process.stderr.write(`\r  building full-text index  ${i + 1}/${keys.length} shards   `);
+    if (o.progress) ftsBar.tick(`  building full-text index  ${i + 1}/${keys.length} shards   `,
+                                ((i + 1) / keys.length) * 100, i === keys.length - 1);
     try {
       const r = await shards.byKey(keys[i])!.ensureFtsIndex();
       ftsBuilt++;
@@ -328,7 +332,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       if (o.verbose) process.stderr.write(`\n  FTS FAIL: ${String(err).slice(0, 160)}\n`);
     }
   }
-  if (o.progress && keys.length) process.stderr.write("\r" + " ".repeat(60) + "\r");
+  if (o.progress) ftsBar.clear();
   return { added, skipped, failed, filtered, skippedNoise, done, imported, shards, seen,
            ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0, ftsSimple, ftsNoIcu, ftsUpgraded };
 }

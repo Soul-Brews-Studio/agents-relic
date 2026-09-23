@@ -1,9 +1,10 @@
 import { openSync, readSync, closeSync, statSync, readdirSync, existsSync, createReadStream } from "node:fs";
 import { join, dirname } from "node:path";
 import { createInterface } from "node:readline";
-import { loadSources } from "./sources.js";
+import { loadSources, transcriptRoots } from "./sources.js";
 import { encodeProjectDir, treeFiles } from "./live.js";
 import { dur, zoneOffset } from "./time.js";
+import { stripEnvelope } from "./types.js";
 
 /**
  * Which session ids are ONE line of work.
@@ -16,7 +17,7 @@ import { dur, zoneOffset } from "./time.js";
  */
 
 export type StartKind = "startup" | "clear" | "resume" | "compact";
-export type LinkKind = "fork" | "clear" | "relaunch";
+export type LinkKind = "fork" | "clear" | "relaunch" | "session_key";
 
 export interface Mark { kind: "compact" | "resume"; atMs: number }
 
@@ -124,7 +125,8 @@ export function probe(path: string, id: string): LineageNode {
     if (r.type === "user" && !r.isMeta) {
       const text = textOf(r.message?.content).trim();
       if (!started && text.includes("<command-name>/clear</command-name>")) started = "clear";
-      if (!prompt && text && !text.startsWith("<")) prompt = text.split("\n")[0].slice(0, 60);
+      const said = stripEnvelope(text);
+      if (!prompt && said && !said.startsWith("<")) prompt = said.split("\n")[0].slice(0, 60);
     }
     if (r.type === "custom-title" && typeof r.customTitle === "string") custom = r.customTitle;
     if (r.type === "ai-title" && typeof r.aiTitle === "string") ai = r.aiTitle;
@@ -167,7 +169,7 @@ export async function scanMarks(path: string, startMs: number): Promise<Mark[]> 
 
 const NAMED_AGENT = /^agent-a(.+)-[0-9a-f]{16}$/;
 
-function peak(spans: { startMs: number; endMs: number }[]): number {
+export function peak(spans: { startMs: number; endMs: number }[]): number {
   const edges: [number, number][] = [];
   for (const s of spans) edges.push([s.startMs, 1], [Math.max(s.endMs, s.startMs), -1]);
   edges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -243,7 +245,8 @@ export function inferLinks(nodes: LineageNode[], w = WINDOWS): Link[] {
 function claudeRoots(): string[] {
   const seen = new Set<string>();
   for (const s of loadSources())
-    if (s.walk === "claude-tiers" && s.enabled && existsSync(s.path)) seen.add(s.path);
+    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && s.enabled)
+      for (const root of transcriptRoots(s)) if (existsSync(root)) seen.add(root);
   return [...seen];
 }
 
@@ -287,31 +290,32 @@ export function findSessions(prefix: string, cwd = process.cwd()): { id: string;
   return [...seen.values()];
 }
 
+/** The ids in the tree holding `target` — up to its root, then every descendant. */
+export function chainMembers(ids: string[], links: Link[], target: string, all: boolean): Set<string> {
+  if (all) return new Set(ids);
+  const parentOf = new Map(links.map(l => [l.child, l.parent]));
+  const kids = new Map<string, string[]>();
+  for (const l of links) kids.set(l.parent, [...(kids.get(l.parent) ?? []), l.child]);
+  let root = target;
+  const seen = new Set<string>();
+  while (parentOf.has(root) && !seen.has(root)) { seen.add(root); root = parentOf.get(root)!; }
+  const keep = new Set<string>();
+  const stack = [root];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (keep.has(id)) continue;
+    keep.add(id);
+    stack.push(...(kids.get(id) ?? []));
+  }
+  return keep;
+}
+
 export async function buildLineage(projectDir: string, target: string, opts: { all?: boolean } = {}): Promise<Lineage> {
   const nodes = jsonlIn(projectDir)
     .map(f => probe(join(projectDir, f), f.slice(0, -".jsonl".length)))
     .filter(n => Number.isFinite(n.startMs));
   const links = inferLinks(nodes);
-
-  const parentOf = new Map(links.map(l => [l.child, l.parent]));
-  const kids = new Map<string, string[]>();
-  for (const l of links) kids.set(l.parent, [...(kids.get(l.parent) ?? []), l.child]);
-
-  let keep: Set<string>;
-  if (opts.all) keep = new Set(nodes.map(n => n.id));
-  else {
-    let root = target;
-    const seen = new Set<string>();
-    while (parentOf.has(root) && !seen.has(root)) { seen.add(root); root = parentOf.get(root)!; }
-    keep = new Set<string>();
-    const stack = [root];
-    while (stack.length) {
-      const id = stack.pop()!;
-      if (keep.has(id)) continue;
-      keep.add(id);
-      stack.push(...(kids.get(id) ?? []));
-    }
-  }
+  const keep = chainMembers(nodes.map(n => n.id), links, target, Boolean(opts.all));
 
   const members = nodes.filter(n => keep.has(n.id));
   for (const n of members) {
@@ -359,11 +363,15 @@ function markLines(n: LineageNode): string[] {
   return out;
 }
 
+// A uuid is unique in 8 chars; a Hermes id opens with its date, so it is kept whole.
+const shortId = (id: string) => (/^[0-9a-f]{8}-/i.test(id) ? id.slice(0, 8) : id);
+
 function linkLine(l: Link): string {
   const gap = dur(l.gapMs);
   const flag = (l.via === "last-event" ? " · matched on last event" : "") + (l.ambiguous ? " · (!) ambiguous" : "");
   if (l.kind === "clear") return `/clear → new id ${gap} later${flag}`;
   if (l.kind === "fork") return `resumed into a new id ${gap} later · carries the parent's turns`;
+  if (l.kind === "session_key") return `same session_key → new id ${gap} later`;
   return `relaunch ${gap} later · no marker${flag}`;
 }
 
@@ -386,7 +394,7 @@ export function renderLineage(l: Lineage, opts: { now?: number; current?: string
     const end = live ? "now" : stamp(x.endMs, !sameDay(x.startMs, x.endMs));
     const label = x.title ?? (x.prompt ? `"${x.prompt}"` : "(untitled)");
     const here = x.id === opts.current ? "   ← you are here" : "";
-    return `${x.id.slice(0, 8)}  ${stamp(x.startMs, true)} → ${end}   ${dur((live ? now : x.endMs) - x.startMs)}   ${label}${here}`;
+    return `${shortId(x.id)}  ${stamp(x.startMs, true)} → ${end}   ${dur((live ? now : x.endMs) - x.startMs)}   ${label}${here}`;
   };
 
   const walk = (x: LineageNode, prefix: string) => {
