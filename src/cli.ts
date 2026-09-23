@@ -43,6 +43,7 @@ import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
+import { rebuildFts } from "./fts-rebuild.js";
 
 const fmt = (n: number) => n.toLocaleString("en-US");
 
@@ -93,6 +94,7 @@ function resolveSourcePath(f: Record<string, string | boolean>, only: string[] |
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
+  if (f["fts-rebuild"]) return cmdFtsRebuild(dataRoot, inRepo, Boolean(f["dry-run"]));
   const skipNoise = wantSkipNoise(f);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
@@ -156,6 +158,10 @@ async function cmdIndex(f: Record<string, string | boolean>) {
               (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
   if (tally.ftsUpgraded)
     console.log(`  fts:         ${tally.ftsUpgraded} shard${tally.ftsUpgraded === 1 ? "" : "s"} rebuilt from \`simple\` to ICU`);
+  if (tally.ftsDrifted) {
+    console.log(`  fts:         ${tally.ftsDrifted} shard${tally.ftsDrifted === 1 ? "" : "s"} rebuilt — the old index dropped stop words, "nas" and "bin" among them (#97)`);
+    console.log(`               shards this run did not reach keep theirs: relic index --fts-rebuild rebuilds every shard`);
+  }
   if (tally.ftsSimple.length) {
     const n = tally.ftsSimple.length;
     console.log(`  \u26A0 fts:       ${n} shard${n === 1 ? "" : "s"} on the \`simple\` tokenizer — this LanceDB build has no ICU` +
@@ -233,6 +239,41 @@ function reportPrune(plan: PrunePlan, maxDropPct: number) {
   // "nothing to prune" and "never looked" are different facts. Only one means clean.
   if (plan.untouched) console.log(`  ${plan.untouched} shard${plan.untouched === 1 ? "" : "s"} on disk were not reached by this run — never considered`);
   if (!plan.applied && tot.files) console.log(`\n  to remove them:  relic prune --apply`);
+}
+
+/**
+ * `index --fts-rebuild`: the full-text index of every shard on disk, rebuilt with today's
+ * ftsConfig() — once per machine after an FTS setting changes (#97). Imports nothing.
+ * The root goes in the header, so a run aimed at the wrong index says so before it writes.
+ */
+async function cmdFtsRebuild(dataRoot: string | null, inRepo: boolean, dryRun: boolean) {
+  const where = dataRoot ?? (inRepo ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
+  console.log(`\u{1F3FA} relic fts rebuild  (every shard under ${where} · imports nothing` +
+              `${dryRun ? " · DRY RUN — no writes" : ""})`);
+  if (dryRun) {
+    console.log(`  would rebuild: ${fmt(listShards(dataRoot, inRepo).length)} shards`);
+    return;
+  }
+  const r = await rebuildFts({ dataRoot, inRepo, progress: true });
+  const s = (n: number) => (n === 1 ? "" : "s");
+  const refusal = /unknown base tokenizer [\w-]+/i.exec(r.noIcu)?.[0] ?? r.noIcu.slice(0, 80);
+  console.log(`  shards:      ${fmt(r.shards)} on disk`);
+  console.log(`  rebuilt:     ${fmt(r.rebuilt)}` +
+              (r.drifted ? `  (${fmt(r.drifted)} had been built dropping stop words — #97)` : ""));
+  console.log(`  skipped:     ${fmt(r.empty + r.kept)}` +
+              (r.empty ? `  (${fmt(r.empty)} with no events table)` : ""));
+  if (r.kept)
+    console.log(`  \u26A0 kept:      ${fmt(r.kept)} ICU index${r.kept === 1 ? " as it is" : "es as they are"} — this LanceDB build has no ICU` +
+                ` ("${refusal}"). Rebuild on a machine where ICU loads.`);
+  if (r.simple.length)
+    console.log(`  \u26A0 fts:       ${r.simple.length} shard${s(r.simple.length)} rebuilt with \`simple\` — this LanceDB build has no ICU` +
+                ` ("${refusal}"). Thai substring search degraded; a run where ICU loads rebuilds ${r.simple.length === 1 ? "it" : "them"}.`);
+  console.log(`  failed:      ${fmt(r.failed.length)}` +
+              (r.failed.length ? `  \u26A0 those shards keep their old index` : ""));
+  for (const x of r.failed.slice(0, 5)) console.log(`               ${x.key}  ${x.err}`);
+  if (r.failed.length > 5) console.log(`               ... and ${r.failed.length - 5} more`);
+  console.log(`  time:        ${(r.ms / 1000).toFixed(1)}s`);
+  if (r.failed.length) process.exitCode = 1;
 }
 
 // ---- prune -----------------------------------------------------------------

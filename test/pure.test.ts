@@ -408,10 +408,10 @@ describe("contentTerms — the generic-query warning's input, issue #32", () => 
     expect(contentTerms("fix the bug in the search function")).toEqual(["fix", "bug", "search", "function"]);
   });
 
-  test("stopwords match what the FTS index itself does — searching 'the' returns 0", () => {
-    // Measured on the live index: t.search("the"/"in", "fts") comes back with 0 hits
-    // because the tokenizer drops them, so counting them toward rarity would read
-    // every stopword as "specific" — the opposite of what the index says about them.
+  test("stopwords never reach the rarity probe — they cannot anchor a query", () => {
+    // Once because the index dropped them: t.search("the", "fts") gave 0 hits, which the
+    // probe reads as "rare". Since #97 the index keeps every word, so "the" would probe as
+    // common instead — skipping it saves the probe, and an all-stopword query has nothing to check.
     expect(contentTerms("the in of")).toEqual([]);
   });
 

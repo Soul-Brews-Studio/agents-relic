@@ -181,10 +181,10 @@ export interface SearchResult {
  * single rare identifier, and fires for "herdr pane run agent prompt
  * recent-unwrapped" (every remaining term >= 0.55) — the two ends of the measured
  * range. "the"/"in"/"of" never reach the probe at all: they are stopwords in
- * `contentTerms`, matching the fact that the FTS index itself returns 0 hits for
- * them (measured: `t.search("the", "fts")` on a live shard — the tokenizer drops
- * them, so counting them toward rarity would misclassify every stopword as
- * "specific").
+ * `contentTerms`. That began as matching the index, whose tokenizer dropped them —
+ * `t.search("the", "fts")` returned 0 hits, which the probe would read as "rare".
+ * Since #97 the index keeps every word, so "the" would probe as common instead;
+ * skipping it now just saves a probe, since a stopword can never anchor a query.
  *
  * MIN TERM COUNT IS 2, NOT NAT'S PROPOSED 3: the issue's own motivating failure —
  * "facebook transcribe" — is two words. Gating on 3 would never fire on the report
