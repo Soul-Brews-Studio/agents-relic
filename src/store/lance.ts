@@ -22,7 +22,7 @@ import { mkdirSync } from "node:fs";
  */
 
 export interface EventRow {
-  uid: string;            // sha1(source, basename, seq) — path-independent, dedups across roots
+  uid: string;            // sha1(source, treeKeyOf(path), seq) — root-independent, dedups across roots
   session_uuid: string;
   file_path: string;
   repo_key: string;
@@ -226,6 +226,27 @@ export class LanceStore {
   async deleteEventsOf(filePath: string): Promise<void> {
     const t = await this.existing("events");
     await t?.delete(`file_path = ${sqlStr(filePath)}`);
+  }
+
+  /** (uid, seq, file_path) of every event these files own — chunked like pruneFiles. */
+  async eventKeysOf(paths: string[]): Promise<{ uid: string; seq: number; file_path: string }[]> {
+    const t = await this.existing("events");
+    if (!t || !paths.length) return [];
+    const out: { uid: string; seq: number; file_path: string }[] = [];
+    for (let i = 0; i < paths.length; i += 200) {
+      const where = `file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`;
+      for (const r of await t.query().where(where).select(["uid", "seq", "file_path"]).toArray() as any[])
+        out.push({ uid: String(r.uid), seq: Number(r.seq), file_path: String(r.file_path) });
+    }
+    return out;
+  }
+
+  /** Vectors whose events are about to be re-keyed would otherwise be orphans nothing can reach. */
+  async deleteVectors(uids: string[]): Promise<void> {
+    const t = await this.existing("vectors");
+    if (!t) return;
+    for (let i = 0; i < uids.length; i += 200)
+      await t.delete(`uid IN (${uids.slice(i, i + 200).map(sqlStr).join(", ")})`);
   }
 
   /**

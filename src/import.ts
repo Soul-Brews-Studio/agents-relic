@@ -3,6 +3,8 @@ import type { Found } from "./discover.js";
 import { classify, logSkipped } from "./noise.js";
 import { kindOf } from "./discover.js";
 import { resolveRepoKey, repoKeyOf, contextOf, locationOf, shardDirFor, guardShardDir, DEFAULT_BANK } from "./repo.js";
+import { uidOf, treeKeyOf } from "./types.js";
+import { basename } from "node:path";
 
 /**
  * Writing into the index.
@@ -86,6 +88,8 @@ export interface ImportOpts {
 export interface ImportTally {
   added: number; skipped: number; failed: number; filtered: number;
   skippedNoise: number; done: number; imported: number; shards: Shards;
+  /** Unchanged files re-imported because their events were keyed by the pre-#58 uid. */
+  repaired: number;
   /**
    * Every file DISCOVERED this run, grouped by shard key — including the ones skipped
    * as unchanged, which are the overwhelming majority on a repeat run and are exactly
@@ -96,6 +100,36 @@ export interface ImportTally {
   ftsBuilt: number; ftsFailed: number; ftsMs: number;
 }
 
+/** Paths that share a basename but not a tree key — the pairs the basename-only uid collided (#58). */
+export function sameNameGroups(paths: Iterable<string>): string[][] {
+  const byName = new Map<string, string[]>();
+  for (const p of paths) {
+    const name = basename(p);
+    const g = byName.get(name);
+    if (g) g.push(p); else byName.set(name, [p]);
+  }
+  return [...byName.values()].filter(g => g.length > 1 && new Set(g.map(treeKeyOf)).size > 1);
+}
+
+export interface LegacyRepair { paths: Set<string>; uids: Map<string, string[]> }
+
+// Colliding groups still on basename uids re-import whole: a member whose rows were all overwritten has none left to detect.
+export async function legacyCollisions(store: LanceStore, manifestPaths: Iterable<string>): Promise<LegacyRepair> {
+  const out: LegacyRepair = { paths: new Set(), uids: new Map() };
+  const groups = sameNameGroups(manifestPaths);
+  if (!groups.length) return out;
+  const groupOf = new Map<string, string[]>();
+  for (const g of groups) for (const p of g) groupOf.set(p, g);
+  for (const r of await store.eventKeysOf([...groupOf.keys()])) {
+    const legacy = uidOf("claude", basename(r.file_path), r.seq);
+    if (r.uid !== legacy || legacy === uidOf("claude", treeKeyOf(r.file_path), r.seq)) continue;
+    for (const p of groupOf.get(r.file_path) ?? []) out.paths.add(p);
+    const u = out.uids.get(r.file_path);
+    if (u) u.push(r.uid); else out.uids.set(r.file_path, [r.uid]);
+  }
+  return out;
+}
+
 /**
  * Import a list of files. Shared by `index` and by the seek-then-index path, so an
  * on-demand import of one file behaves identically to a bulk run — same skip rules,
@@ -104,7 +138,8 @@ export interface ImportTally {
 export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()): Promise<ImportTally> {
   const shards = new Shards(o.dataRoot, o.inRepo);
   const manifests = new Map<string, Map<string, { mtime: number; size: number }>>();
-  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0;
+  const repairs = new Map<string, LegacyRepair>();
+  let added = 0, skipped = 0, failed = 0, done = 0, filtered = 0, skippedNoise = 0, imported = 0, repaired = 0;
   const seen = new Map<string, Set<string>>();
 
   /*
@@ -130,11 +165,11 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   // The batch carries its own store. The shard key is now (bank, repo), and re-deriving
   // a store from that string in flush() would mean parsing the key back apart — the exact
   // shape of bug this change exists to remove.
-  interface Pending { store: LanceStore; events: EventRow[]; sessions: SessionRow[]; files: FileRow[]; deletes: string[] }
+  interface Pending { store: LanceStore; events: EventRow[]; sessions: SessionRow[]; files: FileRow[]; deletes: string[]; vectorDeletes: string[] }
   const pending = new Map<string, Pending>();
   const pend = (k: string, store: LanceStore): Pending => {
     let b = pending.get(k);
-    if (!b) { b = { store, events: [], sessions: [], files: [], deletes: [] }; pending.set(k, b); }
+    if (!b) { b = { store, events: [], sessions: [], files: [], deletes: [], vectorDeletes: [] }; pending.set(k, b); }
     return b;
   };
 
@@ -142,6 +177,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     for (const b of pending.values()) {
       if (!b.events.length && !b.sessions.length && !b.files.length && !b.deletes.length) continue;
       const store = b.store;
+      if (b.vectorDeletes.length) await store.deleteVectors(b.vectorDeletes);
       // Deletes FIRST and as a unit: a re-imported file must drop its old rows before
       // the new ones land, or the two generations coexist.
       for (const fp of b.deletes) await store.deleteEventsOf(fp);
@@ -162,7 +198,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       }
       if (b.sessions.length) await store.putSessions(b.sessions);
       if (b.files.length)    await store.putFiles(b.files);
-      b.events = []; b.sessions = []; b.files = []; b.deletes = [];
+      b.events = []; b.sessions = []; b.files = []; b.deletes = []; b.vectorDeletes = [];
     }
   }
 
@@ -229,14 +265,20 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       const ctx = contextOf(p.cwd);
       const loc = locationOf(p.cwd);
 
-      if (!manifests.has(shardKey)) manifests.set(shardKey, await store.manifest());
+      if (!manifests.has(shardKey)) {
+        const m = await store.manifest();
+        manifests.set(shardKey, m);
+        repairs.set(shardKey, await legacyCollisions(store, m.keys()));
+      }
       const man = manifests.get(shardKey)!;
+      const fix = repairs.get(shardKey)!;
       // `known`, not `seen`: the run-wide `seen` map is read earlier in this same
       // block, and a second block-scoped `const seen` puts it in the temporal dead
       // zone for the whole block — every file threw ReferenceError, and the importer
       // reported them as parse failures.
       const known = man.get(file.path);
-      if (known && known.mtime === file.mtime && known.size === file.size) { skipped++; continue; }
+      const legacy = fix.paths.has(file.path);
+      if (known && known.mtime === file.mtime && known.size === file.size && !legacy) { skipped++; continue; }
 
       const dropped: any[] = [];
       const kept = o.skipNoise
@@ -265,6 +307,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
 
       const batch = pend(shardKey, store);
       if (known) batch.deletes.push(file.path);
+      if (legacy) { batch.vectorDeletes.push(...(fix.uids.get(file.path) ?? [])); repaired++; }
       batch.events.push(...events);
       batch.sessions.push({
         session_uuid: p.sessionUuid, file_path: file.path, repo_key: repoCol,
@@ -290,7 +333,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
 
   // A scan writes nothing, so there is nothing to flush and no index to rebuild.
   if (o.noWrite)
-    return { added, skipped, failed, filtered, skippedNoise, done, imported, shards, seen,
+    return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
              ftsBuilt: 0, ftsFailed: 0, ftsMs: 0 };
 
   await flush();   // anything left below the batch threshold
@@ -316,6 +359,6 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
     }
   }
   if (o.progress && stores.length) process.stderr.write("\r" + " ".repeat(60) + "\r");
-  return { added, skipped, failed, filtered, skippedNoise, done, imported, shards, seen,
+  return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
            ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0 };
 }

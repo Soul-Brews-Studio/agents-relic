@@ -74,12 +74,22 @@ export const MAX_TEXT = 16_000;
 const SEP = String.fromCharCode(31); // unit separator — cannot occur in a path or seq
 
 /**
- * Event identity. Deliberately excludes the directory: only the basename and the
- * line number participate, so the same transcript discovered under two roots
- * (live + archive, or two machines) collapses to one row instead of doubling.
+ * Event identity. Deliberately excludes the root and project directory: only the path
+ * INSIDE the session tree (see treeKeyOf) and the line number participate, so the same
+ * transcript discovered under two roots (live + archive, or two machines) collapses to
+ * one row instead of doubling.
  */
 export function uidOf(source: string, fileKey: string, seq: number): string {
   return createHash("sha1").update([source, fileKey, seq].join(SEP)).digest("hex");
+}
+
+// Basename at the top of a project dir, path from the session dir below it: one agent file can sit in two trees (#58).
+export function treeKeyOf(filePath: string): string {
+  const parts = filePath.split("/");
+  const n = parts.length;
+  if (n >= 5 && parts[n - 3] === "workflows" && parts[n - 4] === "subagents") return parts.slice(n - 5).join("/");
+  if (n >= 3 && parts[n - 2] === "subagents") return parts.slice(n - 3).join("/");
+  return parts[n - 1];
 }
 
 export function asObj(v: unknown): Record<string, unknown> | null {
