@@ -19,7 +19,7 @@ queries = json.load(open(os.environ.get("BENCH_QUERIES", "/tmp/queries.json")))
 K = 20
 results = pickle.load(open(os.environ.get("BENCH_ALL", "/tmp/bench_all.pkl"), "rb"))
 
-db = lancedb.connect("/tmp/bench_fts")
+db = lancedb.connect(os.environ.get("BENCH_FTS_DB", "/tmp/bench_fts"))   # built by bench.py
 t = db.open_table("d")
 
 def fts(q, k=K):
