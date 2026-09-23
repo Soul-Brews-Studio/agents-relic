@@ -15,6 +15,7 @@ from typing import Optional
 
 from .discover import _dirs, _files, _stat
 from .sources import load_sources
+from .unreadable import reachable
 
 
 def age(mtime: int) -> int:
@@ -42,7 +43,7 @@ def live_roots() -> list[str]:
     for src in load_sources():
         if src.walk not in ("claude-tiers", "omp"):
             continue
-        if not os.path.exists(src.path) or src.path in seen:
+        if src.path in seen or not reachable(src.path):
             continue
         seen.append(src.path)
     return seen

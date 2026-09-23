@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from .models import ParsedFile
 from .sources import SourceDef, bank_of, load_sources
+from .unreadable import begin_walk, dir_unreadable, reachable, walk_error
 
 Parser = Callable[[str], ParsedFile]
 
@@ -38,11 +40,14 @@ class Found:
     parser: Parser
 
 
+# A failed scandir or stat still yields nothing, but no longer SAYS nothing: anything
+# other than ENOENT is reported once per path (#99). See unreadable.py.
 def _stat(p: str):
     try:
         st = os.stat(p)
         return int(st.st_mtime), st.st_size
-    except OSError:
+    except OSError as e:
+        walk_error(p, e)
         return None
 
 
@@ -62,7 +67,8 @@ def _dirs(p: str) -> list[str]:
     """
     try:
         return sorted(e.name for e in os.scandir(p) if e.is_dir(follow_symlinks=False))
-    except OSError:
+    except OSError as e:
+        dir_unreadable(p, e)
         return []
 
 
@@ -70,7 +76,8 @@ def _files(p: str, ext: str = ".jsonl") -> list[str]:
     try:
         return sorted(e.name for e in os.scandir(p)
                       if e.is_file(follow_symlinks=False) and e.name.endswith(ext))
-    except OSError:
+    except OSError as e:
+        dir_unreadable(p, e)
         return []
 
 
@@ -80,7 +87,7 @@ def _walk_subagents(subagents, project, since_ms, out, key, parser):
     Called with two different bases — the project-level one and the per-session one — so
     the two cannot drift about what a subagent directory contains.
     """
-    if not os.path.isdir(subagents):
+    if not reachable(subagents):
         return
     for f in _files(subagents):
         p = os.path.join(subagents, f)
@@ -92,7 +99,7 @@ def _walk_subagents(subagents, project, since_ms, out, key, parser):
 
     # --- the tier everyone forgets -----------------------------------
     workflows = os.path.join(subagents, "workflows")
-    if not os.path.isdir(workflows):
+    if not reachable(workflows):
         return
     for run in _dirs(workflows):
         if not run.startswith("wf_"):
@@ -214,7 +221,7 @@ def _walk_memory(root, since_ms, out, key, parser):
     the others, so indexing it repeats every memory's description as a second hit."""
     for project in _dirs(root):
         d = os.path.join(root, project, "memory")
-        if not os.path.isdir(d):
+        if not reachable(d):
             continue
         for f in _files(d, ".md"):
             if f == "MEMORY.md":
@@ -242,7 +249,8 @@ def _walk_claude_home(home, since_ms, out, src_key, parser) -> None:
         roots = [d for d in os.listdir(home)
                  if (d == "projects" or d.startswith("projects-"))
                  and os.path.isdir(os.path.join(home, d))]
-    except OSError:
+    except OSError as e:
+        dir_unreadable(home, e)     # a declared home that cannot be read must say so (#99)
         return
     roots.sort(key=lambda d: (d != "projects", d))
     for r in roots:
@@ -271,14 +279,25 @@ def discover(only: Optional[list[str]], since_ms: Optional[int],
     where the rest of that source's rows already live.
     """
     out: list[Found] = []
+    begin_walk()          # walk_failures() after this call describes this walk and no other
     for src in load_sources():
         wanted = (src.key in only) if only else src.enabled
-        root = path_override[1] if path_override and path_override[0] == src.key else src.path
-        if not wanted or not os.path.exists(root):
+        if not wanted:
             continue
         walker = _WALKERS.get(src.walk)
         if not walker:
-            continue          # hermes is SQLite — not ported to Python yet
+            # Hermes is SQLite, and its reader is not ported. This used to `continue` in
+            # silence, so `--corpus hermes` indexed 0 files and exited 0 — the exact
+            # report in #99. Said BEFORE the root check, so a missing ~/.hermes cannot
+            # turn it back into a quiet zero.
+            print(f"relic-py: {src.key}: Hermes is not supported by relic-py yet (walk "
+                  f'"{src.walk}" is not ported) — nothing was read from it. The TypeScript '
+                  f"CLI reads it: relic index --corpus {src.key}", file=sys.stderr)
+            continue
+        root = path_override[1] if path_override and path_override[0] == src.key else src.path
+        # A missing root is a source this machine does not have; an unreadable one is not.
+        if not reachable(root):
+            continue
         before = len(out)
         walker(root, since_ms, out, src.key, src.parser)
         # Stamp the bank on what this source contributed, rather than threading it

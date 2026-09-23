@@ -698,6 +698,31 @@ export class LanceStore {
     return n;
   }
 
+  /**
+   * The embeddable population, as (role, text) — what `relic langs` measures.
+   *
+   * SAME eligibility as embeddableCount and unembedded: main tiers when asked, length
+   * filtered here rather than in SQL, so the language mix describes exactly the text a
+   * model would be fed. `where` narrows it further — `relic langs` passes a uid range,
+   * which is a uniform sample because a uid is a sha1.
+   */
+  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number } = {}): Promise<{ role: string; text: string }[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const minChars = opts.minChars ?? 24;
+    let q = t.query().select(["role", "text"]);
+    const filters = [opts.where ?? "", opts.mainTiers ? await this.mainTiersFilter(t) : ""].filter(Boolean);
+    if (filters.length) q = q.where(filters.join(" AND "));
+    const out: { role: string; text: string }[] = [];
+    for (const r of await q.toArray()) {
+      const text = String(r.text ?? "");
+      // Eligibility on the full length, as embed decides it; keep only the slice embed sends,
+      // so `--sample 1` over a big shard does not hold every event's full text at once.
+      if (text.length >= minChars) out.push({ role: String(r.role ?? ""), text: opts.maxChars ? text.slice(0, opts.maxChars) : text });
+    }
+    return out;
+  }
+
   async counts(): Promise<{ events: number; sessions: number; files: number }> {
     const names = await this.db.tableNames();
     const n = async (x: string) => names.includes(x) ? await (await this.db.openTable(x)).countRows() : 0;

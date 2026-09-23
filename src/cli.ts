@@ -7,7 +7,8 @@ import { discover, parseSince, type Found, type PathOverride } from "./discover.
 import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
-import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
+import { classify, logSkipped, readSkipped, skippedPath, logSkippedFiles, readSkippedFiles } from "./noise.js";
+import { walkFailures } from "./unreadable.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
@@ -18,8 +19,8 @@ import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
-import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
-import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
+import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, shortId, type Lineage } from "./lineage.js";
+import { findHermesSessions, buildHermesLineage, hermesOffNotes } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 
@@ -39,8 +40,10 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote, matchCount, floorNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
+import { rebuildFts } from "./fts-rebuild.js";
 
 const fmt = (n: number) => n.toLocaleString("en-US");
 
@@ -91,6 +94,7 @@ function resolveSourcePath(f: Record<string, string | boolean>, only: string[] |
 async function cmdIndex(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
+  if (f["fts-rebuild"]) return cmdFtsRebuild(dataRoot, inRepo, Boolean(f["dry-run"]));
   const skipNoise = wantSkipNoise(f);
   const only = f.corpus && String(f.corpus) !== "all" ? String(f.corpus).split(",") : null;
   const sinceMs = parseSince(f.since as string | undefined);
@@ -104,6 +108,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
                 f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
   console.log(`\u{1F3FA} relic indexing  (${mode})`);
   let found = discover(only, sinceMs, override);
+  const unreadable = walkFailures();
 
   // --repo scopes the index to one repo — "personal memory" rather than fleet-wide.
   // Cheap prefilter first: the encoded project dir name contains the repo name with
@@ -119,6 +124,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     prefiltered = before - found.length;
   }
   if (f["dry-run"]) { process.stderr.write("--dry-run: nothing written\n"); return; }
+  logSkippedFiles(unreadable, dataRoot);
 
   // One importer, shared with `session`'s on-demand path — a second copy of this loop
   // would drift the moment either side changed.
@@ -138,6 +144,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   for (const [k, v] of [...byTier].sort((a, b) => b[1] - a[1]))
     console.log(`               ${String(fmt(v)).padStart(7)}  ${k}`);
   if (prefiltered) console.log(`  prefiltered: ${fmt(prefiltered)} (name did not match --repo, never opened)`);
+  if (unreadable.length)
+    console.log(`  \u26A0 unreadable: ${fmt(unreadable.length)} path${unreadable.length === 1 ? "" : "s"} could not be read, ` +
+                `nothing in ${unreadable.length === 1 ? "it" : "them"} indexed -> relic skipped --files`);
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
@@ -149,6 +158,10 @@ async function cmdIndex(f: Record<string, string | boolean>) {
               (tally.ftsFailed ? `  \u26A0 ${tally.ftsFailed} FAILED — those shards fall back to a slow LIKE scan` : ""));
   if (tally.ftsUpgraded)
     console.log(`  fts:         ${tally.ftsUpgraded} shard${tally.ftsUpgraded === 1 ? "" : "s"} rebuilt from \`simple\` to ICU`);
+  if (tally.ftsDrifted) {
+    console.log(`  fts:         ${tally.ftsDrifted} shard${tally.ftsDrifted === 1 ? "" : "s"} rebuilt — the old index dropped stop words, "nas" and "bin" among them (#97)`);
+    console.log(`               shards this run did not reach keep theirs: relic index --fts-rebuild rebuilds every shard`);
+  }
   if (tally.ftsSimple.length) {
     const n = tally.ftsSimple.length;
     console.log(`  \u26A0 fts:       ${n} shard${n === 1 ? "" : "s"} on the \`simple\` tokenizer — this LanceDB build has no ICU` +
@@ -165,7 +178,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     const maxDropPct = f["max-drop"] !== undefined ? Number(f["max-drop"]) : DEFAULT_MAX_DROP_PCT;
     const plan = await prune(tally, {
       apply: true, maxDropPct, force: Boolean(f.force), dataRoot, inRepo,
-      sinceMs, repoFilter,
+      sinceMs, repoFilter, unreadable: unreadable.length,
     });
     reportPrune(plan, maxDropPct);
   }
@@ -228,6 +241,41 @@ function reportPrune(plan: PrunePlan, maxDropPct: number) {
   if (!plan.applied && tot.files) console.log(`\n  to remove them:  relic prune --apply`);
 }
 
+/**
+ * `index --fts-rebuild`: the full-text index of every shard on disk, rebuilt with today's
+ * ftsConfig() — once per machine after an FTS setting changes (#97). Imports nothing.
+ * The root goes in the header, so a run aimed at the wrong index says so before it writes.
+ */
+async function cmdFtsRebuild(dataRoot: string | null, inRepo: boolean, dryRun: boolean) {
+  const where = dataRoot ?? (inRepo ? `in-repo ${ghqRoot()}/<org>/<repo>/.relic/` : defaultRoot());
+  console.log(`\u{1F3FA} relic fts rebuild  (every shard under ${where} · imports nothing` +
+              `${dryRun ? " · DRY RUN — no writes" : ""})`);
+  if (dryRun) {
+    console.log(`  would rebuild: ${fmt(listShards(dataRoot, inRepo).length)} shards`);
+    return;
+  }
+  const r = await rebuildFts({ dataRoot, inRepo, progress: true });
+  const s = (n: number) => (n === 1 ? "" : "s");
+  const refusal = /unknown base tokenizer [\w-]+/i.exec(r.noIcu)?.[0] ?? r.noIcu.slice(0, 80);
+  console.log(`  shards:      ${fmt(r.shards)} on disk`);
+  console.log(`  rebuilt:     ${fmt(r.rebuilt)}` +
+              (r.drifted ? `  (${fmt(r.drifted)} had been built dropping stop words — #97)` : ""));
+  console.log(`  skipped:     ${fmt(r.empty + r.kept)}` +
+              (r.empty ? `  (${fmt(r.empty)} with no events table)` : ""));
+  if (r.kept)
+    console.log(`  \u26A0 kept:      ${fmt(r.kept)} ICU index${r.kept === 1 ? " as it is" : "es as they are"} — this LanceDB build has no ICU` +
+                ` ("${refusal}"). Rebuild on a machine where ICU loads.`);
+  if (r.simple.length)
+    console.log(`  \u26A0 fts:       ${r.simple.length} shard${s(r.simple.length)} rebuilt with \`simple\` — this LanceDB build has no ICU` +
+                ` ("${refusal}"). Thai substring search degraded; a run where ICU loads rebuilds ${r.simple.length === 1 ? "it" : "them"}.`);
+  console.log(`  failed:      ${fmt(r.failed.length)}` +
+              (r.failed.length ? `  \u26A0 those shards keep their old index` : ""));
+  for (const x of r.failed.slice(0, 5)) console.log(`               ${x.key}  ${x.err}`);
+  if (r.failed.length > 5) console.log(`               ... and ${r.failed.length - 5} more`);
+  console.log(`  time:        ${(r.ms / 1000).toFixed(1)}s`);
+  if (r.failed.length) process.exitCode = 1;
+}
+
 // ---- prune -----------------------------------------------------------------
 /**
  * Scan every source, then remove index rows for files discovery no longer yields.
@@ -268,15 +316,17 @@ async function cmdPrune(f: Record<string, string | boolean>) {
   process.stderr.write(`\u{1F3FA} relic prune  (${only ? only.join("+") : "all enabled sources"} · ` +
                        `${apply ? "APPLY — rows will be deleted" : "dry run"} · ceiling ${maxDropPct}%)\n`);
   const found = discover(only, null);
+  const unreadable = walkFailures().length;
   const tally = await importFiles(found, { dataRoot, inRepo, noWrite: true, progress: true,
                                           verbose: Boolean(f.verbose) }, t0);
   clearLine();
 
   console.log(`  scanned:     ${fmt(found.length)} files -> ${tally.seen.size} shards reached`);
   if (tally.failed) console.log(`  \u26A0 failed:    ${fmt(tally.failed)} (re-run with --verbose to see why)`);
+  if (unreadable) console.log(`  \u26A0 unreadable: ${fmt(unreadable)} path${unreadable === 1 ? "" : "s"} (named on stderr)`);
 
   const plan = await prune(tally, { apply, maxDropPct, force: Boolean(f.force),
-                                    dataRoot, inRepo, sinceMs: null, repoFilter: null });
+                                    dataRoot, inRepo, sinceMs: null, repoFilter: null, unreadable });
   reportPrune(plan, maxDropPct);
   console.log(`  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (plan.refused) process.exit(1);
@@ -302,17 +352,21 @@ async function cmdPrune(f: Record<string, string | boolean>) {
 async function recapTarget(arg: string | undefined): Promise<string> {
   if (arg) return arg;
   const prev = await previousSessionFile(process.cwd());
-  if (!prev) {
-    console.error(`no earlier session found for ${process.cwd()}`);
-    console.error(`  relic now --all   lists what is running, anywhere`);
-    process.exit(1);
-  }
+  if (!prev) noEarlierSession(process.cwd());
   // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
   // not data. On stdout it lands inside `--json` output and makes it unparseable:
   // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
   // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
   return prev.id;
+}
+
+/** Nothing earlier in this directory: point at the machine-wide view, and at Hermes data left switched off. */
+function noEarlierSession(cwd: string): never {
+  console.error(`no earlier session found for ${cwd}`);
+  console.error(`  relic now --all   lists what is running, anywhere`);
+  for (const note of hermesOffNotes()) console.error(`  ${note}`);
+  process.exit(1);
 }
 
 /*
@@ -389,9 +443,11 @@ async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   });
   if (!r) {
     // recap reads the INDEX, so "no match" also covers "ran too recently to be in it".
+    // A Hermes id names a different corpus, and indexing claude-live would not add it.
+    const corpus = findHermesSessions(id).length ? "hermes" : "claude-live";
     console.error(`no session matched ${id}`);
     console.error(`  if it only just ran, it is in the file but not the index yet:`);
-    console.error(`  relic index --corpus claude-live    (or: relic tail ${id}, which reads the file)`);
+    console.error(`  relic index --corpus ${corpus}    (or: relic tail ${id}, which reads the file)`);
     process.exit(1);
   }
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
@@ -835,6 +891,18 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
   const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
   /*
+   * HERMES HAS NO FILE IN THAT DIRECTORY (#100). Its sessions are rows in state.db, each
+   * carrying its own cwd and its own event clock — the newest active message — so they
+   * join the SAME ranking instead of being tried only when the transcripts come up
+   * empty. The newest session is the answer, whichever host wrote it.
+   */
+  const { hermesSessionsIn } = await import("./live-hermes.js");
+  const cands = [
+    ...ranked.map(c => ({ file: c.file, id: c.id, at: c.lastEventMs ?? c.mtimeMs })),
+    ...hermesSessionsIn(cwd).map(h => ({ file: h.path, id: h.id, at: h.lastMs })),
+  ].sort((a, b) => b.at - a.at);
+
+  /*
    * NEWEST IS NOT THE SAME AS WORTH READING.
    *
    * Measured here: the newest non-self transcript in this directory was `b658931d`,
@@ -846,14 +914,14 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * filter. Parsing stops at the first real hit, so the normal case costs one parse.
    */
   const { parserFor } = await import("./sources.js");
-  for (const c of ranked.slice(0, 8)) {
+  for (const c of cands.slice(0, 8)) {
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
       if (human && p.events.length > 2) return { file: c.file, id: c.id };
     } catch { /* unreadable: try the next */ }
   }
-  return ranked[0] ?? null;     // nothing substantial — hand back the newest and say so
+  return cands[0] ?? null;      // nothing substantial — hand back the newest and say so
 }
 
 /*
@@ -933,28 +1001,37 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   let file = target;
   if (!target || target === "--last") {
     const prev = await previousSessionFile(process.cwd());
-    if (!prev) {
-      console.error(`no earlier session found for ${process.cwd()}`);
-      console.error(`  relic now --all   lists what is running, anywhere`);
-      process.exit(1);
-    }
+    if (!prev) noEarlierSession(process.cwd());
     file = prev.file;
     // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
-  // not data. On stdout it lands inside `--json` output and makes it unparseable:
-  // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
-  // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+    // not data. On stdout it lands inside `--json` output and makes it unparseable:
+    // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
+    // line was an arrow. Found by piping the new default into jq.
+    console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
-    if (!rows.length) {
-      console.error(`no session matches ${target}`);
-      console.error(`  relic now --all   lists what is running; relic report --since 7d  what ran lately`);
-      process.exit(1);
+    if (rows.length) {
+      // The PARENT transcript: a subagent's tail answers what an agent said to itself.
+      const parent = rows.find((r: any) => r.tier === "session") ?? rows[0];
+      file = String(parent.file_path);
+    } else {
+      // Not in the index. A Hermes id reads straight from its state.db, as lineage does —
+      // `now --all` lists live Hermes sessions, and a session it lists must be tailable (#100).
+      const hermes = findHermesSessions(target);
+      if (hermes.length > 1) {
+        console.error(`${target} matches ${hermes.length} Hermes sessions — give more of the id:`);
+        for (const h of hermes.slice(0, 10)) console.error(`  ${h.id}  ${h.db}`);
+        process.exit(1);
+      }
+      if (!hermes.length) {
+        console.error(`no session matches ${target}`);
+        console.error(`  relic now --all   lists what is running; relic report --since 7d  what ran lately`);
+        for (const note of hermesOffNotes()) console.error(`  ${note}`);
+        process.exit(1);
+      }
+      file = `${hermes[0].db}#${hermes[0].id}`;
     }
-    // The PARENT transcript: a subagent's tail answers what an agent said to itself.
-    const parent = rows.find((r: any) => r.tier === "session") ?? rows[0];
-    file = String(parent.file_path);
   }
 
   const { parserFor } = await import("./sources.js");
@@ -1137,6 +1214,46 @@ async function cmdReport(f: Record<string, string | boolean>) {
 }
 
 // ---- status ----------------------------------------------------------------
+/**
+ * `relic langs` — the language mix of the embeddable corpus, and which measured model
+ * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
+ */
+async function cmdLangs(f: Record<string, string | boolean>) {
+  const sample = f.sample === undefined ? 64 : typeof f.sample === "string" ? Number(f.sample) : NaN;
+  if (!Number.isInteger(sample) || sample < 1) {
+    console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
+    process.exit(1);
+  }
+  // Every flag that narrowed the measurement rides into the printed embed command, so
+  // "continue with" acts on the scope that was measured — never silently on the whole index.
+  const scopeArgs: string[] = [];
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+    if (typeof f[k] === "string") scopeArgs.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) scopeArgs.push(`--${k}`);
+  const bar = progress();
+  const r = await scanLangs({
+    scopeArgs,
+    dataRoot: (f["data-root"] as string) ?? null,
+    inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined,
+    bank: f.bank ? String(f.bank) : undefined,
+    sample,
+    // Same flags, same meaning as embed: the population measured is the one embedded.
+    mainTiers: !f["all-tiers"],
+    minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
+    maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
+    onProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty") bar.tick(`  ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total);
+    },
+  });
+  bar.clear();
+  const rec = recommend(r);
+  if (outFmt(f) === "json") { console.log(JSON.stringify({ ...r, recommendation: rec }, null, 2)); return; }
+  if (outFmt(f) === "jsonl") { console.log(JSON.stringify({ ...r, recommendation: rec })); return; }
+  if (!r.shards) { console.log("no shards match — check --repo / --bank, or run relic index first"); return; }
+  console.log(renderLangs(r, rec));
+}
+
 /*
  * EMBED — a second pass over an index that is already complete.
  *
@@ -1424,11 +1541,15 @@ async function cmdNow(f: Record<string, string | boolean>) {
     const live = await liveSessions(windowSec, Number(f.limit ?? 20));
     if (mode === "json") { console.log(JSON.stringify({ windowSec, sessions: live }, null, 2)); return; }
     if (mode === "plain") { for (const s of live) console.log([s.sessionUuid, s.ageSec, s.agents, s.cwd ?? ""].join("\t")); return; }
-    if (!live.length) { console.log(`nothing written in the last ${humanAge(windowSec)}`); return; }
+    if (!live.length) {
+      console.log(`nothing written in the last ${humanAge(windowSec)}`);
+      for (const note of hermesOffNotes()) console.log(`  ${note}`);
+      return;
+    }
     console.log(`${live.length} session${live.length === 1 ? "" : "s"} active in the last ${humanAge(windowSec)}\n`);
     for (const s of live) {
       const wrote = Math.abs(s.ageSec - s.eventAgeSec) > 180 ? `  (write ${humanAge(s.ageSec)} ago)` : "";
-      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
+      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${shortId(s.sessionUuid)}  ` +
         `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}${wrote}`);
       console.log(`            ${s.cwd ?? s.projectDir}`);
     }
@@ -1505,8 +1626,7 @@ async function cmdLineage(arg: string | undefined, f: Record<string, string | bo
       }
       if (!hermes.length) {
         console.error(`no Claude Code transcript or Hermes session matches ${arg}`);
-        for (const r of disabledHermesRoots())
-          console.error(`  (${r} holds Hermes data, but its source is disabled — enable "hermes" in ~/.relic/sources.json)`);
+        for (const note of hermesOffNotes()) console.error(`  ${note}`);
         process.exit(1);
       }
       l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
@@ -1554,6 +1674,34 @@ const cmd = pos[0];
  */
 if (f["no-native"]) process.env.RELIC_NATIVE = "0";
 else if (typeof f.native === "string") process.env.RELIC_NATIVE = f.native;
+
+// ---- skipped --files ---------------------------------------------------------
+/**
+ * Paths the walk could not read (#99): the file-scoped half of the proof log.
+ *
+ * Same log and same rule buckets as the event view, but one row per PATH — an
+ * unreadable directory is logged again by every index run until someone fixes it, and
+ * listing it forty times would bury the second one.
+ */
+function cmdSkippedFiles(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const r = readSkippedFiles(dataRoot);
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r ?? { total: 0, byRule: [], paths: [] }, null, 2)); return; }
+  if (!r) { console.log(`no unreadable paths logged — ${skippedPath(dataRoot)}`); return; }
+  console.log(`${fmt(r.total)} path${r.total === 1 ? "" : "s"} the walk could not read — ` +
+              `nothing in ${r.total === 1 ? "it" : "them"} was indexed\n`);
+  for (const b of r.byRule) console.log(`  ${b.rule.padEnd(26)} ${String(fmt(b.n)).padStart(7)}`);
+  const limit = Number(f.limit ?? 20);
+  for (const b of r.byRule) {
+    const rows = r.paths.filter(x => x.rule === b.rule);
+    console.log(`\n  [${b.rule}]`);
+    for (const x of rows.slice(0, limit)) {
+      console.log(`    ${x.path}`);
+      console.log(`        ${x.error}  ·  last ${localDateTime(x.ts)}${x.runs > 1 ? `  ·  logged by ${fmt(x.runs)} runs` : ""}`);
+    }
+    if (rows.length > limit) console.log(`    ... and ${fmt(rows.length - limit)} more (--limit N, or --json)`);
+  }
+}
 
 // ---- memory / pending -------------------------------------------------------
 // Both functions already existed in query.ts with no way to call them. A query nobody
@@ -1608,6 +1756,9 @@ async function cmdPending(f: Record<string, string | boolean>) {
     return;
   }
   console.log(`found ${fmt(r.found)}  indexed ${fmt(r.indexed)}  missing ${fmt(r.missing)}  changed ${fmt(r.changed)}   ${r.scanMs} ms`);
+  if (r.unreadable.length)
+    console.log(`\u26A0 ${fmt(r.unreadable.length)} path${r.unreadable.length === 1 ? "" : "s"} could not be read (named on stderr) — ` +
+                `files under ${r.unreadable.length === 1 ? "it are" : "them are"} in none of these counts`);
   if (r.newestPendingMs !== null)
     console.log(`newest pending file: ${localDateTime(new Date(r.newestPendingMs).toISOString())}`);
   for (const g of r.groups)
@@ -1677,7 +1828,8 @@ async function cmdPending(f: Record<string, string | boolean>) {
     }
     if (r.filesOmitted) console.log(`\n  ... and ${fmt(r.filesOmitted)} more pending (--list N)`);
   } else if (r.missing + r.changed === 0) {
-    console.log(`\nnothing pending — every discovered file is in the index.`);
+    console.log(r.unreadable.length ? `\nnothing pending among the files the walk could read.`
+                                    : `\nnothing pending — every discovered file is in the index.`);
   }
 }
 
@@ -1803,6 +1955,7 @@ else if (cmd === "chain") {
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);
+else if (cmd === "skipped" && f.files) cmdSkippedFiles(f);
 else if (cmd === "skipped") {
   const dataRoot = (f["data-root"] as string) ?? null;
   const st = readSkipped(dataRoot);
@@ -1820,6 +1973,9 @@ else if (cmd === "skipped") {
       console.log(`            ${x.file_path.split("/").pop()} --seq ${x.seq}`);
     }
   }
+  // Same log, other kind of row: point at it rather than fold paths into event counts.
+  const lost = outFmt(f) === "json" ? null : readSkippedFiles(dataRoot);
+  if (lost) console.log(`\n${fmt(lost.total)} path${lost.total === 1 ? "" : "s"} the walk could not read -> relic skipped --files`);
 }
 else if (cmd === "dig") {
   // PROJECT_DIRS is the contract the /dig skill already exports — honour it so this is
@@ -1889,5 +2045,6 @@ else if (cmd === "serve") {
 }
 else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
+else if (cmd === "langs") await cmdLangs(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

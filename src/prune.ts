@@ -21,7 +21,9 @@ import { listShards } from "./repo.js";
  * Four gates, from widest to narrowest:
  *
  *   1. the run must be UNFILTERED — no --since, no --repo
- *   2. nothing may have FAILED to parse; a file that failed is not a file that is gone
+ *   2. nothing may have FAILED to parse; a file that failed is not a file that is gone.
+ *      Nor may discovery have failed to READ a path (#99): every file under an
+ *      unreadable directory is missing from the scan, and would look deleted
  *   3. only shards this run actually reached are considered — a bank whose source was
  *      not in --corpus, or whose root was missing, is never touched
  *   4. a shard losing more than `maxDropPct` of its files is REFUSED, not pruned
@@ -42,6 +44,8 @@ export interface PruneOpts {
   /** The run's own narrowing — gate 1 reads these, it does not re-derive them. */
   sinceMs: number | null;
   repoFilter: string | null;
+  /** Paths this run's discovery could not read (walkFailures().length) — gate 2 reads it. */
+  unreadable?: number;
 }
 
 export interface ShardPrune {
@@ -65,7 +69,7 @@ export interface PrunePlan {
 export const DEFAULT_MAX_DROP_PCT = 10;
 
 /** Why this run may not prune, or null. */
-export function pruneRefusal(t: ImportTally, o: Pick<PruneOpts, "sinceMs" | "repoFilter">): string | null {
+export function pruneRefusal(t: ImportTally, o: Pick<PruneOpts, "sinceMs" | "repoFilter" | "unreadable">): string | null {
   if (o.sinceMs !== null)
     return "--since narrows discovery to recent files, so every older file would look deleted. Prune needs a full scan.";
   if (o.repoFilter)
@@ -73,6 +77,9 @@ export function pruneRefusal(t: ImportTally, o: Pick<PruneOpts, "sinceMs" | "rep
   if (t.failed)
     return `${t.failed.toLocaleString("en-US")} file${t.failed === 1 ? "" : "s"} failed to parse. ` +
            `A file that failed to parse is not a file that is gone — re-run with --verbose, fix it, then prune.`;
+  if (o.unreadable)
+    return `${o.unreadable.toLocaleString("en-US")} path${o.unreadable === 1 ? "" : "s"} could not be read during discovery. ` +
+           `Files under an unreadable directory are not files that are gone — fix access to the paths named above, then prune.`;
   return null;
 }
 

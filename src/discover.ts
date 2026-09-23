@@ -1,9 +1,10 @@
-import { readdirSync, statSync, existsSync, lstatSync, realpathSync } from "node:fs";
+import { readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { bankOf, loadSources, homeProjectRoots } from "./sources.js";
 import { repoKeyOf } from "./repo.js";
 import { hermesSessions } from "./shapes/hermes.js";
+import { dirUnreadable, walkError, reachable, beginWalk } from "./unreadable.js";
 import type { Parser } from "./types.js";
 
 // "note" is not a transcript tier — a vault document has no turns. It shares the
@@ -53,19 +54,21 @@ const HOME = homedir();
 // Sources come from the registry in sources.ts (config-overridable), not from a
 // hardcoded list here — adding an agent should not require editing the walker.
 
+// A failed readdir or stat still yields nothing, but no longer SAYS nothing: anything
+// other than ENOENT is reported once per path (#99). See unreadable.ts.
 function statOf(p: string) {
   try { const s = statSync(p); return { mtime: Math.floor(s.mtimeMs / 1000), size: s.size }; }
-  catch { return null; }
+  catch (e) { walkError(p, e); return null; }
 }
 
 function dirs(p: string): string[] {
   try { return readdirSync(p, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(p, e); return []; }
 }
 
 function files(p: string, ext = ".jsonl"): string[] {
   try { return readdirSync(p, { withFileTypes: true }).filter(e => e.isFile() && e.name.endsWith(ext)).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(p, e); return []; }
 }
 
 /**
@@ -82,7 +85,7 @@ function files(p: string, ext = ".jsonl"): string[] {
 /** One `subagents/` directory: its agent transcripts, and the workflow tier beneath it. */
 function walkSubagents(subagents: string, project: string, sinceMs: number | null,
                        out: Found[], srcKey: string, parser: Parser) {
-  if (!existsSync(subagents)) return;
+  if (!reachable(subagents)) return;
   for (const f of files(subagents)) {
     const p = join(subagents, f);
     const st = statOf(p);
@@ -93,7 +96,7 @@ function walkSubagents(subagents: string, project: string, sinceMs: number | nul
 
   // --- the tier everyone forgets ------------------------------------------
   const workflows = join(subagents, "workflows");
-  if (!existsSync(workflows)) return;
+  if (!reachable(workflows)) return;
   for (const run of dirs(workflows)) {
     if (!run.startsWith("wf_")) continue;
     for (const f of files(join(workflows, run))) {
@@ -144,7 +147,7 @@ function walkClaude(root: string, sinceMs: number | null, out: Found[], srcKey: 
     for (const sessionDir of dirs(projectPath)) {
       if (sessionDir === "subagents") continue;   // handled above, do not walk twice
       const subagents = join(projectPath, sessionDir, "subagents");
-      if (!existsSync(subagents)) continue;
+      if (!reachable(subagents)) continue;
 
       walkSubagents(subagents, project, sinceMs, out, srcKey, parser);
     }
@@ -489,7 +492,7 @@ function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: 
 function walkMemory(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
   for (const project of dirs(root)) {
     const dir = join(root, project, "memory");
-    if (!existsSync(dir)) continue;
+    if (!reachable(dir)) continue;
     for (const f of files(dir, ".md")) {
       if (f === "MEMORY.md") continue;
       const p = join(dir, f);
@@ -538,10 +541,12 @@ export function discover(only: string[] | null, sinceMs: number | null,
   const tick = () => {
     if (out.length && out.length % 2000 === 0) progressLine(`  scanning… ${out.length.toLocaleString()} files found`);
   };
+  beginWalk();       // walkFailures() after this call describes this walk and no other
   for (const src of loadSources()) {
     const wanted = only ? only.includes(src.key) : src.enabled;
     const root = pathOverride && pathOverride.key === src.key ? pathOverride.path : src.path;
-    if (!wanted || !existsSync(root)) continue;
+    // A missing root is a source this machine does not have; an unreadable one is not.
+    if (!wanted || !reachable(root)) continue;
     progressLine(`  scanning ${src.key}…`);
     const before = out.length;
     if (src.walk === "claude-home") walkClaudeHome(root, sinceMs, out, src.key, src.parser);

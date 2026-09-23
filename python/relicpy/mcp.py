@@ -205,8 +205,18 @@ def run(name: str, a: dict) -> str:
         r = pending_report(scope, since=a.get("since"), list_n=int(a.get("list") or 0))
         L = [f"found {r.found:,} · indexed {r.indexed:,} · missing {r.missing:,} · "
              f"changed {r.changed:,} · {r.scan_ms} ms"]
+        # An MCP client never sees stderr, so the walk's failures have to be in the
+        # answer — without them "nothing pending" is exactly the #99 report.
+        if r.unreadable:
+            n = len(r.unreadable)
+            L += ["", f"⚠ {n:,} path{'' if n == 1 else 's'} could not be read — files under "
+                      f"{'it are' if n == 1 else 'them are'} in none of these counts:"]
+            L += [f"    {x['path']}  ({x['error']})" for x in r.unreadable[:10]]
+            if n > 10:
+                L.append(f"    ... and {n - 10:,} more")
         if not r.missing and not r.changed:
-            L += ["", "nothing pending — every discovered file is in the index."]
+            L += ["", "nothing pending among the files the walk could read." if r.unreadable
+                  else "nothing pending — every discovered file is in the index."]
         L.append("")
         for g in r.groups:
             L.append(f"  {g.source + '/' + g.tier:30} found {g.found:>6}  "

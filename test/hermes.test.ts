@@ -49,6 +49,12 @@ describe("hermesSessions", () => {
     ]);
   });
 
+  test("sessions come back newest activity first, as documented", () => {
+    const p = makeDb("order.db");
+    seed(p);
+    expect(hermesSessions(p).map(s => s.id)).toEqual(["s1", "s2"]);
+  });
+
   test("an inactive message never sets the activity time", () => {
     const p = makeDb("inactive.db", { lastActivity: true });
     seed(p);

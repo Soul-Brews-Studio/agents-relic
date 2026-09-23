@@ -18,6 +18,10 @@ export function helpText(): string {
   return `relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--keep-noise] [--dry-run] [--prune]
+          [--fts-rebuild]      rebuild the full-text index of EVERY shard on disk, every
+                               bank, and import nothing. Once per machine after an FTS
+                               setting changes: an index keeps the settings it was built
+                               with, and a run only reaches the shards it discovers.
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
@@ -69,7 +73,8 @@ export function helpText(): string {
                                parallel work. Add --role user for your turns alone.
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
-                               an id. Found by mtime, never the index.
+                               an id. Found by mtime, never the index. Hermes
+                               sessions that ran in this checkout count too.
                                the LAST N EXCHANGES — what was I just doing. An
                                exchange is the human's turn plus the last thing
                                the agent said before they spoke again. Takes a
@@ -78,6 +83,7 @@ export function helpText(): string {
                                55 of 63 user-channel turns were the tooling itself.
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now|live [--all] [--window 300]  what is running RIGHT NOW — this session, its agents
+                               --all is machine-wide, Hermes sessions (state.db) included
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
@@ -99,6 +105,13 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
+  langs   [--sample 64] [--repo S] [--bank B] [--all-tiers] [--min-chars 24] [--max-chars 2000] [--json]
+                               which languages the embeddable corpus is written in, and
+                               which measured model fits it: th / th+en / en / latin /
+                               other scripts, share of events and chars, Thai by role,
+                               vectors already on disk. Same population as embed.
+                               1 in 64 events by default, picked by uid (a sha1, so the
+                               sample is uniform and repeatable); --sample 1 reads all.
   recap   [id|prefix] [--limit 20] [--all-tiers] [--chars 140] [--json]
                                NO ID = the session before this one, same as tail.
                                Shows the LAST 20 asked turns; --limit 0 for all. The
@@ -110,7 +123,9 @@ export function helpText(): string {
                                not a summary: session gives shape, recap gives content.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
-  skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
+  skipped [--files] [--json]   what noise filtering dropped, and the proof (--keep-noise disables it)
+                               --files: paths the walk could NOT READ, so nothing in them was
+                               indexed — one row per path, newest first. Index runs log them.
   serve   [--host 127.0.0.1] [--port 4319] [--token T] [--origin URL,URL]
                                the MCP tools over HTTP at /mcp, for clients that are not
                                a child process — a browser UI, another machine, another

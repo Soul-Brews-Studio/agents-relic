@@ -273,6 +273,25 @@ Noise filtering is declarative here rather than heuristic: `active = 1` and
 `compacted = 0` are exact column predicates, unlike noise filtering, which has to infer
 from text shape.
 
+**No transcript file means the live views cannot find it by walking directories.**
+`now --all` and a no-argument `tail`/`recap` walk project directories, and Hermes has
+none, so they read `state.db` instead, through a parallel lookup rather than
+`liveRoots()`. The clock is each session's newest active message:
+
+- `now --all` lists every Hermes session with a message inside the window. A spawn
+  (`parent_session_id`) counts as its parent's live agent, not as a row of its own.
+- A no-argument `tail`/`recap` also considers Hermes sessions that ran in **this
+  checkout**: the same repo key AND the same worktree. With the repo key alone, a sibling
+  worktree's session would outrank this one's own transcript. They are ranked with the
+  transcripts, so the newest session wins whichever agent wrote it. When relic runs
+  inside a Hermes session, that session is skipped: Hermes sets `HERMES_SESSION_ID` on
+  every command it runs.
+- A gateway session (Discord, say) records no cwd. It appears in `now --all` but can
+  never be the session before this one for a directory.
+
+Only an enabled `hermes` source is read. When a lookup comes up empty and `~/.hermes`
+holds data with the source switched off, the miss message says so.
+
 ## Three readers, one index
 
 The same `~/.relic` is read by three implementations. This is not redundancy — it is
@@ -1120,10 +1139,20 @@ relic status --json | jq '.rows[] | select(.bank=="codex")'
 ```bash
 relic skipped                # counts by rule, with samples of what each one ate
 relic skipped --json
+relic skipped --files        # paths the walk could NOT READ — nothing in them was indexed
 ```
 
 Every drop is logged to `~/.relic/skipped.jsonl` with the rule that fired and the first
 120 characters, because **a filter you cannot audit is a filter you cannot trust**.
+
+The same log holds the paths discovery could not read (#99): `dir-unreadable` for a
+directory it could not list or reach, `walk-error` for a single file it could not stat.
+Every walker used to answer those with an empty list, so an unreadable directory looked
+exactly like an empty one and `relic pending` reported `0 missing` about files it had
+never seen. Now each is one stderr line per path (ENOENT stays quiet — optional
+`subagents/` directories are the normal case), `index` logs them here, `pending` says
+its counts cover only what the walk could read, and `prune` refuses to run over a scan
+that could not see everything.
 
 ### `embed` — the opt-in second pass
 
@@ -1241,6 +1270,50 @@ untested one: a `--semantic` mode is justified in principle — the user knows t
 style better than a classifier would — but not by quality. 0.140 MRR, 34% recall@20,
 median target rank 68 of 3,000 is a different failure from FTS's, not a better one.
 `relic embed` ships as the infrastructure that makes this measurable.
+
+### `langs` — which languages, so which model
+
+The default model, `all-minilm`, is English-only: Thai paraphrase MRR **0.006** in
+bench/. Whether that matters is a fact about the corpus, so `langs` measures it on the
+population `embed` would feed a model: the same tiers, the same `--min-chars`, the same
+first `--max-chars` of each event.
+
+```bash
+relic langs                       # whole index, 1 event in 64
+relic langs --repo neo-oracle     # one repo
+relic langs --sample 1 --json     # every event, machine-readable
+```
+
+```
+sample   1 in 64 by uid -> 4,238 events · ~271,232 eligible · 0.2 s
+
+lang        events   share   chars   what it is
+th              46    1.1%    2.0%   Thai is at least half the letters
+th+en          191    4.5%    5.5%   Thai is 10-49% of the letters: code-switched, usually with English
+en           2,093   49.4%   54.7%   Latin script with English function words: prose
+latin        1,908   45.0%   37.8%   Latin script without them: code, paths, JSON, ids, or another Latin language
+any Thai       467   11.0%           at least one Thai character (bench/'s definition)
+
+role            events   carry Thai
+note             1,609    21.8%
+assistant          502     7.2%
+user               243     3.3%
+
+vectors  st:intfloat/multilingual-e5-small+passage: · 384d · 66,570 rows in 2 shards
+
+model    MULTILINGUAL. 11.0% of eligible events carry Thai, at or above 1.0%. ...
+         -> keep the model on disk (st:intfloat/multilingual-e5-small+passage:). ...
+```
+
+`--repo neo-oracle`, 2026-09-23, trimmed. How it decides:
+
+| | |
+|---|---|
+| script, not a detector | Thai against Latin is a Unicode-block question and needs no model. Latin text is split by English function words, so `en` is prose and `latin` is code, JSON, paths and ids. Single letters do not count: `a` is the commonest function word in prose and the commonest variable name in code. |
+| the sample | `uid < '0400'` is 1 in 64. Every shape mints uids with `uidOf`, a sha1, so a hex range is uniform and repeatable, and the filter runs inside Lance instead of reading text that would be thrown away. A test pins the premise on 64,000 real uids. |
+| the rule | at least 1% of eligible events carrying Thai, or dominated by another non-Latin script, means multilingual. |
+| the candidates | `MEASURED_MODELS` in `embed.ts`: only models measured here, with the evidence each one has. The Ollama en-th cosine and the bench/ MRR are never ranked against each other. |
+| keep beats switch | when the vectors already on disk fit, the advice is to keep that model. embed refuses a second model per shard (`--reset` drops the vectors), and semantic search embeds a query with the model its shard stores. |
 
 ### `attach` — index someone else's LanceDB
 
@@ -1545,7 +1618,7 @@ SQL.
                        │  source  tier            │   push down into the FTS scan
                        └────────────┬─────────────┘
                                     │
-                            text_idx(text)          ICU · stem:false · maxToken 128
+                            text_idx(text)          ICU · stem:false · stop words kept · maxToken 128
                                     │
                                     ▼
                                BM25 search
@@ -1574,6 +1647,7 @@ SQL.
 
  SIDECARS   ~/.relic/trace.jsonl    one line per query, + `opened` on show
             ~/.relic/skipped.jsonl  one line per dropped event, with the rule
+                                    — and per unreadable path (`relic skipped --files`)
             both JSONL on purpose: relic can index its own logs, no new reader
 
  LEGEND  PK = key in practice   FK→ = join by convention, unenforced   !! = trap
@@ -1669,6 +1743,14 @@ word segmentation — verified with `table.tokenize()`:
 One store, one index, no query routing, no second thing to drift. `stem: false` is set
 deliberately — the English stemmer mangles identifiers (`structured_output_mode` →
 `structured_output_mod`).
+
+So is `removeStopWords: false`. LanceDB removes stop words by default, and under ICU the
+list is not English but 21 languages at once: 5,200 words, `nas`, `bin`, `min`, `var`
+and `del` among them. `relic search nas` answered 0 on an index where a rebuild without
+the filter finds 9,971 rows (#97). An index keeps the settings it was built with, so
+after a change like this run `relic index --fts-rebuild` once per machine. It rebuilds
+every shard on disk, including the ones a normal run never reaches: 1,136 shards in
+128 s here.
 
 ---
 
