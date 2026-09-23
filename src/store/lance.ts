@@ -62,6 +62,24 @@ export interface EventRow {
   // in all seven tools.
   mem_type: string;       // project | feedback | reference | user
   origin_session: string; // the session that produced this memory — the join key
+  /*
+   * CHANNEL FACETS — who sent a turn, from which room, on whose clock (#85, #86).
+   * Parsed at import from a channel plugin's envelope; "" on every other row, the same
+   * trade the memory columns make, for the same reason.
+   *
+   * `via` sits BESIDE `source`, never inside `kind`. `source` is the transcript's
+   * format and `kind` is what a row IS; a turn typed into Discord is still a transcript
+   * turn. Folding the front door into either puts two axes in one column, which is the
+   * tier/kind mistake above. Stored verbatim — nine distinct values in the live index
+   * on m5, among them arra-oracle-discord, mqtt and oracle-inbox; a normaliser would be
+   * guessing at the tenth.
+   */
+  via: string;            // the envelope's source: plugin:discord:discord | mqtt | …
+  chat_id: string;        // which channel or thread
+  msg_id: string;         // the upstream message_id
+  from_user: string;      // who typed it
+  from_user_id: string;
+  sent_ts: string;        // THEIR clock; `ts` is when the transcript was written
 }
 
 export interface SessionRow {
@@ -73,6 +91,13 @@ export interface SessionRow {
   started_at: string; ended_at: string; description: string; imported_at: string;
   title: string;   // the host's own session name; "" when it wrote none
   git_branch: string;
+  /*
+   * The rooms a session lived in and who spoke there: distinct values from its channel
+   * turns, most frequent first, comma-joined. Lists, because one session commonly
+   * spans rooms — measured on m5, 61 of 95 channel transcripts carry more than one
+   * chat_id and 21 more than one sender. "" when nothing arrived by channel.
+   */
+  via: string; chat_id: string; from_users: string;
 }
 
 /** (path, mtime, size) is the import-diff identity — no content hashing. */
@@ -346,11 +371,24 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean; via?: string; chat?: string; fromUser?: string } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const limit = opts.limit ?? 20;
     const filters: string[] = [];
+    /*
+     * CHANNEL FACETS, probed like `kind` below: a shard indexed before they existed has
+     * no such column, and naming one in a filter is a hard error there. That shard holds
+     * no facets, so a facet filter matches nothing in it — an empty answer, not an error
+     * the fan-out would swallow. Substring and case-blind: `--via discord` is both
+     * plugin:discord:discord and arra-oracle-discord.
+     */
+    const facets = ([["via", opts.via], ["chat_id", opts.chat], ["from_user", opts.fromUser]] as const)
+      .filter(([, v]) => v);
+    if (facets.length) {
+      if ((await this.missingColumns("events", facets.map(([c]) => c)))?.length) return [];
+      for (const [c, v] of facets) filters.push(`lower(${c}) LIKE '%${v!.toLowerCase().replace(/'/g, "''")}%'`);
+    }
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
     /*
      * The "main" default: the human's own thread plus documents, excluding the
@@ -746,6 +784,59 @@ export class LanceStore {
     return await t.query().where("tier = 'memory'")
       .select(["session_uuid", "file_path", "mem_type", "origin_session", "ts", "text"])
       .toArray() as any;
+  }
+
+  /**
+   * Which of these columns the table lacks: [] when it has them all, null when there is
+   * no such table. A filter or select naming a missing column is a hard error.
+   */
+  async missingColumns(table: string, cols: string[]): Promise<string[] | null> {
+    const t = await this.existing(table);
+    if (!t) return null;
+    const have = new Set((await t.schema()).fields.map(f => f.name));
+    return cols.filter(c => !have.has(c));
+  }
+
+  /**
+   * What `index --backfill-channel` would re-read here. Read-only.
+   *
+   * `facets`: files with a user turn that opens with a channel envelope and carries no
+   * `via` — every such turn on a shard written before the columns existed. The texts
+   * come back so the caller can confirm each with parseChannelEnvelope: a `<channel`
+   * the parser rejects would otherwise be re-read on every run and never leave the list.
+   *
+   * `names`: session rows whose stored description still opens with an envelope tag,
+   * written before import stripped it (#92). Where the tag ran past the 200-char cut,
+   * the words the human typed are gone from the row and only a re-parse brings them back.
+   */
+  async channelBackfill(): Promise<{ facets: { file_path: string; text: string }[];
+                                     names: SessionRow[] }> {
+    const out = { facets: [] as { file_path: string; text: string }[], names: [] as SessionRow[] };
+    const ev = await this.existing("events");
+    if (ev) {
+      const faceted = (await this.missingColumns("events", ["via"]))?.length === 0;
+      out.facets = await ev.query()
+        .where(`role = 'user' AND text LIKE '<channel%'` + (faceted ? ` AND via = ''` : ""))
+        .select(["file_path", "text"]).toArray() as any;
+    }
+    const se = await this.existing("sessions");
+    if (se) {
+      out.names = await se.query()
+        .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `description LIKE '${p}%'`).join(" OR "))
+        .toArray() as unknown as SessionRow[];
+    }
+    return out;
+  }
+
+  /** Session rows for these files — chunked, like every IN (...) in this file. */
+  async sessionsOf(paths: string[]): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const out: SessionRow[] = [];
+    for (let i = 0; i < paths.length; i += 200)
+      out.push(...await t.query().where(`file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`)
+        .toArray() as unknown as SessionRow[]);
+    return out;
   }
 
   /** The session ids this shard holds — the right-hand side of the memory join. */

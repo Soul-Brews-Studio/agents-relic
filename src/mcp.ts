@@ -5,8 +5,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, roomTag, channelHead,
 } from "./query.js";
+import { parseChannelEnvelope, saidText } from "./types.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
@@ -87,6 +88,13 @@ const TOOLS = [
         source: str("Which corpus a transcript came from — see relic_status."),
         worktree: str("Worktree name, when the repo uses them."),
         path: str("Substring of the transcript's file path."),
+        via: str("Channel turns only: substring of the plugin a human turn came in by — the " +
+                 "envelope's `source`, stored verbatim, so 'discord' matches both " +
+                 "plugin:discord:discord and arra-oracle-discord. Case-blind."),
+        chat: str("Channel turns only: substring of the room or thread id (chat_id) a turn " +
+                  "came in on — the last digits of a Discord channel id are enough."),
+        from_user: str("Channel turns only: substring of who sent the turn (the envelope's " +
+                       "`user`), e.g. 'nazt_'. A shared channel is several people, all role:user."),
         since: str(SINCE_DESC),
         until: str(SINCE_DESC),
       },
@@ -364,9 +372,10 @@ async function run(name: string, a: any): Promise<string> {
       return `no shards match${a?.repo ? ` repo~${a.repo}` : ""} — call relic_status to see what is indexed`;
 
     const limit = Number(a.limit ?? 20);
-    const { hits, shards, ms, total } = await searchEvents(q, {
+    const { hits, shards, ms, total, unfaceted } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
+      via: a.via, chat: a.chat, fromUser: a.from_user,
       allTiers: Boolean(a.all_tiers || a.tier),
     });
     // Same trace log the CLI writes, so MCP traffic shows up in `relic trace` too —
@@ -377,14 +386,22 @@ async function run(name: string, a: any): Promise<string> {
             shards, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
             top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true }, DATA_ROOT);
 
-    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)`;
+    // Said on the answer itself: a shard that predates the facets cannot match one, and
+    // its silence reads exactly like "no such turn".
+    const note = unfaceted ? `${unfaceted} of ${shards} shards predate channel facets and cannot match ` +
+      `via/chat/from_user until \`relic index --backfill-channel --apply\` re-reads them` : "";
+    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + (note ? `\n${note}` : "");
     const narrowed = !a.all_tiers && !a.tier;
     const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
-      (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""), ""];
+      (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""),
+      ...(note ? [note] : []), ""];
     for (const h of hits.slice(0, limit)) {
-      const i = h.text.toLowerCase().indexOf(q.toLowerCase());
-      const snip = i < 0 ? h.text.slice(0, 200) : h.text.slice(Math.max(0, i - 70), i + q.length + 130);
+      const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
+      const text = c ? c.body : h.text;
+      const i = text.toLowerCase().indexOf(q.toLowerCase());
+      const snip = i < 0 ? text.slice(0, 200) : text.slice(Math.max(0, i - 70), i + q.length + 130);
       L.push(`${h.repo}${h.worktree ? ` [${h.worktree}]` : ""} · ${h.source}/${h.tier} · ${h.role} · ${h.ts}`);
+      if (c) L.push(`  ${channelHead(c)}`);
       L.push(`  ...${oneLine(snip, 260)}...`);
       L.push(`  relic_show  file=${h.file_path}  seq=${h.seq}`);
       L.push("");
@@ -402,7 +419,7 @@ async function run(name: string, a: any): Promise<string> {
     for (const r of rows) {
       L.push(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
              `${String(r.event_count).padStart(6)} ev  ${r.repo}${r.worktree ? ` [${r.worktree}]` : ""}`);
-      L.push(`    ${oneLine(nameOf(r), 110)}`);
+      L.push(`    ${oneLine(nameOf(r), 110)}${roomTag(r) ? `  ${roomTag(r)}` : ""}`);
     }
     if (total > rows.length) L.push("", `... and ${total - rows.length} more (raise limit)`);
     return L.join("\n");
@@ -422,14 +439,14 @@ async function run(name: string, a: any): Promise<string> {
       const L = [`${uuids.size} sessions named like "${a.id}" — call again with one id:`, ""];
       for (const r of rows)
         L.push(`${localDateTime(r.started_at)}  ${r.session_uuid}  ` +
-               `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}`);
+               `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}${roomTag(r) ? `  ${roomTag(r)}` : ""}`);
       return L.join("\n");
     }
 
     const st = statsOf(rows)!;
     const parent = rows.find(r => r.tier === "session") ?? rows[0];
     const L = [
-      nameOf(parent),
+      `${nameOf(parent)}${roomTag(parent) ? `  ${roomTag(parent)}` : ""}`,
       `${parent.session_uuid} · matched by ${matchedBy}${imported ? ` · ${imported} imported on demand` : ""}`,
       `${st.repo}${st.worktree ? ` [${st.worktree}]` : ""}${st.model ? ` · ${st.model}` : ""}`,
       `${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)} · ` +
@@ -542,7 +559,8 @@ async function run(name: string, a: any): Promise<string> {
   if (name === "relic_show") {
     const lines = await readAround(String(a.file), Number(a.seq), Number(a?.before ?? 2), Number(a?.after ?? 2));
     if (!lines.length) return `no events around seq ${a.seq} in ${a.file}`;
-    return lines.map(l => `${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ${oneLine(l.text, 1200)}`).join("\n");
+    return lines.map(l => `${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ` +
+                          `${oneLine(l.role === "user" ? saidText(l.text) : l.text, 1200)}`).join("\n");
   }
 
   return `unknown tool ${name}`;

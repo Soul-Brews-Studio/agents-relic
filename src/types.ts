@@ -31,6 +31,11 @@ export interface ParsedEvent {
    * would force four shapes to write a value they do not have.
    */
   cwd?: string | null;
+  /**
+   * Who sent this turn, from which room, and when — set only on a user turn that OPENS
+   * with a channel envelope (see parseChannelEnvelope). `text` keeps the envelope.
+   */
+  channel?: ChannelEnvelope | null;
 }
 
 export interface ParsedFile {
@@ -196,4 +201,61 @@ export function stripEnvelope(text: string): string {
   }
   t = t.replace(CHANNEL_TAG, " ");
   return t === raw ? raw : t.trim();
+}
+
+/**
+ * What a channel plugin's envelope says about a turn, and the only place it is said:
+ * who sent it, from which room, on whose clock (#85, #86). "" for an absent attribute.
+ */
+export interface ChannelFacets {
+  via: string;            // `source`, VERBATIM: plugin:discord:discord, arra-oracle-discord, mqtt …
+  chat_id: string;        // the channel or thread it arrived in
+  msg_id: string;         // `message_id` — the message upstream
+  from_user: string;      // `user`
+  from_user_id: string;   // `user_id`
+  sent_ts: string;        // `ts` — the sender's clock, not the transcript's
+}
+export interface ChannelEnvelope extends ChannelFacets { body: string }
+
+const CHANNEL_OPEN = /^\s*<channel(?=[\s>])([^>]*)(?:>|$)/;
+
+/**
+ * A channel delivery's facets, or null when the text is not one.
+ *
+ * A DELIVERY OPENS THE TURN. Measured on m5: of 3,474 user turns holding a `<channel`
+ * tag, 3,377 open with one, each with exactly one envelope. The other 97 are quoted
+ * text — compaction summaries, pasted prompts, federation messages — and parsing those
+ * would credit a Discord user with a paragraph an agent pasted. `source` is required:
+ * a bare `<channel>` is prose about the tag (48 of them).
+ *
+ * Tolerant of truncation. A tag cut off before its `>` keeps every attribute that
+ * survived whole, and a missing one is "" — a half-written id is not an id. `body` is
+ * stripEnvelope's, so there is one idea of what an envelope wraps, not two. Like
+ * stripEnvelope, the tag ends at its first `>`: 0 of 3,377 real envelopes quote one.
+ */
+export function parseChannelEnvelope(text: string): ChannelEnvelope | null {
+  const m = CHANNEL_OPEN.exec(String(text ?? ""));
+  if (!m) return null;
+  const a = new Map<string, string>();
+  for (const [, k, v] of m[1].matchAll(/([\w-]+)="([^"]*)"/g)) if (!a.has(k)) a.set(k, v);
+  if (!a.get("source")) return null;
+  const at = (k: string) => a.get(k) ?? "";
+  return { via: at("source"), chat_id: at("chat_id"), msg_id: at("message_id"),
+           from_user: at("user"), from_user_id: at("user_id"), sent_ts: at("ts"), body: stripEnvelope(text) };
+}
+
+/** `plugin:discord:discord` -> `discord`. Display only; the column keeps the raw value. */
+export function viaLabel(via: string): string {
+  return /^plugin:[^:]*:(.+)$/.exec(via)?.[1] ?? via;
+}
+
+/** `nazt_ (discord)` — who said it, and through what. All a human turn needs in a margin. */
+export function senderOf(c: ChannelFacets): string {
+  return c.from_user ? `${c.from_user} (${viaLabel(c.via)})` : viaLabel(c.via);
+}
+
+/** A human turn as a reader should see it: `nazt_ (discord): yo` for a delivery, else as typed. */
+export function saidText(text: string): string {
+  const c = parseChannelEnvelope(text);
+  return c ? `${senderOf(c)}: ${c.body}` : text;
 }

@@ -33,8 +33,10 @@ SHARD = os.path.expanduser("~/.relic/banks/projects/github.com/laris-co/neo-orac
 # Listing them explicitly is the point: a typo'd or accidental new field fails here
 # instead of being waved through as "probably a migration".
 PENDING_MIGRATION = {
-    "events": {"kind"},      # issue #12 — split out of `tier`, backfilled by widen()
-    "sessions": set(),
+    "events": {"kind",       # issue #12 — split out of `tier`, backfilled by widen()
+               # #85/#86 channel facets — "" until widen(); filled by index --backfill-channel
+               "via", "chat_id", "msg_id", "from_user", "from_user_id", "sent_ts"},
+    "sessions": {"via", "chat_id", "from_users"},   # #85/#86 — a session's rooms and senders
     "files": set(),
 }
 

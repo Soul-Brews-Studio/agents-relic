@@ -12,7 +12,7 @@ import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
-import { stripEnvelope } from "./types.js";
+import { stripEnvelope, parseChannelEnvelope, senderOf, saidText } from "./types.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
@@ -20,6 +20,7 @@ import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, hu
 import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
+import { planChannelBackfill, applyChannelBackfill } from "./backfill.js";
 
 // #37 — noise filtering is now ON by default: blob-shaped tool traffic (base64,
 // hex, JWTs, minified JS — see noise.ts's longestUnbrokenRun) inflates FTS document
@@ -34,7 +35,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO } from "./query.js";
+         groupByBank, maxISO, roomTag, channelHead } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
@@ -87,6 +88,7 @@ function resolveSourcePath(f: Record<string, string | boolean>, only: string[] |
 
 // ---- index -----------------------------------------------------------------
 async function cmdIndex(f: Record<string, string | boolean>) {
+  if (f["backfill-channel"]) return cmdBackfillChannel(f);
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
   const skipNoise = wantSkipNoise(f);
@@ -156,6 +158,65 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     });
     reportPrune(plan, maxDropPct);
   }
+}
+
+/**
+ * `index --backfill-channel`: re-import the files whose rows predate channel facets, or
+ * whose stored name is still an envelope. DRY BY DEFAULT, like prune — the count comes
+ * first, and `--apply` re-imports exactly the files that count named.
+ */
+async function cmdBackfillChannel(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
+  const apply = Boolean(f.apply);
+  const scope = { dataRoot, inRepo, repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined };
+  const t0 = Date.now();
+  console.log(`\u{1F3FA} relic channel backfill  (${[scope.bank ? `bank ${scope.bank}` : "", scope.repo ? `repo~${scope.repo}` : "",
+              apply ? "APPLY — these files will be re-imported" : "dry run — nothing written"].filter(Boolean).join(" · ")})`);
+  const plan = await planChannelBackfill(scope);
+  const facets = plan.files.filter(x => x.why.includes("facets"));
+  const names = plan.files.filter(x => x.why.includes("names"));
+  const gb = (plan.bytes / 1e9).toFixed(2);
+  console.log(`  scanned:     ${fmt(plan.scanned)} shards in ${(plan.ms / 1000).toFixed(1)}s`);
+  console.log(`  facets:      ${fmt(facets.length)} files · ${fmt(facets.reduce((n, x) => n + x.turns, 0))} channel turns with no via`);
+  console.log(`  names:       ${fmt(names.length)} files · description still opens with an envelope tag,` +
+              ` ${fmt(names.filter(x => x.untitled).length)} of them named (untitled)`);
+  console.log(`  to re-read:  ${fmt(plan.files.length)} files · ${gb} GB`);
+  const byBank = new Map<string, number>();
+  for (const x of plan.files) byBank.set(x.found.bank, (byBank.get(x.found.bank) ?? 0) + 1);
+  for (const [b, n] of [...byBank].sort((a, z) => z[1] - a[1])) console.log(`               ${fmt(n).padStart(7)}  ${b}`);
+  const sk = plan.skipped;
+  if (sk.gone + sk.moved + sk.otherShape)
+    console.log(`  skipped:     ${[sk.gone && `${fmt(sk.gone)} gone from disk`,
+                                   sk.moved && `${fmt(sk.moved)} now resolve to another repo (re-importing would split them across shards)`,
+                                   sk.otherShape && `${fmt(sk.otherShape)} not Claude transcripts (only that shape parses envelopes)`]
+                                  .filter(Boolean).join(" · ")}`);
+  if (!plan.files.length) { console.log(`  nothing to backfill.`); return; }
+  if (!apply) {
+    console.log(`\n  to re-import them:  relic index --backfill-channel --apply` +
+                `   (narrow with --bank B or --repo S)`);
+    // Said up front: this IS the changed-file import, so today's rules come with it.
+    console.log(`  each file is re-imported the way index re-imports a changed one, today's noise` +
+                ` filter included (--keep-noise keeps blob-shaped rows an older import kept)`);
+    return;
+  }
+
+  // Shard totals either side of the write. A re-import replaces rows, so a change in the
+  // count is a rule that changed since the first import — and it should be visible.
+  const dirs = [...new Set(plan.files.map(x => x.shard))];
+  const total = async () => { let n = 0; for (const d of dirs) n += (await (await LanceStore.open(d)).counts()).events; return n; };
+  const before = await total();
+  const tally = await applyChannelBackfill(plan, { dataRoot, inRepo, skipNoise: wantSkipNoise(f),
+                                                    verbose: Boolean(f.verbose), progress: true });
+  console.log(`  re-imported: ${fmt(tally.imported)} files -> ${fmt(tally.added)} events` +
+              (tally.failed ? `  ⚠ ${fmt(tally.failed)} failed (re-run with --verbose to see why)` : ""));
+  console.log(`  events:      ${fmt(before)} -> ${fmt(await total())} across the ${fmt(dirs.length)}` +
+              ` shard${dirs.length === 1 ? "" : "s"} rewritten` +
+              (tally.skippedNoise ? `  ·  ${fmt(tally.skippedNoise)} held back as noise -> relic skipped` : ""));
+  // Proven by asking again, not by trusting the tally: what is left is what the next
+  // dry run would print.
+  const after = await planChannelBackfill(scope);
+  console.log(`  left:        ${fmt(after.files.length)} files still need it  ·  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 }
 
 /**
@@ -468,7 +529,9 @@ async function cmdSemantic(q: string, f: Record<string, string | boolean>,
     const dup = Number((h as any)._dupes ?? 0);
     console.log(`${score}  ${h.repo}  ${h.source}/${h.tier}  ${h.role}  ${h.ts}` +
                 (dup ? `   (+${dup} identical cop${dup === 1 ? "y" : "ies"} elsewhere)` : ""));
-    console.log(`  ${h.text.replace(/\s+/g, " ").trim().slice(0, 220)}`);
+    const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
+    if (c) console.log(`  ${channelHead(c)}`);
+    console.log(`  ${(c ? c.body : h.text).replace(/\s+/g, " ").trim().slice(0, 220)}`);
     const eph = ephemeralNote(h.text, bankOfHit(h.repo));
     if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
@@ -510,18 +573,19 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms, generic } = await searchEvents(q, {
+  const { hits, shards: searched, ms, generic, unfaceted } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
     org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
+    via: f.via as string, chat: f.chat as string, fromUser: f["from-user"] as string,
     allTiers: Boolean(f["all-tiers"] || f.tier),
     warnGeneric: !f["no-warn"],
   });
 
   const filters: Record<string, string> = {};
-  for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
+  for (const k of ["repo", "worktree", "path", "tier", "source", "via", "chat", "from-user"]) if (f[k]) filters[k] = String(f[k]);
   trace({
     ts: new Date().toISOString(), q, chars: [...q].length, filters,
     shards: searched, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
@@ -542,6 +606,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.error(`    Or narrow the scope: --repo/--since/--worktree.  Or try --semantic for a paraphrase.`);
     console.error(`    Suppress this warning: --no-warn`);
   }
+  if (unfaceted)
+    console.error(`\n  ⚠ ${fmt(unfaceted)} of ${fmt(searched)} shards were indexed before channel facets existed —` +
+                  ` --via/--chat/--from-user cannot match anything in them.` +
+                  `\n    relic index --backfill-channel   counts what re-reading their channel turns would take`);
 
   const top = hits.slice(0, limit);
   const mode = outFmt(f);
@@ -589,10 +657,14 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   }
   console.log("");
   for (const h of hits.slice(0, limit)) {
-    const i = h.text.toLowerCase().indexOf(q.toLowerCase());
-    const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
+    // A channel hit says who, where and when, then the words — not 180 chars of routing.
+    const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
+    const text = c ? c.body : h.text;
+    const i = text.toLowerCase().indexOf(q.toLowerCase());
+    const snip = i < 0 ? text.slice(0, 160) : text.slice(Math.max(0, i - 60), i + q.length + 80);
     const wt = h.worktree ? `  [${h.worktree}]` : "";
     console.log(`${h.repo.replace("github.com/", "")}${wt}  ${h.source}/${h.tier}  ${h.role} ${h.ts}`);
+    if (c) console.log(`  ${channelHead(c)}`);
     console.log(`  ...${snip.replace(/\s+/g, " ").trim()}...`);
     // Flagged against the WHOLE event text, not the 160-char snippet — the path that
     // matters is usually a tool's output line, not the part that matched the query.
@@ -614,7 +686,8 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
   }, (f["data-root"] as string) ?? null);
 
   for (const l of await readAround(path, Number(f.seq ?? 1), Number(f.before ?? 2), Number(f.after ?? 2)))
-    console.log(`${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ${l.text.replace(/\s+/g, " ").slice(0, 300)}`);
+    console.log(`${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ` +
+                `${(l.role === "user" ? saidText(l.text) : l.text).replace(/\s+/g, " ").slice(0, 300)}`);
 }
 // ---- session (resolve one id) ----
 async function cmdSession(id: string, f: Record<string, string | boolean>) {
@@ -646,7 +719,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
     console.log(`${uuids.size} sessions named like "${id}"\n`);
     for (const r of rows)
       console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
-                  `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}`);
+                  `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}` +
+                  (roomTag(r) ? `  ${roomTag(r)}` : ""));
     console.log(`\npick one:  relic session <id>`);
     return;
   }
@@ -662,7 +736,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   }
 
   const wt = st.worktree ? ` [${st.worktree}]` : "";
-  console.log(`${nameOf(parent)}\n`);
+  const room = roomTag(parent);
+  console.log(`${nameOf(parent)}${room ? `  ${room}` : ""}\n`);
   console.log(`${parent.session_uuid}  ·  matched by ${matchedBy}  ·  ${st.repo.replace("github.com/", "")}${wt}`);
   console.log(`${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)}` +
               `  ·  ${fmt(st.transcripts)} transcript${st.transcripts === 1 ? "" : "s"}  ·  ${fmt(st.events)} ev` +
@@ -744,7 +819,8 @@ async function cmdSessions(f: Record<string, string | boolean>) {
     const wt = r.worktree ? `  [${r.worktree}]` : "";
     const kids = r.children ? ` +${r.children}` : "";
     console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}${kids.padEnd(5)}  ${String(r.treeEvents).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
-    console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}`);
+    const room = roomTag(r);
+    console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}${room ? `  ${room}` : ""}`);
   }
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }
@@ -876,11 +952,14 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
   console.log("");
 
   for (const e of tail) {
-    // A channel envelope is ~180 chars of routing before a word the human typed.
-    const t = (e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
+    // A channel envelope is ~180 chars of routing before a word the human typed. What
+    // survives of it is the sender — `nazt_ (discord): ` — OUTSIDE the budget, so
+    // --chars is spent on the words.
+    const c = e.role === "user" ? parseChannelEnvelope(e.text) : null;
+    const t = (c ? c.body : e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
     if (!t) continue;
     const cut = handoffBudget(e.role, chars);
-    const body = t.length > cut ? t.slice(0, cut) + " …" : t;
+    const body = (c ? `${senderOf(c)}: ` : "") + (t.length > cut ? t.slice(0, cut) + " …" : t);
     // The human unmarked at the margin, the assistant indented under it: the block
     // reads as what was asked, with what it was answering underneath.
     console.log(e.role === "user" ? `  ${body}` : `      · ${body}`);
@@ -1039,8 +1118,18 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
                 `  drop --flat for exchanges, or --role user for what was asked.`);
   console.log("");
   for (const e of tail) {
-    console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}`);
-    const text = chars > 0 ? e.text.slice(0, chars) + (e.text.length > chars ? " …" : "") : e.text;
+    /*
+     * A channel turn is headed by its sender, and by THEIR clock when it disagrees with
+     * the transcript's by a minute or more. Usually it does not — median 195 ms over
+     * 2,777 real channel turns — but 29 waited over a minute and 13 over an hour, and
+     * those are the turns whose timing the transcript misreports.
+     */
+    const c = e.role === "user" ? parseChannelEnvelope(e.text) : null;
+    const lag = c ? Math.abs(Date.parse(e.ts ?? "") - Date.parse(c.sent_ts)) : 0;
+    console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}` +
+                (c ? `  ·  ${senderOf(c)}${lag >= 60_000 ? `, sent ${localDateTime(c.sent_ts)}` : ""}` : ""));
+    const said = c ? c.body : e.text;
+    const text = chars > 0 ? said.slice(0, chars) + (said.length > chars ? " …" : "") : said;
     console.log(text.replace(/^/gm, "  "));
     console.log();
   }

@@ -199,3 +199,35 @@ def strip_envelope(text) -> str:
             t = t[:close] + " " + t[close + len(m.group(1)) + 3:]
     t = _CHANNEL_TAG.sub(" ", t)
     return raw if t == raw else t.strip()
+
+
+# A channel delivery OPENS the turn, and its tag ends at the first `>` — exactly as
+# strip_envelope reads it. See parseChannelEnvelope in src/types.ts for the measurements.
+_CHANNEL_OPEN = re.compile(r"^\s*<channel(?=[\s>])([^>]*)(?:>|$)")
+# ASCII, like JavaScript's \w: an attribute name is never Thai, and parity is cheaper
+# kept than argued about.
+_ATTR = re.compile(r'([\w-]+)="([^"]*)"', re.ASCII)
+
+
+def parse_channel_envelope(text) -> Optional[dict]:
+    """Mirror of parseChannelEnvelope in src/types.ts: who sent a turn, from which room,
+    on whose clock — or None when the text does not OPEN with a channel envelope that
+    names its `source`. Both suites read test/fixtures/channel-envelopes.json."""
+    raw = str(text or "")
+    m = _CHANNEL_OPEN.match(raw)
+    if not m:
+        return None
+    a: dict[str, str] = {}
+    for k, v in _ATTR.findall(m.group(1)):
+        a.setdefault(k, v)             # the first of a repeated attribute wins, as in TS
+    if not a.get("source"):
+        return None
+    return {"via": a["source"], "chat_id": a.get("chat_id", ""), "msg_id": a.get("message_id", ""),
+            "from_user": a.get("user", ""), "from_user_id": a.get("user_id", ""),
+            "sent_ts": a.get("ts", ""), "body": strip_envelope(raw)}
+
+
+def via_label(via: str) -> str:
+    """`plugin:discord:discord` -> `discord`. Display only; the column keeps the raw value."""
+    m = re.match(r"^plugin:[^:]*:(.+)\Z", via)     # \Z: JavaScript's $ without the m flag
+    return m.group(1) if m else via

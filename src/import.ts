@@ -82,6 +82,12 @@ export interface ImportOpts {
    * so any divergence between the two mappings is a deletion in the wrong shard.
    */
   noWrite?: boolean;
+  /**
+   * Re-import these paths even when the manifest says unchanged — through the same
+   * delete-by-file_path path a changed file takes. `index --backfill-channel` is the
+   * only caller: rows written before a column existed stay empty until their file moves.
+   */
+  reimport?: Set<string>;
 }
 export interface ImportTally {
   added: number; skipped: number; failed: number; filtered: number;
@@ -94,6 +100,23 @@ export interface ImportTally {
   seen: Map<string, Set<string>>;
   /** FTS indexes actually built or confirmed, and what that phase cost. */
   ftsBuilt: number; ftsFailed: number; ftsMs: number;
+}
+
+/**
+ * A session's rooms and senders, from its channel turns: distinct values, most frequent
+ * first, comma-joined — so the first of each is where most of the session happened.
+ * Ties keep the order they were first seen.
+ */
+export function roomsOf(events: { channel?: { via: string; chat_id: string; from_user: string } | null }[]):
+    { via: string; chat_id: string; from_users: string } {
+  const tally = { via: new Map<string, number>(), chat_id: new Map<string, number>(), from_users: new Map<string, number>() };
+  const bump = (m: Map<string, number>, v: string) => { if (v) m.set(v, (m.get(v) ?? 0) + 1); };
+  for (const { channel: c } of events) {
+    if (!c) continue;
+    bump(tally.via, c.via); bump(tally.chat_id, c.chat_id); bump(tally.from_users, c.from_user);
+  }
+  const list = (m: Map<string, number>) => [...m].sort((a, b) => b[1] - a[1]).map(([v]) => v).join(",");
+  return { via: list(tally.via), chat_id: list(tally.chat_id), from_users: list(tally.from_users) };
 }
 
 /**
@@ -236,7 +259,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       // zone for the whole block — every file threw ReferenceError, and the importer
       // reported them as parse failures.
       const known = man.get(file.path);
-      if (known && known.mtime === file.mtime && known.size === file.size) { skipped++; continue; }
+      if (known && known.mtime === file.mtime && known.size === file.size && !o.reimport?.has(file.path)) { skipped++; continue; }
 
       const dropped: any[] = [];
       const kept = o.skipNoise
@@ -261,6 +284,9 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         org: loc.org, project: loc.project, dir: loc.dir,
         mem_type: String((p as any).memType ?? ""),
         origin_session: String((p as any).originSessionId ?? ""),
+        via: e.channel?.via ?? "", chat_id: e.channel?.chat_id ?? "", msg_id: e.channel?.msg_id ?? "",
+        from_user: e.channel?.from_user ?? "", from_user_id: e.channel?.from_user_id ?? "",
+        sent_ts: e.channel?.sent_ts ?? "",
       }));
 
       const batch = pend(shardKey, store);
@@ -275,6 +301,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
         line_count: p.lines, event_count: kept.length, bad_lines: p.badLines,
         started_at: p.startedAt ?? "", ended_at: p.endedAt ?? "",
         description: p.description ?? "", title: p.title ?? "", git_branch: p.gitBranch ?? "", imported_at: nowISO(),
+        ...roomsOf(p.events),
       });
       batch.files.push({ file_path: file.path, repo_key: repoCol, mtime: file.mtime, size: file.size, imported_at: nowISO() });
       man.set(file.path, { mtime: file.mtime, size: file.size });

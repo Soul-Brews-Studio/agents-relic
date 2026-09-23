@@ -363,7 +363,29 @@ class LanceStore:
         if t is None:
             self.db.create_table(name, data=data, schema=model.to_arrow_schema())
             return
+        if self._widen(t, data[0]):
+            t = self._existing(name)      # reopen: the handle predates the new columns
         t.merge_insert(key).when_matched_update_all().when_not_matched_insert_all().execute(data)
+
+    def _widen(self, t, row: dict) -> bool:
+        """Mirror of widen() in src/store/lance.ts: add the columns a row has and the table
+        lacks, backfilled with a scalar default. Without it every shard indexed before a
+        column existed rejects the WHOLE batch — "Field 'via' not found in target schema".
+
+        Scalars only, like the TypeScript: add_columns backfills a scalar default, and a
+        list column added that way lands as text. Numbers get 0.0, because every number on
+        disk is float64 (see models.py).
+        """
+        have = set(t.schema.names)
+        missing = [k for k in row if k not in have]
+        if not missing:
+            return False
+        for k in missing:
+            if isinstance(row[k], bool) or not isinstance(row[k], (str, int, float)):
+                raise ValueError(f"lance: refusing to widen with non-scalar column {k!r} "
+                                 f"({type(row[k]).__name__}) — create a table with the right schema")
+        t.add_columns({k: "''" if isinstance(row[k], str) else "0.0" for k in missing})
+        return True
 
     def delete_events_of(self, file_path: str) -> None:
         """Drop a file's rows before its new generation lands, or the two coexist."""

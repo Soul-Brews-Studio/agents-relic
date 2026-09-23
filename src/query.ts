@@ -1,5 +1,6 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble, stripEnvelope } from "./types.js";
+import { isHostPreamble, stripEnvelope, viaLabel, type ChannelFacets } from "./types.js";
+import { localDateTime, zoneOffset } from "./time.js";
 export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
@@ -38,6 +39,8 @@ export interface SearchOpts extends Scope {
   allTiers?: boolean;
   since?: string; until?: string;   // 7d / 12h / 30m / 2026-09-01 / full ISO
   prose?: boolean;
+  /** Channel facets, each a case-blind substring: the front door, the room, the sender. */
+  via?: string; chat?: string; fromUser?: string;
   /**
    * Run the generic-query heuristic (see checkGenericQuery). Default true — the
    * check is cheap relative to the search it rides along with, so opting OUT is the
@@ -119,6 +122,11 @@ export interface SearchResult {
   ms: number;
   total: number;           // hits before the limit slice
   generic?: GenericCheck;  // set when warnGeneric ran; undefined if skipped or < 2 shards
+  /**
+   * Shards read under a facet filter that predate the facet columns: they cannot match
+   * one, so "no matches" there means "not faceted yet" — see `index --backfill-channel`.
+   */
+  unfaceted?: number;
 }
 
 /*
@@ -350,7 +358,10 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const tier = o.tier;
   const opts = { limit, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
                  org: o.org, project: o.project, dir: o.dir, memType: o.memType,
-                 since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
+                 since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose,
+                 via: o.via, chat: o.chat, fromUser: o.fromUser };
+  const facetCols = [o.via && "via", o.chat && "chat_id", o.fromUser && "from_user"].filter(Boolean) as string[];
+  let unfaceted = 0;
 
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(CAP, shards.length) }, async () => {
@@ -360,6 +371,9 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
       const s = shards[i];
       try {
         const store = await LanceStore.open(s.dir);
+        // Counted, not just skipped: an empty answer from a shard that CANNOT match
+        // reads exactly like one that did not, and only one of those is true.
+        if (facetCols.length && (await store.missingColumns("events", facetCols))?.length) unfaceted++;
         for (const h of await store.search(q, opts)) hits.push({ ...h, repo: s.key });
         searched++;
       } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
@@ -391,7 +405,8 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const generic = o.warnGeneric === false ? undefined : (await checkGenericQuery(q, shards)) ?? undefined;
 
   return { hits, shards: searched, available: shards.length,
-           ms: Math.round(performance.now() - t0), total: hits.length, generic };
+           ms: Math.round(performance.now() - t0), total: hits.length, generic,
+           ...(facetCols.length && { unfaceted }) };
 }
 
 export interface SemanticOpts extends Scope {
@@ -976,6 +991,39 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
        .replace(/<[^>]{1,40}>/g, " ")
        .replace(/\s+/g, " ").trim();
   return d ? d.slice(0, 70) : "(untitled)";
+}
+
+/** `#…214730` — the tail of a snowflake tells rooms apart; a short id is shown whole. */
+export function chatLabel(id: string): string {
+  return id.length > 8 ? `#…${id.slice(-6)}` : `#${id}`;
+}
+
+/**
+ * `[discord #…214730 +2 · nazt_, ting_41427]` — where a session lived and who spoke,
+ * from the session row's channel columns. "" when nothing arrived by channel, or the
+ * row predates the columns.
+ *
+ * BESIDE the name, never inside it (#86 proposed a prefix). nameOf is the words a human
+ * typed: `session <name>` matches on them, pending and report print them, and a prefix
+ * would push the words past the 70-char cut on exactly the sessions that have one.
+ */
+export function roomTag(r: { via?: unknown; chat_id?: unknown; from_users?: unknown }): string {
+  const list = (v: unknown) => String(v ?? "").split(",").filter(Boolean);
+  const via = [...new Set(list(r.via).map(viaLabel))], chats = list(r.chat_id), users = list(r.from_users);
+  if (!via.length) return "";
+  const room = chats.length ? ` ${chatLabel(chats[0])}${chats.length > 1 ? ` +${chats.length - 1}` : ""}` : "";
+  const who = users.slice(0, 3).join(", ") + (users.length > 3 ? ` +${users.length - 3}` : "");
+  return `[${via.join("+")}${room}${who ? ` · ${who}` : ""}]`;
+}
+
+/** `nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07` — who, where and when, for one hit. */
+export function channelHead(c: ChannelFacets): string {
+  const where = `${viaLabel(c.via)}${c.chat_id ? ` ${chatLabel(c.chat_id)}` : ""}`;
+  // The zone is named: a hit's own `ts` prints as UTC ISO on the line above this one.
+  const t = Date.parse(c.sent_ts);
+  const when = !c.sent_ts ? "" : Number.isNaN(t) ? ` · sent ${c.sent_ts}`
+             : ` · sent ${localDateTime(t)} UTC${zoneOffset(new Date(t))}`;
+  return `${c.from_user ? `${c.from_user} @ ${where}` : where}${when}`;
 }
 
 
