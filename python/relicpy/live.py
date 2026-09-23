@@ -15,7 +15,7 @@ from typing import Optional
 
 from .discover import _dirs, _files, _stat
 from .sources import load_sources
-from .unreadable import reachable
+from .unreadable import dir_unreadable, reachable
 
 
 def age(mtime: int) -> int:
@@ -175,7 +175,8 @@ def session_by_uuid(uuid: str, cwd: str) -> Optional[dict]:
     Codex rollouts live in a date tree that no cwd encoding can address.
     """
     for root in live_roots():
-        for dirpath, _dirnames, filenames in os.walk(root):
+        # os.walk drops a directory it cannot list unless told otherwise (#99).
+        for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda e: dir_unreadable(e.filename, e)):
             for f in filenames:
                 if not f.endswith(".jsonl") or uuid not in f:
                     continue

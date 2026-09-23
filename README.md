@@ -1130,9 +1130,11 @@ directory it could not list or reach, `walk-error` for a single file it could no
 Every walker used to answer those with an empty list, so an unreadable directory looked
 exactly like an empty one and `relic pending` reported `0 missing` about files it had
 never seen. Now each is one stderr line per path (ENOENT stays quiet — optional
-`subagents/` directories are the normal case), `index` logs them here, `pending` says
-its counts cover only what the walk could read, and `prune` refuses to run over a scan
-that could not see everything.
+`subagents/` directories are the normal case — and so does ENAMETOOLONG, a directory
+name derived from a deep cwd that is too long to exist), `index` logs them here,
+`pending` says its counts cover only what the walk could read, and `prune` refuses to
+run over a scan that could not see everything. The lookups report the same way:
+`lineage`, `tail`/`recap` with no id, `dig`, the shard listing and the repo index.
 
 ### `embed` — the opt-in second pass
 

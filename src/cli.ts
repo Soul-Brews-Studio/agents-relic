@@ -8,7 +8,7 @@ import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath, logSkippedFiles, readSkippedFiles } from "./noise.js";
-import { walkFailures } from "./unreadable.js";
+import { walkFailures, dirUnreadable, walkError } from "./unreadable.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
@@ -834,14 +834,18 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
   const found: { file: string; id: string; mtime: number }[] = [];
   for (const root of liveRoots()) {
     const dir = join(root, enc);
-    try {
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith(".jsonl")) continue;
-        const id = name.slice(0, -6);
-        if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
-        try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); } catch {}
-      }
-    } catch { /* root without this project */ }
+    let names: string[];
+    // A root without this project is ENOENT, and quiet. An unreadable one used to give
+    // the same "no earlier session found" while the session sat right there (#99).
+    try { names = readdirSync(dir); }
+    catch (e) { dirUnreadable(dir, e); continue; }
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const id = name.slice(0, -6);
+      if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
+      try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); }
+      catch (e) { walkError(join(dir, name), e); }
+    }
   }
   const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 

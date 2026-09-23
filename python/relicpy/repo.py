@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .models import BANKS_DIR, DEFAULT_BANK, SHARD_DIR, Shard
+from .unreadable import dir_unreadable, reachable
 
 _HOME = Path.home()
 
@@ -176,25 +177,36 @@ def repo_index() -> dict:
         return _repo_index_cache
     out: dict = {}
     host = os.path.join(ghq_root(), "github.com")
-    try:
-        # scandir(follow_symlinks=False), NOT os.path.isdir: isdir FOLLOWS symlinks
-        # while Node's Dirent.isDirectory() does not, so the two implementations would
-        # build different indexes from the same tree. That exact asymmetry already cost
-        # this project once — the vault walker crossed a symlink and found 68,719 notes
-        # where the reference found 10,129. A symlinked repo would also appear under two
-        # names, making both ambiguous and resolving to "_unresolved".
-        for org in sorted(e.name for e in os.scandir(host) if e.is_dir(follow_symlinks=False)):
-            odir = os.path.join(host, org)
-            for repo in sorted(e.name for e in os.scandir(odir) if e.is_dir(follow_symlinks=False)):
-                name = _normalize_repo(repo)
-                key = f"github.com/{org}/{name}"
-                out.setdefault(name, [])
-                if key not in out[name]:
-                    out[name].append(key)
-    except OSError:
-        pass          # no ghq root here — the fallbacks simply never fire
+    # One listing per directory, not one try around the whole walk: the single try read
+    # "no ghq root here" correctly (still quiet — ENOENT), but ONE unreadable org ended
+    # the walk, and every org after it fell out of the index in silence (#99).
+    for org in _real_dirs(host):
+        odir = os.path.join(host, org)
+        for repo in _real_dirs(odir):
+            name = _normalize_repo(repo)
+            key = f"github.com/{org}/{name}"
+            out.setdefault(name, [])
+            if key not in out[name]:
+                out[name].append(key)
     _repo_index_cache = out
     return out
+
+
+def _real_dirs(p: str) -> list[str]:
+    """Real directories only, sorted — and a stderr line when "none" is not "missing".
+
+    scandir(follow_symlinks=False), NOT os.path.isdir: isdir FOLLOWS symlinks while
+    Node's Dirent.isDirectory() does not, so the two implementations would build
+    different indexes from the same tree. That exact asymmetry already cost this project
+    once — the vault walker crossed a symlink and found 68,719 notes where the reference
+    found 10,129. A symlinked repo would also appear under two names, making both
+    ambiguous and resolving to "_unresolved".
+    """
+    try:
+        return sorted(e.name for e in os.scandir(p) if e.is_dir(follow_symlinks=False))
+    except OSError as e:
+        dir_unreadable(p, e)
+        return []
 
 
 def _unique_repo(name: str) -> Optional[str]:
@@ -500,7 +512,7 @@ def list_shards(data_root: Optional[str] = None, in_repo: bool = False) -> list[
     root = data_root or default_root()
     out: list[Shard] = []
     banks_root = os.path.join(root, BANKS_DIR)
-    if not os.path.isdir(banks_root):
+    if not reachable(banks_root):
         return out
     for bank in _subdirs(banks_root):
         bank_dir = os.path.join(banks_root, bank)
@@ -530,10 +542,13 @@ def banks(data_root: Optional[str] = None) -> list[str]:
 
 
 def _subdirs(p: str) -> list[str]:
+    # An unreadable bank or org made its shards vanish from every search and status
+    # without a word — reported now, ENOENT still quiet (#99).
     try:
         return sorted(
             e.name for e in os.scandir(p)
             if e.is_dir() and not e.name.startswith(".") and not e.name.endswith(".lance")
         )
-    except OSError:
+    except OSError as e:
+        dir_unreadable(p, e)
         return []
