@@ -51,8 +51,9 @@ export interface SearchOpts extends Scope {
  * Normalise a date flag to an ISO string the stored `ts` can be compared against.
  *
  * Accepts a relative span (`7d`, `12h`, `30m`), a bare date (`2026-09-01`), or an ISO
- * timestamp passed straight through. `endOfDay` makes a bare date an inclusive upper
- * bound — `--until 2026-09-01` meaning "through the 1st", not "up to its first second".
+ * timestamp, normalised to UTC — a bare one is local time. `endOfDay` makes a bare date an
+ * inclusive upper bound — `--until 2026-09-01` meaning "through the 1st", not "up to its
+ * first second".
  */
 export function toISO(v: unknown, endOfDay = false): string | undefined {
   if (v === undefined || v === null || v === "") return undefined;
@@ -60,7 +61,9 @@ export function toISO(v: unknown, endOfDay = false): string | undefined {
   const rel = parseSince(raw);
   if (rel && /^\d+[mhd]$/.test(raw)) return new Date(rel).toISOString();
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw + (endOfDay ? "T23:59:59Z" : "T00:00:00Z");
-  return raw;
+  // Stored stamps are UTC and compared as text, so an offset or a bare local time must be converted first.
+  const t = Date.parse(raw);
+  return Number.isNaN(t) ? raw : new Date(t).toISOString();
 }
 
 /**

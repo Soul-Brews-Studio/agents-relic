@@ -98,8 +98,8 @@ const TOOLS = [
     description:
       "List or count indexed sessions, newest first, each with its NAME (the title the " +
       "host assigned, falling back to the opening user message). " +
-      "Answers 'what was I working on' over a time range. Filters on the session's own " +
-      "first timestamp, not file mtime — an old session that got one new line stays old.",
+      "Answers 'what was I working on' over a time range. A session matches any window it " +
+      "was active in, on its own event timestamps — not file mtime.",
     inputSchema: {
       type: "object",
       properties: {

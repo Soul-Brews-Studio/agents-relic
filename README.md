@@ -790,8 +790,9 @@ is 111 transcripts sharing one uuid; ungrouped it reads as 111 sessions and the 
 fills with agent prompts instead of the human's. Measured here: 325 transcripts over
 three days are **24 real conversations**. `--all-tiers` turns grouping off.
 
-Filters on `started_at` — the session's own first timestamp — **not** file mtime, which
-moves on every append and would make an old session look new.
+Filters on the session's own event timestamps — a session is in any window it was
+**active** in (`started_at` ≤ until, `ended_at` ≥ since), and its row still shows its own
+start — **not** file mtime, which moves on every append, metadata included.
 
 ### `dig` — the fleet's session timeline, with the tier it was missing
 
