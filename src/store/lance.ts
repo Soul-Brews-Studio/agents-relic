@@ -721,8 +721,9 @@ export class LanceStore {
    * has no tier/kind/repo columns to pre-filter ON. Copying them there would duplicate
    * every scalar column into a second table and re-create the coupling the split removed.
    *
-   * `_distance` is L2 and the vectors are written L2-normalised (VectorRow.norm), so
-   * cosine = 1 - d^2/2 exactly. Reported as `_score` in [0,1] so the number means the
+   * `_distance` is SQUARED L2 and the vectors are written L2-normalised (VectorRow.norm),
+   * so cosine = 1 - d/2 exactly. Reading it as plain L2 (1 - d^2/2) inflated every score
+   * and clamped everything under a true cosine of ~0.29 to 0, in no order (#124). Reported as `_score` in [0,1] so the number means the
    * same thing as a human expects and sorts the same direction as BM25's.
    */
   async vectorSearch(vec: number[], opts: { limit?: number; overfetch?: number;
@@ -758,9 +759,9 @@ export class LanceStore {
 
     const out = rows.map(r => {
       const d = dist.get(String(r.uid)) ?? 0;
-      // L2 on unit vectors: d^2 = 2 - 2cos. Clamped because float error puts a perfect
-      // match a hair below 0, and a score of -1e-9 sorts fine but reads as a bug.
-      const cos = Math.max(0, Math.min(1, 1 - (d * d) / 2));
+      // Squared L2 on unit vectors: d = 2 - 2cos. Clamped because float error puts a
+      // perfect match a hair below 0, and a score of -1e-9 sorts fine but reads as a bug.
+      const cos = Math.max(0, Math.min(1, 1 - d / 2));
       return { ...(r as unknown as Hit), _score: cos } as Hit;
     });
     out.sort((a, b) => Number((b as any)._score) - Number((a as any)._score));
