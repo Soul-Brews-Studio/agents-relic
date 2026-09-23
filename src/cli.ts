@@ -38,7 +38,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
          groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
-import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { embedShards, damageNote, DEFAULT_OLLAMA } from "./embed.js";
 import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
@@ -1229,7 +1229,15 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     dryRun: Boolean(f["dry-run"]),
     session: f.session ? String(f.session) : undefined,
     reset: Boolean(f.reset),
+    repair: Boolean(f.repair),
   };
+  // The run's own flags, minus scope and the two that would defeat a repair (a dry run
+  // never repairs; --reset throws away what a repair keeps). A damaged shard's repair
+  // command is this run, narrowed to that shard — see damageNote().
+  const carry: string[] = [];
+  for (const k of ["data-root", "provider", "model", "host", "device", "batch", "limit", "min-chars", "max-chars", "session"] as const)
+    if (typeof f[k] === "string") carry.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) carry.push(`--${k}`);
 
   let last = 0;
   const bar = progress();
@@ -1261,8 +1269,13 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   console.log(`provider  ${r.providerId}${r.dryRun ? "   (dry run — nothing written)" : ""}`);
   console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}\n`);
   const w = Math.max(6, ...touched.map(sh => sh.key.length));
-  for (const sh of touched.slice(0, Number(f.limit ?? 40))) {
-    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); continue; }
+  // A damaged shard is listed even past the --limit display cap, because its line carries
+  // the only command that repairs it.
+  const cap = Number(f.limit ?? 40);
+  const shown = [...touched.slice(0, cap), ...touched.slice(cap).filter(sh => sh.damage)];
+  for (const sh of shown) {
+    const note = damageNote(sh, carry).map(l => `  ${"".padEnd(w)}        ${l}`);
+    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); note.forEach(l => console.log(l)); continue; }
     const cov = sh.eligible ? Math.round((sh.already + sh.embedded) / sh.eligible * 100) : 0;
     console.log(`  ${sh.key.padEnd(w)}  ${String(cov).padStart(3)}%  ` +
                 `${fmt(sh.already + sh.embedded)}/${fmt(sh.eligible)} embedded` +
@@ -1270,6 +1283,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
                 (sh.pending && r.dryRun ? `  ${fmt(sh.pending)} pending` : "") +
                 (sh.failed ? `  ${fmt(sh.failed)} FAILED` : "") +
                 (sh.dim ? `  dim ${sh.dim}` : ""));
+    note.forEach(l => console.log(l));
   }
   const secs = r.ms / 1000;
   console.log(`\n${fmt(r.embedded)} embedded · ${fmt(r.pending)} pending · ${fmt(r.failed)} failed` +

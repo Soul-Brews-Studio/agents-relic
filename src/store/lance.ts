@@ -114,6 +114,15 @@ export interface VectorRow {
   embedded_at: string;
 }
 
+/** A `vectors` table whose current version no longer reads — see LanceStore.vectorDamage(). */
+export interface VectorDamage {
+  version: number;             // the version the table opens at, which fails to read
+  rows: number;                // rows it claims; countRows() reads only the manifest
+  error: string;               // what the failed read said
+  restorable: number | null;   // the newest older version that reads; null when none does
+  keep: number;                // rows at `restorable`, which is what a restore keeps
+}
+
 export interface Hit extends EventRow { }
 
 /** Lance filters are SQL strings. Quote by doubling; never concatenate raw input. */
@@ -217,6 +226,78 @@ export class LanceStore {
     await this.db.dropTable("vectors");
     this.cache.delete("vectors");
     return true;
+  }
+
+  /**
+   * Whether `vectors` still reads end to end, and if it does not, the newest version
+   * that does. `null` means healthy, or no table at all.
+   *
+   * This is #105. A data file that the current version references can end up 0 bytes,
+   * and from then on every read that touches it fails. On lancedb 0.39 / macOS the error
+   * is "failed to fill whole buffer"; the report had "Invalid range 0..0 for object of
+   * size 0 bytes". countRows() still answers, because it reads only the manifest, so the
+   * table looks fine until something scans it.
+   *
+   * A kill alone did not produce this state. 60 SIGKILLs timed into embed writes on m5
+   * (APFS) always left a table that read: at the last commit that landed, or no table
+   * at all when the kill hit the first write. Lance writes the data files first and the
+   * manifest last, so a killed commit leaves at most files that nothing references
+   * (twice, a 0-byte `.tmpXXXXXX` staging file). What produces the state is data lost
+   * AFTER a commit landed. A machine crash can do that to files that were never
+   * fsynced; that is a guess, not something reproduced here. So the check is a read of
+   * the uid column, never a guess from file sizes. Those harmless 0-byte staging files
+   * would make a size check cry wolf.
+   *
+   * The newest readable version is found by bisection. An embed only appends, so once a
+   * version references a damaged file, every later version does too. Bisection needs
+   * log2(n) probes. Walking back one version at a time needs n, and a shard embedded in
+   * batches of 64 has thousands of versions. If a later delete removed the damaged
+   * fragment, the answer still reads; it is just not necessarily the newest one that does.
+   */
+  async vectorDamage(): Promise<VectorDamage | null> {
+    const t = await this.existing("vectors");
+    if (!t) return null;
+    const reads = async (h: lancedb.Table) => {
+      try { await h.query().select(["uid"]).toArray(); return ""; }
+      catch (err) { return String(err); }
+    };
+    const error = await reads(t);
+    if (!error) return null;
+    const version = await t.version();
+    const rows = await t.countRows();
+    // A second handle: checkout() is in place, and the cached one must stay on latest.
+    const h = await this.db.openTable("vectors");
+    const older = (await h.listVersions()).map(v => v.version).filter(v => v < version).sort((a, b) => a - b);
+    const readsAt = async (v: number) => { await h.checkout(v); return !(await reads(h)); };
+    if (!older.length || !(await readsAt(older[0])))
+      return { version, rows, error, restorable: null, keep: 0 };
+    let lo = 0, hi = older.length;        // older[lo] reads; older[hi] (or `version`) does not
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (await readsAt(older[mid])) lo = mid; else hi = mid;
+    }
+    await h.checkout(older[lo]);
+    return { version, rows, error, restorable: older[lo], keep: await h.countRows() };
+  }
+
+  /**
+   * Put a damaged `vectors` table back to a version that reads. When no version reads,
+   * drop it.
+   *
+   * Restoring loses the least: the vectors committed up to that version survive, and the
+   * resumable anti-join re-embeds only the rest. restore() writes a NEW version that
+   * copies the old manifest, so the damaged versions stay in the history and nothing is
+   * rewritten in place. Dropping is the fallback, and it is the same one-shard,
+   * vectors-only drop as `--reset`. `events`, `sessions`, `files` and the full-text index
+   * are never touched, so the worst case is re-embedding one shard.
+   */
+  async repairVectors(d: VectorDamage): Promise<"restored" | "dropped"> {
+    if (d.restorable === null) { await this.dropVectors(); return "dropped"; }
+    const h = await this.db.openTable("vectors");
+    await h.checkout(d.restorable);
+    await h.restore();
+    this.cache.delete("vectors");   // the cached handle still points at the damaged version
+    return "restored";
   }
 
   /** Single-row conveniences — prefer the array forms in any loop. */

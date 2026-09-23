@@ -6,6 +6,8 @@ resume, the dim guard — and never about whether ollama happens to be running.
 
 from __future__ import annotations
 
+import os
+
 import lancedb
 import pytest
 
@@ -195,3 +197,117 @@ def test_st_provider_id_matches_the_typescript_contract():
         doc = "passage: " if "e5" in model.lower() else ""
         tag = f"st:{model}" + (f"+{doc.strip()}" if doc else "")
         assert tag == want
+
+
+# --------------------------------------- a vectors table that no longer reads (#105)
+
+def damaged(tmp_path, name: str, zero: list[int]) -> LanceStore:
+    """The REPORTED state, built on purpose. The same shape as test/embed.test.ts: 20
+    events, 3 commits of 4 (v1..v3), and the data files the given commits wrote truncated
+    to 0 bytes. A kill alone does not produce it (see LanceStore.vectorDamage() in
+    src/store/lance.ts), so this truncates exactly what those versions reference."""
+    s = mkstore(tmp_path, name, 20)
+    data = tmp_path / name / "vectors.lance" / "data"
+    files = lambda: set(os.listdir(data)) if data.exists() else set()   # noqa: E731
+    per_commit: list[set[str]] = []
+    put = s.put_vectors
+
+    def tracked(rows, dim):
+        had = files()
+        put(rows, dim)
+        per_commit.append(files() - had)
+
+    s.put_vectors = tracked
+    embed_shard(s, fake(8), batch=4, limit=12)
+    for c in zero:
+        for f in per_commit[c]:
+            os.truncate(data / f, 0)
+    return LanceStore.open(str(tmp_path / name))    # the damage is on disk, not in a handle
+
+
+def _version(tmp_path, name: str) -> int:
+    return lancedb.connect(str(tmp_path / name)).open_table("vectors").version
+
+
+def test_the_reported_state_counts_but_does_not_scan(tmp_path):
+    s = damaged(tmp_path, "d-state", [1, 2])
+    assert s.vector_stats()["rows"] == 12            # manifest-only reads look healthy
+    with pytest.raises(Exception, match=r"LanceError\(IO\)"):
+        s.embedded_uids()
+    assert s.counts()["events"] == 20
+
+
+def test_vector_damage_names_the_failing_version_and_the_newest_readable(tmp_path):
+    d = damaged(tmp_path, "d-diag", [1, 2]).vector_damage()
+    assert {k: d[k] for k in ("version", "rows", "restorable", "keep")} == \
+        {"version": 3, "rows": 12, "restorable": 1, "keep": 4}
+
+
+def test_a_table_that_reads_or_none_at_all_is_not_damage(tmp_path):
+    s = mkstore(tmp_path, "d-none", 4)
+    assert s.vector_damage() is None
+    embed_shard(s, fake(8))
+    assert s.vector_damage() is None
+
+
+def test_without_repair_the_shard_is_skipped_and_nothing_is_written(tmp_path):
+    s = damaged(tmp_path, "d-skip", [1, 2])
+    r = embed_shard(s, fake(8), batch=4)
+    assert r.skipped.startswith("vectors table unreadable at v3 — LanceError(IO)")
+    assert (r.damage["restorable"], r.damage["keep"], r.repaired, r.embedded) == (1, 4, "", 0)
+    assert _version(tmp_path, "d-skip") == 3
+
+
+def test_a_dry_run_never_repairs_even_with_repair(tmp_path):
+    s = damaged(tmp_path, "d-dry", [1, 2])
+    r = embed_shard(s, fake(8), batch=4, repair=True, dry_run=True)
+    assert "unreadable at v3" in r.skipped and r.repaired == ""
+    assert _version(tmp_path, "d-dry") == 3
+
+
+def test_repair_restores_the_newest_readable_version_and_re_embeds_the_rest(tmp_path):
+    s = damaged(tmp_path, "d-restore", [1, 2])
+    r = embed_shard(s, fake(8), batch=4, repair=True)
+    assert (r.repaired, r.already, r.embedded, r.skipped) == ("restored", 4, 16, "")
+    assert s.vector_damage() is None
+    assert len(s.embedded_uids()) == 20
+    assert s.counts()["events"] == 20
+    assert _version(tmp_path, "d-restore") > 3       # restore wrote on top; history kept
+
+
+def test_repair_drops_vectors_and_nothing_else_when_no_version_reads(tmp_path):
+    s = damaged(tmp_path, "d-drop", [0, 1, 2])
+    assert s.vector_damage()["restorable"] is None
+    r = embed_shard(s, fake(8), batch=4, repair=True)
+    assert (r.repaired, r.embedded) == ("dropped", 20)
+    assert s.counts()["events"] == 20
+
+
+def test_a_failure_outside_vectors_is_reraised_never_repaired(tmp_path):
+    s = mkstore(tmp_path, "d-other", 8)
+    embed_shard(s, fake(8), batch=4)
+    v = _version(tmp_path, "d-other")
+
+    def boom(**_):
+        raise RuntimeError("events went away")
+
+    s.unembedded = boom
+    with pytest.raises(RuntimeError, match="events went away"):
+        embed_shard(s, fake(8), repair=True)
+    assert _version(tmp_path, "d-other") == v
+
+
+def test_damage_note_says_what_typescript_says():
+    """Same lines as damageNote() in src/embed.ts; only the program name differs."""
+    from relicpy.embed import ShardEmbedStat, damage_note
+
+    st = ShardEmbedStat(key="hermes/_unresolved", bank="hermes", repo="_unresolved",
+                        eligible=1402, skipped="…",
+                        damage={"version": 3, "rows": 192, "error": "", "restorable": 1, "keep": 64})
+    note = damage_note(st, ["--data-root", "/tmp/scratch root", "--model", "nomic-embed-text"])
+    assert note[1] == ("  relic-py embed --repair --bank hermes --repo _unresolved "
+                       "--data-root '/tmp/scratch root' --model nomic-embed-text")
+    assert note[2] == "that restores v1 (64 of 192 vectors) and re-embeds the rest"
+    st.repaired = "restored"
+    assert damage_note(st, []) == \
+        ["repaired: restored v1 of `vectors`, keeping 64 of 192 rows; v3 did not read"]

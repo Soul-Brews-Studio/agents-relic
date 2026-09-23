@@ -98,6 +98,10 @@ export function helpText(): string {
   embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
                                [--session ID]  embed ONE session — the /forward + /new unit
+                               [--repair]  a shard whose \`vectors\` no longer reads is put back
+                               to its newest version that does (dropped if none does), then
+                               embedding carries on. Without it, that shard SKIPs and prints
+                               the exact command. Only \`vectors\` is ever touched.
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
