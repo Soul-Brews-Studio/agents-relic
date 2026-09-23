@@ -1,6 +1,6 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble } from "./types.js";
-export { isHostPreamble };
+import { isHostPreamble, stripChannelEnvelope } from "./types.js";
+export { isHostPreamble, stripChannelEnvelope };
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
@@ -964,7 +964,8 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   // handled below; Codex's three were not, and they account for 64% of its sessions.
   if (isHostPreamble(d)) return "(untitled)";
 
-  d = d.replace(/<local-command-caveat>[\s\S]*$/, "")
+  d = stripChannelEnvelope(d)
+       .replace(/<local-command-caveat>[\s\S]*$/, "")
        .replace(/^\s*Caveat: The messages below were generated[\s\S]*$/, "")
        // A pasted image carries a long tag the {1,40} scrubber below cannot reach, and
        // a message is often JUST the tag. Whatever the human typed after it is the name.

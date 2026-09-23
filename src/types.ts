@@ -167,6 +167,22 @@ const HOST_PREAMBLE = [
   /^<environment_context>/i,
 ];
 
+/**
+ * Strip the envelope a Claude Code channel plugin wraps around every human turn.
+ *
+ * Discord/Telegram/iMessage turns arrive as
+ * `<channel source="…" chat_id="…" message_id="…" user="…" ts="…">what they typed</channel>`
+ * — roughly 180 characters of attributes. That runs past the `{1,40}` tag scrubber in
+ * nameOf, so the tag survives into the name and a 70-char slice cuts it mid-attribute.
+ * It also eats the per-turn budget in `tail --handoff`, where the whole promise is that
+ * the human's words arrive intact.
+ *
+ * One definition because both callers want the same thing: what the human typed.
+ */
+export function stripChannelEnvelope(text: string): string {
+  return text.replace(/<\/?channel\b[^>]*>/gi, " ");
+}
+
 export function isHostPreamble(text: unknown): boolean {
   const t = String(text ?? "").trimStart();
   return HOST_PREAMBLE.some(rx => rx.test(t));

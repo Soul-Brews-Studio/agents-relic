@@ -1,6 +1,7 @@
 import { expect, test, describe } from "bun:test";
 import { dur, handoffStats } from "../src/time.js";
 import { handoffBudget, isHarnessTurn, isInboundTurn } from "../src/recap.js";
+import { stripChannelEnvelope } from "../src/types.js";
 
 /**
  * `relic tail --handoff` exists so the NEXT session is handed the pacing of this one
@@ -131,5 +132,44 @@ describe("isInboundTurn", () => {
   test("a real human turn is neither", () => {
     expect(isHarnessTurn("merge it")).toBe(false);
     expect(isInboundTurn("merge it")).toBe(false);
+  });
+});
+
+/**
+ * A channel plugin (Discord/Telegram/iMessage) wraps every human turn in an envelope
+ * of ids and a timestamp. `--handoff` promises the human's turns in full; left in, the
+ * envelope spends that budget on metadata the next session already has no use for.
+ */
+describe("channel envelope in a handoff turn", () => {
+  const ENVELOPE =
+    '<channel source="plugin:discord:discord" chat_id="1512079809021214730" ' +
+    'message_id="1552137023371083839" user="nazt_" user_id="691531480689541170" ' +
+    'ts="2026-09-23T01:58:23.683Z">\nfix the bug and submit a PR\n</channel>';
+
+  test("the request survives, the envelope does not", () => {
+    const t = stripChannelEnvelope(ENVELOPE).replace(/\s+/g, " ").trim();
+    expect(t).toBe("fix the bug and submit a PR");
+  });
+
+  test("it fits a budget the envelope alone would have exhausted", () => {
+    // handoffBudget gives a user turn the full allowance; 90 chars is smaller than
+    // the envelope's ~180, so before this the request never reached the block.
+    const cut = handoffBudget("user", 90);
+    const raw = ENVELOPE.replace(/\s+/g, " ").trim();
+    expect(raw.slice(0, cut)).not.toContain("fix the bug");
+
+    const cleaned = stripChannelEnvelope(ENVELOPE).replace(/\s+/g, " ").trim();
+    expect(cleaned.slice(0, cut)).toContain("fix the bug and submit a PR");
+  });
+
+  test("an unclosed envelope is still stripped — description truncates at 200 chars", () => {
+    const t = stripChannelEnvelope('<channel source="plugin:discord:discord" user="nazt_">\nready?')
+      .replace(/\s+/g, " ").trim();
+    expect(t).toBe("ready?");
+  });
+
+  test("a turn with no envelope is returned unchanged, Thai included", () => {
+    const plain = "ลองแล้ว — relic lineage ยังไม่มีในเครื่องผม";
+    expect(stripChannelEnvelope(plain)).toBe(plain);
   });
 });

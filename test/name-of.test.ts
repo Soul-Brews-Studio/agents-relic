@@ -83,6 +83,36 @@ describe("host preambles are not names", () => {
     expect(nameOf({ description: '<image name=[Image #1] path="/var/folders/41/x.png"> summarize the book' }))
       .toBe("summarize the book");
   });
+  test("a channel envelope is stripped and the human's words survive", () => {
+    // The Discord/Telegram/iMessage channel plugins wrap every turn. The attribute
+    // list is ~180 chars, so the {1,40} scrubber cannot reach it and slice(0,70)
+    // used to leave half an opening tag as the session name.
+    const envelope =
+      '<channel source="plugin:discord:discord" chat_id="1512079809021214730" ' +
+      'message_id="1540006806481535127" user="nazt_" user_id="691531480689541170" ' +
+      'ts="2026-08-20T14:37:14.608Z">\nyo\n</channel>';
+    expect(nameOf({ description: envelope })).toBe("yo");
+  });
+  test("a channel envelope never leaves a sliced tag as the name", () => {
+    const envelope =
+      '<channel source="plugin:discord:discord" chat_id="1512079809021214730" ' +
+      'message_id="1552132823442530395" user="nazt_" user_id="691531480689541170" ' +
+      'ts="2026-09-23T01:41:42.342Z">\ncan you check relic hand off\n</channel>';
+    const name = nameOf({ description: envelope });
+    expect(name).toBe("can you check relic hand off");
+    expect(name.startsWith("<")).toBe(false);
+  });
+  test("a channel turn in Thai keeps its Thai", () => {
+    const envelope =
+      '<channel source="plugin:discord:discord" chat_id="1512079809021214730" ' +
+      'user="nazt_" ts="2026-09-13T00:08:06.936Z">\nมีสอน 9:00 am\n</channel>';
+    expect(nameOf({ description: envelope })).toBe("มีสอน 9:00 am");
+  });
+  test("an unclosed channel envelope still yields the message", () => {
+    // description is truncated at 200 chars, so the closing tag is often absent.
+    expect(nameOf({ description: '<channel source="plugin:discord:discord" user="nazt_">\nready?' }))
+      .toBe("ready?");
+  });
   test("real messages are untouched, Thai included", () => {
     expect(nameOf({ description: "no i just you read thor memory /mcp" }))
       .toBe("no i just you read thor memory /mcp");

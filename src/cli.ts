@@ -14,6 +14,7 @@ import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
+import { stripChannelEnvelope } from "./types.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
 import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
@@ -875,7 +876,10 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
   console.log("");
 
   for (const e of tail) {
-    const t = e.text.replace(/\s+/g, " ").trim();
+    // A channel-plugin turn opens with ~180 chars of envelope. Left in, it eats the
+    // per-turn budget below and the handoff carries ids and timestamps instead of the
+    // request they wrapped — the one thing this block exists to preserve.
+    const t = stripChannelEnvelope(e.text).replace(/\s+/g, " ").trim();
     if (!t) continue;
     const cut = handoffBudget(e.role, chars);
     const body = t.length > cut ? t.slice(0, cut) + " …" : t;
