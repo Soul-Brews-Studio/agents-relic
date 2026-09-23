@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 
 from .models import Scope
+from .progress import Progress
 from .query import group_by_bank, index_status, search_events
 from .repo import banks as list_bank_names
 from .repo import default_root
@@ -71,14 +72,13 @@ def cmd_embed(a: argparse.Namespace) -> int:
 
     main_tiers = not a.all_tiers
     last = [0]
-    drew = [False]
+    bar = Progress()
 
     def progress(key: str, done: int, total: int) -> None:
         if _fmt(a) != "pretty" or done - last[0] < 200:
             return
         last[0] = done
-        drew[0] = True
-        sys.stderr.write(f"\r  {key}  {done:,}/{total:,}   ")
+        bar.tick(f"  {key}  {done:,}/{total:,}   ", done / max(1, total) * 100)
 
     try:
         t = embed_shards(_scope(a), provider=a.provider, model=a.model, host=a.host,
@@ -91,11 +91,7 @@ def cmd_embed(a: argparse.Namespace) -> int:
         # traceback: the message already says what to run instead.
         print(str(e), file=sys.stderr)
         return 2
-    # Only erase a line that was actually drawn — clearing unconditionally writes 78
-    # spaces into a terminal that never showed progress, which lands as indentation in
-    # front of the first line of output.
-    if drew[0]:
-        sys.stderr.write("\r" + " " * 78 + "\r")
+    bar.clear()
 
     if _json(a):
         print(json.dumps({"provider": t.provider_id, "dryRun": t.dry_run,
