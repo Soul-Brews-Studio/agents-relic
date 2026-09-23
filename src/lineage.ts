@@ -1,7 +1,7 @@
 import { openSync, readSync, closeSync, statSync, readdirSync, existsSync, createReadStream } from "node:fs";
 import { join, dirname } from "node:path";
 import { createInterface } from "node:readline";
-import { loadSources } from "./sources.js";
+import { loadSources, transcriptRoots } from "./sources.js";
 import { encodeProjectDir, treeFiles } from "./live.js";
 import { dur, zoneOffset } from "./time.js";
 
@@ -243,7 +243,8 @@ export function inferLinks(nodes: LineageNode[], w = WINDOWS): Link[] {
 function claudeRoots(): string[] {
   const seen = new Set<string>();
   for (const s of loadSources())
-    if (s.walk === "claude-tiers" && s.enabled && existsSync(s.path)) seen.add(s.path);
+    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && s.enabled)
+      for (const root of transcriptRoots(s)) if (existsSync(root)) seen.add(root);
   return [...seen];
 }
 
