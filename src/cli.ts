@@ -17,7 +17,8 @@ import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
-import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
+import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
+import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 
@@ -1439,26 +1440,41 @@ async function cmdNow(f: Record<string, string | boolean>) {
 
 async function cmdLineage(arg: string | undefined, f: Record<string, string | boolean>) {
   const cur = await currentSession();
-  let target: { id: string; projectDir: string };
+  const all = Boolean(f.all);
+  let l: Lineage;
   if (arg) {
     const hits = findSessions(arg);
-    if (!hits.length) { console.error(`no Claude Code transcript matches ${arg}`); process.exit(1); }
     if (hits.length > 1) {
       console.error(`${arg} matches ${hits.length} sessions — give more of the id:`);
       for (const h of hits.slice(0, 10)) console.error(`  ${h.id}  ${h.projectDir}`);
       process.exit(1);
     }
-    target = hits[0];
+    if (hits.length === 1) l = await buildLineage(hits[0].projectDir, hits[0].id, { all });
+    else {
+      // Not a Claude transcript: a Hermes id links from state.db rows instead (#74).
+      const hermes = findHermesSessions(arg);
+      if (hermes.length > 1) {
+        console.error(`${arg} matches ${hermes.length} Hermes sessions — give more of the id:`);
+        for (const h of hermes.slice(0, 10)) console.error(`  ${h.id}  ${h.db}`);
+        process.exit(1);
+      }
+      if (!hermes.length) {
+        console.error(`no Claude Code transcript or Hermes session matches ${arg}`);
+        for (const r of disabledHermesRoots())
+          console.error(`  (${r} holds Hermes data, but its source is disabled — enable "hermes" in ~/.relic/sources.json)`);
+        process.exit(1);
+      }
+      l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
+    }
   } else {
     if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
     if (!isClaudeProjectDir(cur.projectDir)) {
       console.error(`lineage reads Claude Code transcripts; this session is under ${cur.projectDir}`);
       process.exit(1);
     }
-    target = { id: cur.sessionUuid, projectDir: cur.projectDir };
+    l = await buildLineage(cur.projectDir, cur.sessionUuid, { all });
   }
 
-  const l = await buildLineage(target.projectDir, target.id, { all: Boolean(f.all) });
   const mode = outFmt(f);
   if (mode === "json") { console.log(JSON.stringify(lineageJSON(l), null, 2)); return; }
   if (mode === "plain" || mode === "jsonl") {
