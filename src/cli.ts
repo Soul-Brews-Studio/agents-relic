@@ -556,7 +556,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.error(`    Suppress this warning: --no-warn`);
   }
 
-  const top = hits.slice(0, limit);
+  // `--limit 0` (and negative) means "all", the same idiom recap teaches — so show every
+  // hit the store returned rather than slicing to nothing. The store already unbounded the
+  // query for limit <= 0 (#94); this keeps the CLI's own slice/count in agreement.
+  const top = limit > 0 ? hits.slice(0, limit) : hits;
   const mode = outFmt(f);
 
   if (mode === "json") {
@@ -593,9 +596,9 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   const byKey = new Map(pickShards(scope).map(sh => [sh.key, sh.dir]));
   const fresh = await answerFreshness(
-    [...new Set(hits.slice(0, limit).map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
+    [...new Set(top.map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
   const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
-  console.log(`${Math.min(hits.length, limit)} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+  console.log(`${top.length} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
     (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
   if (lossy) console.log(`  ${lossy}`);
   // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
@@ -608,7 +611,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.log(`     relic index${scoped ? ` ${scoped}` : ""}   ·   relic status  names which bank is behind`);
   }
   console.log("");
-  for (const h of hits.slice(0, limit)) {
+  for (const h of top) {
     const i = h.text.toLowerCase().indexOf(q.toLowerCase());
     const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
     const wt = h.worktree ? `  [${h.worktree}]` : "";

@@ -357,7 +357,13 @@ export class LanceStore {
   async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
-    const limit = opts.limit ?? 20;
+    // `--limit 0` means "all" — recap teaches that idiom in its own footer, and honours it
+    // (recap.ts: `limit > 0 ? slice : all`). A LanceDB fts/vector search compiles to a
+    // datafusion topk that asserts `k > 0`, so a bare `.limit(0)` panics the worker instead
+    // of returning everything. Resolve 0/negative to the table's row count — a safe upper
+    // bound once the filters run — so `k` is always positive and the two verbs agree. Fixes #94.
+    let limit = opts.limit ?? 20;
+    if (limit <= 0) limit = Math.max(await t.countRows(), 1);
     const filters: string[] = [];
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
     /*
