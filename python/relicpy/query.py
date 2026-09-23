@@ -19,7 +19,7 @@ from .models import (BankGroup, Hit, PendingFile, PendingGroup, PendingReport,
 from .repo import default_root, list_shards, repo_key_of, resolve_repo_key
 from .store import LanceStore
 from .types import block_role, flatten_content
-from .types import is_host_preamble
+from .types import is_host_preamble, strip_envelope
 
 T = TypeVar("T")
 
@@ -255,6 +255,11 @@ def name_of(row: dict) -> str:
     # boilerplate as the session's name.
     # A host's own boot directive is not a name. Claude's two shapes were already
     # handled below; Codex's three were not, and they are 64% of its sessions.
+    if is_host_preamble(d):
+        return "(untitled)"
+
+    # Rows indexed before import stripped envelopes still carry them, cut at 200 chars.
+    d = strip_envelope(re.sub(r"\.\.\.\[\+\d+\]$", "", d))
     if is_host_preamble(d):
         return "(untitled)"
 
