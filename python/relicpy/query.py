@@ -177,6 +177,11 @@ def search_events(query: str, s: Scope, limit: int = 20,
     """
     shards = pick_shards(s)
     t0 = time.time()
+    # One past the limit (#95): limit+1 rows back means the shard holds more than was
+    # fetched, so the total is a floor — see searchEvents. Clamped at the u32 the native
+    # side takes: past it the binding raises OverflowError, and the catch in one() would
+    # turn that into a shard with no hits.
+    per_shard = min(limit + 1, 0xFFFF_FFFF) if limit > 0 else limit
 
     faceting = bool(via or chat or from_user)
 
@@ -203,7 +208,7 @@ def search_events(query: str, s: Scope, limit: int = 20,
             where = None if all_tiers else st.main_tiers_filter()
             if facet:
                 where = facet if where is None else f"({where}) AND {facet}"
-            rows = st.search(query, limit=limit, where=where)
+            rows = st.search(query, limit=per_shard, where=where)
         except Exception:
             return [], stale
         for r in rows:
@@ -213,9 +218,12 @@ def search_events(query: str, s: Scope, limit: int = 20,
 
     hits: list[dict] = []
     unfaceted = unfaceted_turns = 0
+    capped = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         for rows, stale in pool.map(one, shards):
             hits.extend(rows)
+            if limit > 0 and len(rows) > limit:
+                capped += 1
             if stale:
                 unfaceted += 1
                 unfaceted_turns += stale
@@ -224,11 +232,24 @@ def search_events(query: str, s: Scope, limit: int = 20,
     hits = dedupe_hits(hits)
     total = len(hits)
     out = {"hits": [_to_hit(h) for h in hits[:limit]],
-           "shards": len(shards), "total": total,
+           "shards": len(shards), "total": total, "capped": capped,
            "ms": int((time.time() - t0) * 1000)}
     if faceting:
         out.update(unfaceted=unfaceted, unfaceted_turns=unfaceted_turns)
     return out
+
+
+def match_count(shown: int, total: int, capped: int = 0) -> str:
+    """ "N of M", where M is called a count only when it is one — mirrors matchCount (#95)."""
+    return f"{shown} of at least {total}" if capped else f"{shown} of {total}"
+
+
+def floor_note(capped: int, searched: int, limit: int) -> Optional[str]:
+    """The line under a header whose total is a floor — mirrors floorNote."""
+    if not capped:
+        return None
+    return (f"a floor, not a count — {capped} of {searched} shards hold more than {limit} "
+            f"match{'' if limit == 1 else 'es'} and were not read to the end")
 
 
 def _to_hit(h: dict) -> Hit:

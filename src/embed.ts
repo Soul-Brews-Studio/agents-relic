@@ -1,5 +1,6 @@
 import { LanceStore, type VectorRow, type VectorDamage } from "./store/lance.js";
 import { pickShards, type Scope } from "./query.js";
+import { checkEmbedModel, type EmbedCheck } from "./langs.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -243,6 +244,10 @@ export interface EmbedOpts extends Scope {
   dryRun?: boolean;
   session?: string;       // embed ONE session — the /forward + /new unit
   reset?: boolean;        // drop `vectors` first — the only way to change model/dim
+  force?: boolean;        // embed with an English-only model on a scope that is not — see checkEmbedModel
+  scopeArgs?: string[];   // the flags that set this scope, echoed into the commands the check prints
+  onCheck?: (c: EmbedCheck) => void;   // once, after the language check and before any provider call
+  onCheckProgress?: (done: number, total: number, key: string) => void;   // per shard the check samples
   repair?: boolean;       // restore (or, failing that, drop) a `vectors` table that no longer reads — #105
   onProgress?: (p: { shard: string; done: number; pending: number }) => void;
 }
@@ -304,6 +309,8 @@ export interface EmbedTally {
   shards: ShardEmbedStat[];
   embedded: number; failed: number; pending: number;
   ms: number; dryRun: boolean; providerId: string;
+  check: EmbedCheck;      // the scope's languages against the model, measured before anything else
+  refused: boolean;       // the check stopped this run before the embed pass: no provider called
 }
 
 // -------------------------------------------------------------------- the driver
@@ -399,10 +406,23 @@ export async function embedShard(store: LanceStore, p: EmbedProvider, o: EmbedOp
   return { eligible, already, pending: todo.length, embedded, failed, dim };
 }
 
-export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
+/** `p` comes from the flags unless a caller hands one in, which is how the tests run offline. */
+export async function embedShards(
+  o: EmbedOpts = {},
+  p: EmbedProvider = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device),
+): Promise<EmbedTally> {
   const t0 = Date.now();
-  const p = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device);
-  const shards = pickShards(o);
+  // The scope's languages against the model, BEFORE any provider call: the population is
+  // the one embedShard reads below, sampled 1 in 64 by uid.
+  const check = await checkEmbedModel(p.id, {
+    dataRoot: o.dataRoot, inRepo: o.inRepo, repo: o.repo, bank: o.bank, session: o.session,
+    mainTiers: o.mainTiers !== false, minChars: o.minChars ?? 24, maxChars: o.maxChars ?? 2000,
+    scopeArgs: o.scopeArgs, force: o.force, onProgress: o.onCheckProgress,
+  });
+  o.onCheck?.(check);
+  // A dry run reports the refusal and still counts: it writes nothing and calls no provider.
+  const refused = check.action === "refuse" && !o.dryRun;
+  const shards = refused ? [] : pickShards(o);
   const out: ShardEmbedStat[] = [];
   let embedded = 0, failed = 0, pending = 0;
 
@@ -424,5 +444,5 @@ export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
   // model is 500 MB of RSS that never comes back.
   p.close?.();
   return { shards: out, embedded, failed, pending, ms: Date.now() - t0,
-           dryRun: Boolean(o.dryRun), providerId: p.id };
+           dryRun: Boolean(o.dryRun), providerId: p.id, check, refused };
 }

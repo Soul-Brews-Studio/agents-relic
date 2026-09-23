@@ -180,9 +180,9 @@ def _scope(a: dict) -> Scope:
 
 
 def run(name: str, a: dict) -> str:
-    from .query import (dedupe_hits, group_by_bank, index_status, list_sessions,
-                        max_iso, memory_report, name_of, pending_report, pick_shards,
-                        read_around, resolve_session, search_events, stats_of)
+    from .query import (dedupe_hits, floor_note, group_by_bank, index_status, list_sessions,
+                        match_count, max_iso, memory_report, name_of, pending_report,
+                        pick_shards, read_around, resolve_session, search_events, stats_of)
     from .time import local_date_time, local_time
     scope = _scope(a)
 
@@ -220,7 +220,8 @@ def run(name: str, a: dict) -> str:
             facets = {k: _facet_arg(k, a.get(k)) for k in ("via", "chat", "from_user")}
         except ValueError as e:
             return f"relic_search: {e}"
-        res = search_events(q, scope, limit=int(a.get("limit") or 20),
+        limit = int(a.get("limit") or 20)
+        res = search_events(q, scope, limit=limit,
                             all_tiers=bool(a.get("all_tiers")), **facets)
         note = (f'{res["unfaceted_turns"]} channel turns in {res["unfaceted"]} of {res["shards"]} shards '
                 f'predate channel facets and cannot match via/chat/from_user until '
@@ -229,8 +230,11 @@ def run(name: str, a: dict) -> str:
             return f'no matches for "{q}" across {res["shards"]} shards ({res["ms"]} ms)' + (f"\n{note}" if note else "")
         narrowed = "" if a.get("all_tiers") else \
             "  ·  main sessions only — pass all_tiers:true for subagent/workflow work"
-        L = [f'{len(res["hits"])} of {res["total"]} matches · {res["shards"]} shards · '
-             f'{res["ms"]} ms{narrowed}', *([note] if note else []), ""]
+        floor = floor_note(res["capped"], res["shards"], limit)
+        L = [f'{match_count(len(res["hits"]), res["total"], res["capped"])} matches · '
+             f'{res["shards"]} shards · {res["ms"]} ms{narrowed}',
+             *([f"{floor}. Pass repo or a higher limit for an exact count."] if floor else []),
+             *([note] if note else []), ""]
         for h in res["hits"]:
             L.append(f"{h.repo}{' [' + h.worktree + ']' if h.worktree else ''} · "
                      f"{h.source}/{h.tier} · {h.role} · {h.ts}")

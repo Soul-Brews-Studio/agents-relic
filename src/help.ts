@@ -113,8 +113,16 @@ export function helpText(): string {
                                --paths adds the full session id and absolute path.
                                --tree groups them by directory — which RUN is missing.
   embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
-                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
+                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--max-chars 2000]
+                               [--dry-run] [--reset] [--force] [--repair]
                                [--session ID]  embed ONE session — the /forward + /new unit
+                               --model all-minilm, the default, is ENGLISH-ONLY: all-MiniLM
+                               scored 0.006 on Thai paraphrase (bench/). For Thai: --model
+                               bge-m3, or --provider st --model intfloat/multilingual-e5-small.
+                               Before any provider call, embed samples the scope's languages
+                               as langs does, and REFUSES an English-only model when 1% or
+                               more of the events carry Thai, or another non-Latin script.
+                               --force embeds anyway; --dry-run shows the same check.
                                [--repair]  a shard whose \`vectors\` no longer reads is put back
                                to its newest version that does (dropped if none does), then
                                embedding carries on. Without it, that shard SKIPs and prints

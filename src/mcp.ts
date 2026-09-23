@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
   statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote, roomTag, channelHead,
-  facetArg,
+  facetArg, matchCount, floorNote,
 } from "./query.js";
 import { parseChannelEnvelope } from "./types.js";
 import { renderChain } from "./chain.js";
@@ -392,7 +392,7 @@ async function run(name: string, a: any): Promise<string> {
     try {
       facets = { via: facetArg("via", a.via), chat: facetArg("chat", a.chat), fromUser: facetArg("from_user", a.from_user) };
     } catch (e) { return `relic_search: ${(e as Error).message}`; }
-    const { hits, shards, ms, total, degraded, unfaceted, unfacetedTurns } = await searchEvents(q, {
+    const { hits, shards, ms, total, capped, degraded, unfaceted, unfacetedTurns } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
       ...facets,
@@ -414,10 +414,16 @@ async function run(name: string, a: any): Promise<string> {
     const notes = [lossy, unfacetedNote].filter(Boolean);
     if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + notes.map(n => `\n${n}`).join("");
     const narrowed = !a.all_tiers && !a.tier;
-    const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
+    // Sliced the way the CLI slices since #107, so limit:0 lists every hit here too
+    // rather than "0 of N". A model divides, compares and reports M, so it says when
+    // M is a floor.
+    const top = limit > 0 ? hits.slice(0, limit) : hits;
+    const floor = floorNote(capped, shards, limit);
+    const L = [`${matchCount(top.length, total, capped)} matches · ${shards} shards · ${ms} ms` +
       (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""),
+      ...(floor ? [`${floor}. limit:0 reads every match — pass repo with it.`] : []),
       ...notes, ""];
-    for (const h of hits.slice(0, limit)) {
+    for (const h of top) {
       const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
       const text = c ? c.body : h.text;
       const i = text.toLowerCase().indexOf(q.toLowerCase());

@@ -43,6 +43,13 @@ describe("the help text parses and is whole", () => {
     });
   });
 
+  test("embed marks its default model English-only where the model is chosen (#101)", () => {
+    const embed = helpText().split("\n  langs")[0].split("\n  embed")[1];
+    expect(embed).toContain("--model all-minilm, the default, is ENGLISH-ONLY");
+    expect(embed).toContain("--force");
+    expect(embed).toContain("--max-chars 2000");
+  });
+
   test("it names the index root, so the interpolation still runs", () => {
     // helpText() calls defaultRoot(). A literal that lost its ${} would still parse.
     expect(helpText()).toContain("/banks/<bank>/github.com/<org>/<repo>/");

@@ -394,6 +394,30 @@ class LanceStore:
         return sum(1 for r in q.limit(0).to_list()
                    if len(str(r.get("text") or "")) >= min_chars)
 
+    def lang_rows(self, where: str = "", main_tiers: bool = True, min_chars: int = 24,
+                  max_chars: int = 2000) -> list[dict]:
+        """The embeddable population as (role, text) — what embed's language check reads.
+
+        SAME eligibility as embeddable_count and unembedded, so the mix describes exactly
+        the text a model would be fed: the length is judged on the full text, and only the
+        first `max_chars` is kept. `where` narrows it further — a uid range, which is a
+        uniform sample because a uid is a sha1.
+        """
+        t = self._existing("events")
+        if t is None:
+            return []
+        filters = [f for f in (where, self.main_tiers_filter() if main_tiers else "") if f]
+        q = t.search().select(["role", "text"])
+        if filters:
+            q = q.where(" AND ".join(filters))
+        out: list[dict] = []
+        for r in q.limit(0).to_list():
+            text = str(r.get("text") or "")
+            if len(text) >= min_chars:
+                out.append({"role": str(r.get("role") or ""),
+                            "text": text[:max_chars] if max_chars else text})
+        return out
+
     # ---------------------------------------------------------------- write side
 
     def put_events(self, rows: Iterable[EventRow]) -> None:
