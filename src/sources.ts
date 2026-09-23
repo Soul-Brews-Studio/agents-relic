@@ -12,6 +12,7 @@ import { parseOmp } from "./shapes/omp.js";
 import { parseVault } from "./shapes/vault.js";
 import { parseHermes } from "./shapes/hermes.js";
 import { parseMemory } from "./shapes/memory.js";
+import { dirUnreadable } from "./unreadable.js";
 import type { Parser } from "./types.js";
 
 const HOME = homedir();
@@ -96,7 +97,7 @@ export function bankOf(s: SourceDef): string { return s.bank || s.key; }
 export function homeProjectRoots(home: string): string[] {
   let names: string[];
   try { names = readdirSync(home, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); }
-  catch { return []; }
+  catch (e) { dirUnreadable(home, e); return []; }   // a declared home that cannot be read must say so (#99)
   return names.filter(d => d === "projects" || d.startsWith("projects-"))
     .sort((a, b) => (a === "projects" ? -1 : b === "projects" ? 1 : a.localeCompare(b)))
     .map(d => join(home, d));
@@ -287,6 +288,22 @@ export const KNOWN_NON_JSONL = [
   { key: "hermes-kanban", path: join(HOME, ".hermes", "kanban.db"), note: "Hermes kanban board — not conversation, unread" },
 ];
 
+const configWarned = new Set<string>();
+
+/**
+ * One stderr line per distinct config error per process. loadSources() runs many times
+ * in one command, and the same typo reported five times is noise.
+ */
+function configError(cfgPath: string, section: string, e: unknown): void {
+  const msg = e instanceof Error ? e.message : String(e);
+  const line = section
+    ? `relic: ${cfgPath}: bad "${section}" entry (${msg}) — config only partly applied, from that entry on it is ignored`
+    : `relic: ${cfgPath}: ${msg} — file ignored, using the built-in sources only`;
+  if (configWarned.has(line)) return;
+  configWarned.add(line);
+  process.stderr.write(line + "\n");
+}
+
 /**
  * User config, so adding a source needs no code change:
  *
@@ -298,12 +315,16 @@ export function loadSources(): SourceDef[] {
   const out = BUILTIN.map(s => ({ ...s }));
   const cfgPath = join(HOME, ".relic", "sources.json");
   if (!existsSync(cfgPath)) return out;
+  let section = "";       // which list was being applied when an entry threw; "" = still reading
   try {
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+    section = "disable";
     for (const k of cfg.disable ?? []) { const s = out.find(x => x.key === k); if (s) s.enabled = false; }
+    section = "enable";
     for (const k of cfg.enable ?? []) { const s = out.find(x => x.key === k); if (s) s.enabled = true; }
     // Let config point a builtin at a real path — the vault's location is per-machine,
     // so its builtin entry ships with a placeholder and MUST be repointed here.
+    section = "path";
     for (const [k, v] of Object.entries(cfg.path ?? {})) {
       const s = out.find(x => x.key === k);
       if (s && typeof v === "string") { s.path = v; s.enabled = true; }
@@ -312,6 +333,7 @@ export function loadSources(): SourceDef[] {
      * Homes expand BEFORE `add`, so an explicit `add` entry can still override one by
      * key — the dup guard keeps the first match, and hand-written beats derived.
      */
+    section = "homes";
     for (const h of cfg.homes ?? []) {
       const key = String(h.key ?? "");
       const path = expandHome(String(h.path ?? ""));
@@ -333,6 +355,7 @@ export function loadSources(): SourceDef[] {
                  parser: parseMemory, enabled: h.enabled !== false, bank: `${key}-memory`,
                  note: `declared Claude home ${path} — typed memory facts` });
     }
+    section = "add";
     for (const a of cfg.add ?? []) {
       out.push({
         key: String(a.key), path: String(a.path),
@@ -353,7 +376,11 @@ export function loadSources(): SourceDef[] {
         bank: a.bank ? String(a.bank) : undefined,
       });
     }
-  } catch { /* a broken config must not stop an index run */ }
+  } catch (e) {
+    // A broken config must not stop an index run — and must not pass for no config
+    // either (#99). Whatever was applied before the throw stays applied, as it always did.
+    configError(cfgPath, section, e);
+  }
 
   /*
    * A DUPLICATE SOURCE IS A DOUBLED BANK, and nothing downstream would say so.

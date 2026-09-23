@@ -102,19 +102,38 @@ _SHAPES: dict[str, Parser] = {
 }
 
 
+_config_warned: set[str] = set()
+
+
+def _config_error(cfg_path: str, section: str, e: BaseException) -> None:
+    """One stderr line per distinct config error per process. load_sources() runs many
+    times in one command, and the same typo reported five times is noise."""
+    msg = f"{type(e).__name__}: {e}"
+    line = (f'relic: {cfg_path}: bad "{section}" entry ({msg}) — config only partly '
+            f"applied, from that entry on it is ignored" if section else
+            f"relic: {cfg_path}: {msg} — file ignored, using the built-in sources only")
+    if line in _config_warned:
+        return
+    _config_warned.add(line)
+    print(line, file=sys.stderr)
+
+
 def load_sources() -> list[SourceDef]:
     """Builtins, overlaid with ~/.relic/sources.json — the SAME file the TypeScript
     reads, so both front ends agree about what exists."""
     out = list(_builtin())
     cfg_path = os.path.join(HOME, ".relic", "sources.json")
     if os.path.exists(cfg_path):
+        section = ""          # which list was being applied when an entry threw; "" = still reading
         try:
             with open(cfg_path, encoding="utf-8") as fh:
                 cfg = json.load(fh)
+            section = "disable"
             for k in cfg.get("disable", []):
                 for s in out:
                     if s.key == k:
                         s.enabled = False
+            section = "enable"
             for k in cfg.get("enable", []):
                 for s in out:
                     if s.key == k:
@@ -122,6 +141,7 @@ def load_sources() -> list[SourceDef]:
             # Let config point a builtin at a real path — the vault's location is
             # per-machine, so its builtin ships with a placeholder and MUST be
             # repointed here. Setting a path also enables the source.
+            section = "path"
             for k, v in (cfg.get("path") or {}).items():
                 for s in out:
                     if s.key == k and isinstance(v, str):
@@ -131,6 +151,7 @@ def load_sources() -> list[SourceDef]:
             # override one by key — the dup guard keeps the first match, and
             # hand-written beats derived. See HomeDef in src/sources.ts for why a
             # home is the right thing for a BANK to be.
+            section = "homes"
             for h in cfg.get("homes", []):
                 key = str(h.get("key") or "")
                 path = str(h.get("path") or "")
@@ -157,6 +178,7 @@ def load_sources() -> list[SourceDef]:
                     walk="memory", parser=_SHAPES["memory"], enabled=enabled,
                     bank=f"{key}-memory",
                     note=f"declared Claude home {path} — typed memory facts"))
+            section = "add"
             for a in cfg.get("add", []):
                 walk = a.get("walk")
                 walk = walk if walk in ("claude-tiers", "vault", "vaults", "omp", "memory", "hermes") else "flat"
@@ -172,8 +194,10 @@ def load_sources() -> list[SourceDef]:
                     note=str(a.get("note", "user-configured")),
                     bank=str(a["bank"]) if a.get("bank") else None,
                 ))
-        except Exception:
-            pass          # a broken config must not stop an index run
+        except Exception as e:
+            # A broken config must not stop an index run — and must not pass for no
+            # config either (#99). Whatever was applied before the throw stays applied.
+            _config_error(cfg_path, section, e)
 
     # A DUPLICATE SOURCE IS A DOUBLED BANK, and nothing downstream would say so.
     seen_keys: set[str] = set()
