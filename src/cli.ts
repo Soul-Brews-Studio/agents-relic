@@ -141,6 +141,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
+  if (tally.repaired) console.log(`  repaired:    ${fmt(tally.repaired)} files re-keyed — same-named transcripts had overwritten each other's events (#58)`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--keep-noise to disable) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
