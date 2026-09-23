@@ -99,6 +99,13 @@ export function helpText(): string {
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
+  langs   [--sample 64] [--repo S] [--bank B] [--all-tiers] [--min-chars 24] [--max-chars 2000] [--json]
+                               which languages the embeddable corpus is written in, and
+                               which measured model fits it: th / th+en / en / latin /
+                               other scripts, share of events and chars, Thai by role,
+                               vectors already on disk. Same population as embed.
+                               1 in 64 events by default, picked by uid (a sha1, so the
+                               sample is uniform and repeatable); --sample 1 reads all.
   recap   [id|prefix] [--limit 20] [--all-tiers] [--chars 140] [--json]
                                NO ID = the session before this one, same as tail.
                                Shows the LAST 20 asked turns; --limit 0 for all. The

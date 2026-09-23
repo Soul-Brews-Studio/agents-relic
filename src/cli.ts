@@ -39,6 +39,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
@@ -1133,6 +1134,46 @@ async function cmdReport(f: Record<string, string | boolean>) {
 }
 
 // ---- status ----------------------------------------------------------------
+/**
+ * `relic langs` — the language mix of the embeddable corpus, and which measured model
+ * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
+ */
+async function cmdLangs(f: Record<string, string | boolean>) {
+  const sample = f.sample === undefined ? 64 : typeof f.sample === "string" ? Number(f.sample) : NaN;
+  if (!Number.isInteger(sample) || sample < 1) {
+    console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
+    process.exit(1);
+  }
+  // Every flag that narrowed the measurement rides into the printed embed command, so
+  // "continue with" acts on the scope that was measured — never silently on the whole index.
+  const scopeArgs: string[] = [];
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+    if (typeof f[k] === "string") scopeArgs.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) scopeArgs.push(`--${k}`);
+  const bar = progress();
+  const r = await scanLangs({
+    scopeArgs,
+    dataRoot: (f["data-root"] as string) ?? null,
+    inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined,
+    bank: f.bank ? String(f.bank) : undefined,
+    sample,
+    // Same flags, same meaning as embed: the population measured is the one embedded.
+    mainTiers: !f["all-tiers"],
+    minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
+    maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
+    onProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty") bar.tick(`  ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total);
+    },
+  });
+  bar.clear();
+  const rec = recommend(r);
+  if (outFmt(f) === "json") { console.log(JSON.stringify({ ...r, recommendation: rec }, null, 2)); return; }
+  if (outFmt(f) === "jsonl") { console.log(JSON.stringify({ ...r, recommendation: rec })); return; }
+  if (!r.shards) { console.log("no shards match — check --repo / --bank, or run relic index first"); return; }
+  console.log(renderLangs(r, rec));
+}
+
 /*
  * EMBED — a second pass over an index that is already complete.
  *
@@ -1885,5 +1926,6 @@ else if (cmd === "serve") {
 }
 else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
+else if (cmd === "langs") await cmdLangs(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }

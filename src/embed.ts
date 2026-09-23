@@ -28,25 +28,53 @@ export interface EmbedProvider {
 
 export const DEFAULT_OLLAMA = "http://localhost:11434";
 
+export interface MeasuredModel {
+  provider: "ollama" | "st";
+  model: string;            // exactly what --model takes
+  dim: number;
+  multilingual: boolean;    // marked "multi" when measured — unmarked is NOT a claim of Thai support
+  enTh?: number;            // cos(en, th-translation), the smoke test below
+  knownItem?: { all: number; th: number };   // MRR@20, bench/README.md
+  paraphrase?: { all: number; th: number };  // MRR@20, bench/README.md
+}
+
+/**
+ * Every model measured on THIS corpus, and the numbers — kept as data in one place so
+ * `relic langs` recommends from the same figures the comments here argue from.
+ *
+ * `enTh`: Ollama models measured locally 2026-09-18, dim read off the live response.
+ * One English string against its Thai translation — a SMOKE TEST, not a benchmark. It
+ * says whether a model places the two languages in one space at all, and nothing about
+ * ranking quality.
+ *
+ * `knownItem` / `paraphrase`: bench/ (3,000 docs, 400 with Thai, 200 queries each). The
+ * ranking numbers, but only for the three sentence-transformers models. FTS scored
+ * 0.890 (Thai 0.768) on known-item there, above every model below.
+ */
+export const MEASURED_MODELS: MeasuredModel[] = [
+  { provider: "ollama", model: "all-minilm", dim: 384, multilingual: false, enTh: 0.187 },
+  { provider: "ollama", model: "nomic-embed-text", dim: 768, multilingual: false, enTh: 0.467 },
+  { provider: "ollama", model: "mxbai-embed-large", dim: 1024, multilingual: false, enTh: 0.479 },
+  { provider: "ollama", model: "qwen3-embedding:0.6b", dim: 1024, multilingual: true, enTh: 0.572 },
+  { provider: "ollama", model: "bge-m3", dim: 1024, multilingual: true, enTh: 0.626 },
+  { provider: "st", model: "intfloat/multilingual-e5-small", dim: 384, multilingual: true,
+    knownItem: { all: 0.600, th: 0.308 }, paraphrase: { all: 0.140, th: 0.214 } },
+  { provider: "st", model: "sentence-transformers/all-MiniLM-L6-v2", dim: 384, multilingual: false,
+    knownItem: { all: 0.503, th: 0.209 }, paraphrase: { all: 0.119, th: 0.006 } },
+  { provider: "st", model: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", dim: 384, multilingual: true,
+    knownItem: { all: 0.430, th: 0.203 }, paraphrase: { all: 0.081, th: 0.078 } },
+];
+
 /**
  * Ollama over HTTP. Chosen as the default because it needs NOTHING added to this
  * repo — no Python, no torch, no model download step inside the tool — and because
  * both the TypeScript and the Python implementation can speak it identically, which
  * keeps `relic embed` and `relic-py embed` the same command rather than two.
  *
- * Models measured locally, 2026-09-18, dim read off the live response:
- *
- *   all-minilm             384   en only   — cos(en, th-translation) +0.187
- *   nomic-embed-text       768             — +0.467
- *   mxbai-embed-large     1024             — +0.479
- *   qwen3-embedding:0.6b  1024   multi     — +0.572
- *   bge-m3                1024   multi     — +0.626
- *
- * That cosine is a SMOKE TEST, not a benchmark: one English string against its Thai
- * translation, which says whether a model places the two languages in one space at
- * all. It says nothing about ranking quality. `all-minilm` at +0.187 is the honest
- * shape of "English-only" — pick it for 384 dims on an English corpus, not for this
- * one, which is en+th.
+ * The models measured for it, with their cos(en, th-translation), are MEASURED_MODELS
+ * above. `all-minilm` at +0.187 is the honest shape of "English-only" — pick it for
+ * 384 dims on an English corpus, not for this one, which is en+th. `relic langs`
+ * measures how en+th it actually is.
  */
 export function ollamaProvider(model: string, host = DEFAULT_OLLAMA): EmbedProvider {
   return {
