@@ -6,7 +6,7 @@ those passed, so a refactor that breaks one fails here instead of silently writi
 different rows into a shared index.
 """
 
-from relicpy.types import block_role, flatten_content, truncate, uid_of, utf16_len
+from relicpy.types import block_role, flatten_content, tree_key_of, truncate, uid_of, utf16_len
 
 
 class TestUid:
@@ -16,6 +16,15 @@ class TestUid:
         # digest means the same event lands twice instead of merging.
         assert uid_of("claude", "x.jsonl", 7) == "333a68a5473812feb14beeda65a8956819e92cf3"
         assert uid_of("codex", "rollout-a.jsonl", 3007) == "7c54ead46f86fc02cf9861f740dee993af3b9eec"
+
+    def test_nested_transcripts_key_on_their_path_inside_the_session_tree(self):
+        # Same digests as test/uid-collision.test.ts: one agent file can sit in two trees (#58).
+        sid = "04d1d650-031a-44f6-9c22-3e400e68390f"
+        assert tree_key_of(f"/r/-opt-x/{sid}.jsonl") == f"{sid}.jsonl"
+        assert uid_of("claude", tree_key_of(f"/r/-opt-x/{sid}/subagents/agent-a1.jsonl"), 7) \
+            == "72ae4d4171f5d04f2052499fb398aa5d0c006507"
+        assert uid_of("claude", tree_key_of(f"/r/-opt-x/{sid}/subagents/workflows/wf_abc/agent-a1.jsonl"), 7) \
+            == "5515dbe912e947168971651ac564a89d2153c4e2"
 
     def test_uid_excludes_the_directory(self):
         # Path-independent by design: the same transcript found under live AND archive
