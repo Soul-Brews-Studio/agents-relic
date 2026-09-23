@@ -39,6 +39,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
+import { scanLangs, recommend, renderLangs } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 
@@ -1135,6 +1136,38 @@ async function cmdReport(f: Record<string, string | boolean>) {
  * so embedding is opt-in, resumable, and scoped: `--repo`, `--bank` and `--limit` all
  * narrow it, and `--dry-run` answers "how much would this cost" without an HTTP call.
  */
+/**
+ * `relic langs` — the language mix of the embeddable corpus, and which measured model
+ * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
+ */
+async function cmdLangs(f: Record<string, string | boolean>) {
+  const sample = f.sample === undefined ? 64 : Number(f.sample);
+  if (!Number.isInteger(sample) || sample < 1) {
+    console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
+    process.exit(1);
+  }
+  const bar = progress();
+  const r = await scanLangs({
+    dataRoot: (f["data-root"] as string) ?? null,
+    inRepo: Boolean(f["in-repo"]),
+    repo: f.repo ? String(f.repo) : undefined,
+    bank: f.bank ? String(f.bank) : undefined,
+    sample,
+    // Same flags, same meaning as embed: the population measured is the one embedded.
+    mainTiers: !f["all-tiers"],
+    minChars: f["min-chars"] ? Number(f["min-chars"]) : 24,
+    maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
+    onProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty") bar.tick(`  ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total);
+    },
+  });
+  bar.clear();
+  const rec = recommend(r);
+  if (outFmt(f) === "json" || outFmt(f) === "jsonl") { console.log(JSON.stringify({ ...r, recommendation: rec }, null, 2)); return; }
+  if (!r.shards) { console.log("no shards match — check --repo / --bank, or run relic index first"); return; }
+  console.log(renderLangs(r, rec));
+}
+
 async function cmdEmbed(f: Record<string, string | boolean>) {
   const o = {
     dataRoot: (f["data-root"] as string) ?? null,
@@ -1879,5 +1912,6 @@ else if (cmd === "serve") {
 }
 else if (cmd === "probe") await cmdProbe(f);
 else if (cmd === "embed") await cmdEmbed(f);
+else if (cmd === "langs") await cmdLangs(f);
 else if (cmd === "status") await cmdStatus(f);
 else { console.error(`unknown command: ${cmd}`); process.exit(1); }
