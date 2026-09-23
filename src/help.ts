@@ -81,10 +81,11 @@ export function helpText(): string {
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
-                               day by day: which repo, which worktree, what it was
+          [--all-tiers]        day by day: which repo, which worktree, what it was
                                called. --tree adds each session's transcript shape.
                                Transcript tiers only — a sessions row can be a ψ note,
-                               which outnumber conversations 100:1.
+                               which outnumber conversations 100:1. --all-tiers counts
+                               them too.
   memory  [--mem-type T] [--bank B] [--limit 20]  Claude's own memory, joined to the
                                sessions that produced it — which had one, which had none
   pending [--corpus ...] [--since 1h] [--repo S] [--bank B] [--list N] [--paths]
