@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
-  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint,
+  statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote,
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
@@ -354,6 +354,11 @@ async function run(name: string, a: any): Promise<string> {
     }
     L.push(`total ${fmt(rows.reduce((x, r) => x + r.events, 0))} events · ` +
            `${fmt(rows.reduce((x, r) => x + r.sessions, 0))} transcripts · ${rows.length} shards`);
+    const simple = rows.filter(r => r.events > 0 && r.fts === "simple");
+    if (simple.length)
+      L.push(`\u26A0 ${simple.length} shard(s) use the \`simple\` tokenizer (no ICU where indexed) — Thai substring ` +
+             `search degraded: ${simple.slice(0, 5).map(r => r.key.replace("github.com/", "")).join(", ")}` +
+             (simple.length > 5 ? ", ..." : ""));
     return L.join("\n");
   }
 
@@ -364,7 +369,7 @@ async function run(name: string, a: any): Promise<string> {
       return `no shards match${a?.repo ? ` repo~${a.repo}` : ""} — call relic_status to see what is indexed`;
 
     const limit = Number(a.limit ?? 20);
-    const { hits, shards, ms, total } = await searchEvents(q, {
+    const { hits, shards, ms, total, degraded } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
       allTiers: Boolean(a.all_tiers || a.tier),
@@ -377,10 +382,12 @@ async function run(name: string, a: any): Promise<string> {
             shards, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
             top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true }, DATA_ROOT);
 
-    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)`;
+    const lossy = degradedNote(degraded, shards);
+    if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + (lossy ? `\n${lossy}` : "");
     const narrowed = !a.all_tiers && !a.tier;
     const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
-      (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""), ""];
+      (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""),
+      ...(lossy ? [lossy] : []), ""];
     for (const h of hits.slice(0, limit)) {
       const i = h.text.toLowerCase().indexOf(q.toLowerCase());
       const snip = i < 0 ? h.text.slice(0, 200) : h.text.slice(Math.max(0, i - 70), i + q.length + 130);

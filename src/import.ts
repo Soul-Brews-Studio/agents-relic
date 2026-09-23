@@ -99,6 +99,8 @@ export interface ImportTally {
   seen: Map<string, Set<string>>;
   /** FTS indexes actually built or confirmed, and what that phase cost. */
   ftsBuilt: number; ftsFailed: number; ftsMs: number;
+  /** "bank/repo" of shards left on the `simple` tokenizer, and why ICU was refused. */
+  ftsSimple: string[]; ftsNoIcu: string; ftsUpgraded: number;
 }
 
 /** Paths that share a basename but not a tree key — the pairs the basename-only uid collided (#58). */
@@ -336,7 +338,8 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   // A scan writes nothing, so there is nothing to flush and no index to rebuild.
   if (o.noWrite)
     return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
-             ftsBuilt: 0, ftsFailed: 0, ftsMs: 0 };
+             ftsBuilt: 0, ftsFailed: 0, ftsMs: 0,
+             ftsSimple: [], ftsNoIcu: "", ftsUpgraded: 0 };
 
   await flush();   // anything left below the batch threshold
 
@@ -350,13 +353,23 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
    * printed a hardcoded "fts index built in 0.0s", which is the same lie with a number.
    */
   const tf0 = Date.now();
-  const stores = shards.stores();
-  let ftsBuilt = 0, ftsFailed = 0;
+  const keys = shards.keys();
+  let ftsBuilt = 0, ftsFailed = 0, ftsUpgraded = 0, ftsNoIcu = "";
+  const ftsSimple: string[] = [];
   const ftsBar = progress();
-  for (let i = 0; i < stores.length; i++) {
-    if (o.progress) ftsBar.tick(`  building full-text index  ${i + 1}/${stores.length} shards   `,
-                                ((i + 1) / stores.length) * 100, i === stores.length - 1);
-    try { await stores[i].ensureFtsIndex(); ftsBuilt++; }
+  for (let i = 0; i < keys.length; i++) {
+    if (o.progress) ftsBar.tick(`  building full-text index  ${i + 1}/${keys.length} shards   `,
+                                ((i + 1) / keys.length) * 100, i === keys.length - 1);
+    try {
+      const r = await shards.byKey(keys[i])!.ensureFtsIndex();
+      ftsBuilt++;
+      if (r?.upgraded) ftsUpgraded++;
+      if (r?.tokenizer === "simple") {
+        const { bank, repo } = splitShardKey(keys[i]);
+        ftsSimple.push(`${bank}/${repo}`);
+        ftsNoIcu ||= r.fellBack ?? "";
+      }
+    }
     catch (err) {
       ftsFailed++;
       if (o.verbose) process.stderr.write(`\n  FTS FAIL: ${String(err).slice(0, 160)}\n`);
@@ -364,5 +377,5 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   }
   if (o.progress) ftsBar.clear();
   return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
-           ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0 };
+           ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0, ftsSimple, ftsNoIcu, ftsUpgraded };
 }
