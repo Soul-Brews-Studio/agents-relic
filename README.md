@@ -665,6 +665,26 @@ Filters stack:
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
 
+### "N of M": M is a count only when it says so
+
+```
+20 of at least 8620 match(es) for plugin:discord:discord · 1141 shards · 1185 ms  ·  indexed 3.7h ago  ·  main sessions only — add --all-tiers for subagent/workflow work
+  a floor, not a count — 488 of 1141 shards hold more than 20 matches and were not read to the end. --limit 0 reads every match.
+```
+
+Every shard answers with its own top `--limit`, so the pool behind M measures the fetch,
+not the corpus. For that query M used to read 640 at `--limit 1`, 8,306 at the default
+20 and 53,892 at 400; every match is **171,790**. Each shard is asked for one row past
+the limit. When no shard returns it, every shard was read to the end and M is printed
+bare, as a count. When any does, M reads "at least", with the line above. `--json`
+carries the same as `exhaustive` and `capped` beside `total`.
+
+A true count on every search was measured and not taken: a second, count-only pass over
+the same shards adds **3.8 s** to that query when deduped the way hits are (1.7 s without
+the dedupe, which counts every cross-bank copy), and 8.8 s to the widest query in the
+trace log, against a 1-4 s search. `--limit 0` gives the exact number when it is wanted:
+171,790 hits in 6.6 s and 4.9 GB here, so pair it with `--repo`.
+
 ### Staleness, because a stale hit looks exactly like a fresh one
 
 ```

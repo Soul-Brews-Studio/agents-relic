@@ -37,7 +37,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO, unindexedHint, degradedNote } from "./query.js";
+         groupByBank, maxISO, unindexedHint, degradedNote, matchCount, floorNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, damageNote, DEFAULT_OLLAMA } from "./embed.js";
 import { scanLangs, recommend, renderLangs } from "./langs.js";
@@ -579,7 +579,7 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    */
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms, generic, degraded } = await searchEvents(q, {
+  const { hits, shards: searched, ms, capped, generic, degraded } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
@@ -619,7 +619,9 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const mode = outFmt(f);
 
   if (mode === "json") {
+    // `exhaustive: false` makes `total` a floor — the flag a script needs before it divides by it.
     console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length,
+                                 exhaustive: !capped, capped: capped ?? 0,
                                  degraded: degraded ?? [], hits: top }, null, 2));
     return;
   }
@@ -654,8 +656,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const fresh = await answerFreshness(
     [...new Set(top.map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
   const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
-  console.log(`${top.length} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+  console.log(`${matchCount(top.length, hits.length, capped)} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
     (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
+  const floor = floorNote(capped, searched, limit);
+  if (floor) console.log(`  ${floor}. --limit 0 reads every match.`);
   if (lossy) console.log(`  ${lossy}`);
   // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
   if (fresh && fresh.ageSec > 86_400) {
