@@ -63,6 +63,24 @@ export interface EventRow {
   // in all seven tools.
   mem_type: string;       // project | feedback | reference | user
   origin_session: string; // the session that produced this memory — the join key
+  /*
+   * CHANNEL FACETS — who sent a turn, from which room, on whose clock (#85, #86).
+   * Parsed at import from a channel plugin's envelope; "" on every other row, the same
+   * trade the memory columns make, for the same reason.
+   *
+   * `via` sits BESIDE `source`, never inside `kind`. `source` is the transcript's
+   * format and `kind` is what a row IS; a turn typed into Discord is still a transcript
+   * turn. Folding the front door into either puts two axes in one column, which is the
+   * tier/kind mistake above. Stored verbatim — nine distinct values in the live index
+   * on m5, among them arra-oracle-discord, mqtt and oracle-inbox; a normaliser would be
+   * guessing at the tenth.
+   */
+  via: string;            // the envelope's source: plugin:discord:discord | mqtt | …
+  chat_id: string;        // which channel or thread
+  msg_id: string;         // the upstream message_id
+  from_user: string;      // who typed it
+  from_user_id: string;
+  sent_ts: string;        // THEIR clock; `ts` is when the transcript was written
 }
 
 export interface SessionRow {
@@ -74,6 +92,13 @@ export interface SessionRow {
   started_at: string; ended_at: string; description: string; imported_at: string;
   title: string;   // the host's own session name; "" when it wrote none
   git_branch: string;
+  /*
+   * The rooms a session lived in and who spoke there: distinct values from its channel
+   * turns, most frequent first, comma-joined. Lists, because one session commonly
+   * spans rooms — measured on m5, 61 of 95 channel transcripts carry more than one
+   * chat_id and 21 more than one sender. "" when nothing arrived by channel.
+   */
+  via: string; chat_id: string; from_users: string;
 }
 
 /** (path, mtime, size) is the import-diff identity — no content hashing. */
@@ -112,6 +137,15 @@ export interface VectorRow {
   dim: number;
   norm: string;           // "l2" when written normalised, "" when raw — see embedShard()
   embedded_at: string;
+}
+
+/** A `vectors` table whose current version no longer reads — see LanceStore.vectorDamage(). */
+export interface VectorDamage {
+  version: number;             // the version the table opens at, which fails to read
+  rows: number;                // rows it claims; countRows() reads only the manifest
+  error: string;               // what the failed read said
+  restorable: number | null;   // the newest older version that reads; null when none does
+  keep: number;                // rows at `restorable`, which is what a restore keeps
 }
 
 export interface Hit extends EventRow { }
@@ -219,6 +253,78 @@ export class LanceStore {
     return true;
   }
 
+  /**
+   * Whether `vectors` still reads end to end, and if it does not, the newest version
+   * that does. `null` means healthy, or no table at all.
+   *
+   * This is #105. A data file that the current version references can end up 0 bytes,
+   * and from then on every read that touches it fails. On lancedb 0.39 / macOS the error
+   * is "failed to fill whole buffer"; the report had "Invalid range 0..0 for object of
+   * size 0 bytes". countRows() still answers, because it reads only the manifest, so the
+   * table looks fine until something scans it.
+   *
+   * A kill alone did not produce this state. 60 SIGKILLs timed into embed writes on m5
+   * (APFS) always left a table that read: at the last commit that landed, or no table
+   * at all when the kill hit the first write. Lance writes the data files first and the
+   * manifest last, so a killed commit leaves at most files that nothing references
+   * (twice, a 0-byte `.tmpXXXXXX` staging file). What produces the state is data lost
+   * AFTER a commit landed. A machine crash can do that to files that were never
+   * fsynced; that is a guess, not something reproduced here. So the check is a read of
+   * the uid column, never a guess from file sizes. Those harmless 0-byte staging files
+   * would make a size check cry wolf.
+   *
+   * The newest readable version is found by bisection. An embed only appends, so once a
+   * version references a damaged file, every later version does too. Bisection needs
+   * log2(n) probes. Walking back one version at a time needs n, and a shard embedded in
+   * batches of 64 has thousands of versions. If a later delete removed the damaged
+   * fragment, the answer still reads; it is just not necessarily the newest one that does.
+   */
+  async vectorDamage(): Promise<VectorDamage | null> {
+    const t = await this.existing("vectors");
+    if (!t) return null;
+    const reads = async (h: lancedb.Table) => {
+      try { await h.query().select(["uid"]).toArray(); return ""; }
+      catch (err) { return String(err); }
+    };
+    const error = await reads(t);
+    if (!error) return null;
+    const version = await t.version();
+    const rows = await t.countRows();
+    // A second handle: checkout() is in place, and the cached one must stay on latest.
+    const h = await this.db.openTable("vectors");
+    const older = (await h.listVersions()).map(v => v.version).filter(v => v < version).sort((a, b) => a - b);
+    const readsAt = async (v: number) => { await h.checkout(v); return !(await reads(h)); };
+    if (!older.length || !(await readsAt(older[0])))
+      return { version, rows, error, restorable: null, keep: 0 };
+    let lo = 0, hi = older.length;        // older[lo] reads; older[hi] (or `version`) does not
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (await readsAt(older[mid])) lo = mid; else hi = mid;
+    }
+    await h.checkout(older[lo]);
+    return { version, rows, error, restorable: older[lo], keep: await h.countRows() };
+  }
+
+  /**
+   * Put a damaged `vectors` table back to a version that reads. When no version reads,
+   * drop it.
+   *
+   * Restoring loses the least: the vectors committed up to that version survive, and the
+   * resumable anti-join re-embeds only the rest. restore() writes a NEW version that
+   * copies the old manifest, so the damaged versions stay in the history and nothing is
+   * rewritten in place. Dropping is the fallback, and it is the same one-shard,
+   * vectors-only drop as `--reset`. `events`, `sessions`, `files` and the full-text index
+   * are never touched, so the worst case is re-embedding one shard.
+   */
+  async repairVectors(d: VectorDamage): Promise<"restored" | "dropped"> {
+    if (d.restorable === null) { await this.dropVectors(); return "dropped"; }
+    const h = await this.db.openTable("vectors");
+    await h.checkout(d.restorable);
+    await h.restore();
+    this.cache.delete("vectors");   // the cached handle still points at the damaged version
+    return "restored";
+  }
+
   /** Single-row conveniences — prefer the array forms in any loop. */
   putSession = (row: SessionRow) => this.putSessions([row]);
   putFile    = (row: FileRow)    => this.putFiles([row]);
@@ -227,6 +333,30 @@ export class LanceStore {
   async deleteEventsOf(filePath: string): Promise<void> {
     const t = await this.existing("events");
     await t?.delete(`file_path = ${sqlStr(filePath)}`);
+  }
+
+  /**
+   * Take down the "imported" mark on these files. It must commit BEFORE any of their
+   * rows are deleted.
+   *
+   * The `files` row is the only thing that makes `index` skip a file, so it is a done
+   * marker. A rewrite that spans several commits has to take the marker down first and
+   * put it back last. The #58 re-key re-imports files that are UNCHANGED on disk, so
+   * their `files` rows still match, and the only sign a file needed re-keying was its
+   * old rows. The delete destroys those rows. A run killed between the per-file delete
+   * commits and the insert commit therefore left the files skipped as unchanged on
+   * every later run, with their events gone.
+   *
+   * No file on disk has an mtime of -1, so after this commit the next plain `index`
+   * re-imports these files, whatever else did or did not commit. `relic pending`
+   * reads the same manifest, so it lists them as changed until then, which is true.
+   */
+  async markStale(paths: string[]): Promise<void> {
+    const t = await this.existing("files");
+    if (!t) return;
+    for (let i = 0; i < paths.length; i += 200)
+      await t.update({ where: `file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`,
+                       values: { mtime: -1 } });
   }
 
   /** (uid, seq, file_path) of every event these files own — chunked like pruneFiles. */
@@ -360,7 +490,7 @@ export class LanceStore {
   }
 
   /** Full-text search, BM25-ranked. Falls back to a LIKE scan if no index exists yet. */
-  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean } = {}): Promise<Hit[]> {
+  async search(q: string, opts: { limit?: number; tier?: string; mainTiers?: boolean; org?: string; project?: string; dir?: string; memType?: string; source?: string; worktree?: string; path?: string; since?: string; until?: string; role?: string; prose?: boolean; via?: string; chat?: string; fromUser?: string } = {}): Promise<Hit[]> {
     const t = await this.existing("events");
     if (!t) return [];
     // `--limit 0` means "all" — recap teaches that idiom in its own footer, and honours it
@@ -371,6 +501,22 @@ export class LanceStore {
     let limit = opts.limit ?? 20;
     if (limit <= 0) limit = Math.max(await t.countRows(), 1);
     const filters: string[] = [];
+    /*
+     * CHANNEL FACETS, probed like `kind` below: a shard indexed before they existed has
+     * no such column, and naming one in a filter is a hard error there. That shard holds
+     * no facets, so a facet filter matches nothing in it — an empty answer, not an error
+     * the fan-out would swallow. Substring and case-blind: `--via discord` is both
+     * plugin:discord:discord and arra-oracle-discord.
+     *
+     * strpos, not LIKE: a username is `nazt_`, and in a LIKE pattern `_` matches any
+     * character and `%` matches everything, so `--from-user nazt_` also found `naztX`.
+     */
+    const facets = ([["via", opts.via], ["chat_id", opts.chat], ["from_user", opts.fromUser]] as const)
+      .filter(([, v]) => v);
+    if (facets.length) {
+      if ((await this.missingColumns("events", facets.map(([c]) => c)))?.length) return [];
+      for (const [c, v] of facets) filters.push(`strpos(lower(${c}), ${sqlStr(String(v).toLowerCase())}) > 0`);
+    }
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
     /*
      * The "main" default: the human's own thread plus documents, excluding the
@@ -707,17 +853,21 @@ export class LanceStore {
   /**
    * The embeddable population, as (role, text) — what `relic langs` measures.
    *
-   * SAME eligibility as embeddableCount and unembedded: main tiers when asked, length
-   * filtered here rather than in SQL, so the language mix describes exactly the text a
-   * model would be fed. `where` narrows it further — `relic langs` passes a uid range,
-   * which is a uniform sample because a uid is a sha1.
+   * SAME eligibility as embeddableCount and unembedded: one session and main tiers when
+   * asked, length filtered here rather than in SQL, so the language mix describes exactly
+   * the text a model would be fed. `where` narrows it further — `relic langs` passes a uid
+   * range, which is a uniform sample because a uid is a sha1.
    */
-  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number } = {}): Promise<{ role: string; text: string }[]> {
+  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number; session?: string } = {}): Promise<{ role: string; text: string }[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const minChars = opts.minChars ?? 24;
     let q = t.query().select(["role", "text"]);
-    const filters = [opts.where ?? "", opts.mainTiers ? await this.mainTiersFilter(t) : ""].filter(Boolean);
+    const filters = [
+      opts.where ?? "",
+      opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
+      opts.mainTiers ? await this.mainTiersFilter(t) : "",
+    ].filter(Boolean);
     if (filters.length) q = q.where(filters.join(" AND "));
     const out: { role: string; text: string }[] = [];
     for (const r of await q.toArray()) {
@@ -793,6 +943,88 @@ export class LanceStore {
     return await t.query().where("tier = 'memory'")
       .select(["session_uuid", "file_path", "mem_type", "origin_session", "ts", "text"])
       .toArray() as any;
+  }
+
+  /**
+   * Which of these columns the table lacks: [] when it has them all, null when there is
+   * no such table. A filter or select naming a missing column is a hard error.
+   */
+  async missingColumns(table: string, cols: string[]): Promise<string[] | null> {
+    const t = await this.existing(table);
+    if (!t) return null;
+    const have = new Set((await t.schema()).fields.map(f => f.name));
+    return cols.filter(c => !have.has(c));
+  }
+
+  /**
+   * Every user row holding `<channel`, WHOLE — what `index --backfill-channel` reads.
+   *
+   * `%<channel%`, not a prefix: the parser accepts leading whitespace, so SQL only narrows
+   * and parseChannelEnvelope decides; quoted envelopes come back too and are rejected
+   * there. Whole rows, and plain objects, because the backfill writes each one back
+   * exactly as it was read with only its facets set.
+   */
+  async channelRows(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'`).toArray()).map(r => ({ ...r }));
+  }
+
+  /**
+   * Texts of user rows holding `<channel` that carry no facets — the caller counts the
+   * deliveries among them. Read from the DATA, not the schema: one ordinary index run
+   * widens an old shard, and from then on its schema says "faceted" while every older
+   * channel row in it still says via = "".
+   */
+  async unfacetedChannelTexts(): Promise<string[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const faceted = (await this.missingColumns("events", ["via"]))?.length === 0;
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'` + (faceted ? ` AND via = ''` : ""))
+      .select(["text"]).toArray()).map(r => String(r.text));
+  }
+
+  /**
+   * Session rows whose stored name still opens with an envelope tag — written before #92.
+   * A prefix test by strpos, not LIKE: in `<hook_prompt%` the `_` matches any character.
+   */
+  async namedByEnvelope(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    return (await t.query()
+      .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `strpos(description, ${sqlStr(p)}) = 1`).join(" OR "))
+      .toArray()).map(r => ({ ...r }));
+  }
+
+  /** Session rows for these files, as plain objects — chunked, like every IN (...) here. */
+  async sessionsOf(paths: string[]): Promise<SessionRow[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    const out: SessionRow[] = [];
+    for (let i = 0; i < paths.length; i += 200)
+      for (const r of await t.query().where(`file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`).toArray())
+        out.push({ ...r } as unknown as SessionRow);
+    return out;
+  }
+
+  /**
+   * Rewrite rows that already exist, matched on `key`: never an insert, never a delete.
+   *
+   * The backfill's only write. Each row is one that was just read, put back with a field
+   * or two set, in ONE commit — so a run killed at any point leaves every row either as
+   * it was or as it should be, and nothing gone. The re-import it replaces deleted a
+   * file's rows in one commit and wrote them back in the next; killed in between, they
+   * were lost, and the unchanged manifest kept `index` from ever re-reading the file.
+   *
+   * No insert branch on purpose: a row that vanished since the read (an index run replaced
+   * its file) is simply not matched, where an upsert would bring it back.
+   */
+  async updateRows(name: "events" | "sessions", key: string, rows: Record<string, unknown>[]): Promise<void> {
+    if (!rows.length) return;
+    const t = await this.existing(name);
+    if (!t) return;
+    await this.widen(name, t, rows[0]);
+    await (await this.existing(name))!.mergeInsert(key).whenMatchedUpdateAll().execute(rows);
   }
 
   /** The session ids this shard holds — the right-hand side of the memory join. */

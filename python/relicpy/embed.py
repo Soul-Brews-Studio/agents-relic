@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .langs import EmbedCheck, check_embed_model
 from .models import Scope
 from .query import pick_shards
 from .store import LanceStore
@@ -56,7 +58,8 @@ def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
 
     That cosine is a SMOKE TEST, not a benchmark: one English string against its Thai
     translation, which says whether a model places the two languages in one space at
-    all, and nothing about ranking quality.
+    all, and nothing about ranking quality. The same numbers, as data, are
+    MEASURED_MODELS in langs.py — what the embed check reads.
     """
     base = host.rstrip("/")
 
@@ -122,15 +125,33 @@ def st_provider(model: str, device: Optional[str] = None,
     return Provider(id=tag, encode=encode)
 
 
+def _doc_prefix(model: str) -> str:
+    # e5 is the model the st provider exists for, and it is useless without its
+    # prefix — so infer it rather than making silence the failure mode.
+    return "passage: " if "e5" in model.lower() else ""
+
+
 def provider_for(name: str, model: str, host: Optional[str] = None,
                  device: Optional[str] = None) -> Provider:
     if name == "ollama":
         return ollama_provider(model, host or DEFAULT_OLLAMA)
     if name == "st":
-        # e5 is the model this provider exists for, and it is useless without its
-        # prefix — so infer it rather than making silence the failure mode.
-        doc = "passage: " if "e5" in model.lower() else ""
-        return st_provider(model, device=device, doc_prefix=doc)
+        return st_provider(model, device=device, doc_prefix=_doc_prefix(model))
+    raise ValueError(f'unknown provider "{name}" — expected "ollama" or "st"')
+
+
+def provider_id(name: str, model: str) -> str:
+    """The id provider_for(name, model) would write, WITHOUT building the provider.
+
+    Building an st provider loads the model — seconds of work, and an optional
+    dependency — so the embed check, which must run before any of that, reads the id
+    from here instead.
+    """
+    if name == "ollama":
+        return f"ollama:{model}"
+    if name == "st":
+        doc = _doc_prefix(model)
+        return f"st:{model}" + (f"+{doc.strip()}" if doc else "")
     raise ValueError(f'unknown provider "{name}" — expected "ollama" or "st"')
 
 
@@ -162,6 +183,8 @@ class ShardEmbedStat:
     model: str = ""
     dim: int = 0
     skipped: str = ""     # why this shard was left alone
+    damage: Optional[dict] = None   # `vectors` failed to read — see LanceStore.vector_damage()
+    repaired: str = ""    # what --repair did about it: "restored" | "dropped"
 
 
 @dataclass
@@ -173,15 +196,53 @@ class EmbedTally:
     ms: int = 0
     dry_run: bool = False
     provider_id: str = ""
+    check: Optional[EmbedCheck] = None   # the scope's languages against the model, measured first
+    refused: bool = False                # the check stopped this run before a provider was built
 
 
 # -------------------------------------------------------------------- the driver
 
 
+def _lance_reason(error: str) -> str:
+    """The Lance error, without the stream wrapper or the rustc source location."""
+    m = re.search(r"LanceError\([^)]*\): [^,\n]*", error)
+    return m.group(0) if m else error.removeprefix("Error: ")[:120]
+
+
+def _quote(a: str) -> str:
+    return a if re.fullmatch(r"[\w@%+=:,./-]+", a) else "'" + a.replace("'", "'\\''") + "'"
+
+
+def damage_note(st: ShardEmbedStat, carry: list[str], program: str = "relic-py") -> list[str]:
+    """What to say under a shard whose `vectors` failed to read — the same lines as
+    damageNote() in src/embed.ts. Unrepaired: the ONE command that repairs this shard,
+    which is the run itself narrowed to that shard, with --data-root and the model
+    carried along. Repaired: what was done, and what it kept."""
+    d = st.damage
+    if not d:
+        return []
+    if st.repaired == "restored":
+        return [f"repaired: restored v{d['restorable']} of `vectors`, keeping {d['keep']:,} "
+                f"of {d['rows']:,} rows; v{d['version']} did not read"]
+    if st.repaired == "dropped":
+        return ["repaired: dropped `vectors` — no version of it read — so this run embeds "
+                "the shard from scratch"]
+    cmd = " ".join(_quote(a) for a in [program, "embed", "--repair", "--bank", st.bank,
+                                       "--repo", st.repo, *carry])
+    return [
+        "`events` and the full-text index are untouched. To repair this shard's vectors only:",
+        f"  {cmd}",
+        "no version of the table reads, so that drops it and re-embeds the shard"
+        if d["restorable"] is None else
+        f"that restores v{d['restorable']} ({d['keep']:,} of {d['rows']:,} vectors) "
+        "and re-embeds the rest",
+    ]
+
+
 def embed_shard(store: LanceStore, p: Provider, *, batch: int = 64,
                 limit: Optional[int] = None, main_tiers: bool = True,
                 min_chars: int = 24, max_chars: int = 2000,
-                dry_run: bool = False, reset: bool = False,
+                dry_run: bool = False, reset: bool = False, repair: bool = False,
                 on_progress: Optional[Callable[[int, int], None]] = None) -> ShardEmbedStat:
     """One shard. Resumable by construction: the anti-join is against what is ON DISK,
     so an interrupted run is re-entered by running the command again."""
@@ -191,22 +252,43 @@ def embed_shard(store: LanceStore, p: Provider, *, batch: int = 64,
     # state rather than refusing on vectors this run is about to discard anyway.
     if reset and not dry_run:
         store.drop_vectors()
-    prior = store.vector_stats()
+
+    try:
+        prior = store.vector_stats()
+        # A FixedSizeList has ONE width. Writing a 1024-dim vector into a table created
+        # at 384 fails mid-batch, after an arbitrary amount of work has already landed —
+        # so the mismatch is caught before the first HTTP call and the shard is skipped
+        # with a reason, rather than half-written. Saying so is cheaper than discovering
+        # it 40 minutes into a backfill.
+        if prior and prior["rows"] > 0 and prior["model"] and prior["model"] != p.id:
+            st.already, st.dim = prior["rows"], prior["dim"]
+            st.skipped = (f"holds {prior['rows']} vectors from {prior['model']} "
+                          f"(dim {prior['dim']}); re-embed with {p.id} by adding --reset "
+                          f"(drops this shard's vectors table only)")
+            return st
+        todo = store.unembedded(limit=limit, main_tiers=main_tiers, min_chars=min_chars)
+    except Exception as err:
+        # A VECTORS TABLE THAT NO LONGER READS (#105) — see embedShard() in
+        # src/embed.ts. Diagnosed only after a read failed, so a healthy shard pays
+        # nothing. If `vectors` still reads, the fault is elsewhere and is re-raised
+        # unchanged: nothing is dropped on a guess. A dry run never repairs.
+        damage = store.vector_damage()
+        if not damage:
+            raise
+        if not repair or dry_run:
+            st.damage = damage
+            st.skipped = (f"vectors table unreadable at v{damage['version']} — "
+                          f"{_lance_reason(damage['error'])}")
+            return st
+        repaired = store.repair_vectors(damage)
+        # Start over on the repaired table; repair off, so a table that still fails is
+        # reported rather than repaired in a loop.
+        again = embed_shard(store, p, batch=batch, limit=limit, main_tiers=main_tiers,
+                            min_chars=min_chars, max_chars=max_chars, dry_run=dry_run,
+                            on_progress=on_progress)
+        again.damage, again.repaired = damage, repaired
+        return again
     st.already = (prior or {}).get("rows", 0)
-
-    # A FixedSizeList has ONE width. Writing a 1024-dim vector into a table created at
-    # 384 fails mid-batch, after an arbitrary amount of work has already landed — so the
-    # mismatch is caught before the first HTTP call and the shard is skipped with a
-    # reason, rather than half-written. Saying so is cheaper than discovering it 40
-    # minutes into a backfill.
-    if prior and prior["rows"] > 0 and prior["model"] and prior["model"] != p.id:
-        st.dim = prior["dim"]
-        st.skipped = (f"holds {prior['rows']} vectors from {prior['model']} "
-                      f"(dim {prior['dim']}); re-embed with {p.id} by adding --reset "
-                      f"(drops this shard's vectors table only)")
-        return st
-
-    todo = store.unembedded(limit=limit, main_tiers=main_tiers, min_chars=min_chars)
     st.pending = len(todo)
     st.dim = (prior or {}).get("dim", 0)
     if dry_run or not todo:
@@ -244,17 +326,36 @@ def embed_shards(s: Scope, *, provider: str = "ollama", model: str = "all-minilm
                  host: Optional[str] = None, device: Optional[str] = None,
                  batch: int = 64, limit: Optional[int] = None,
                  main_tiers: bool = True, min_chars: int = 24, max_chars: int = 2000,
-                 dry_run: bool = False, reset: bool = False,
-                 on_progress: Optional[Callable[[str, int, int], None]] = None) -> EmbedTally:
+                 dry_run: bool = False, reset: bool = False, force: bool = False,
+                 repair: bool = False,
+                 scope_args: Optional[list[str]] = None,
+                 on_check: Optional[Callable[[EmbedCheck], None]] = None,
+                 on_check_progress: Optional[Callable[[int, int, str], None]] = None,
+                 on_progress: Optional[Callable[[str, int, int], None]] = None,
+                 p: Optional[Provider] = None) -> EmbedTally:
+    """`p` is built from the flags unless a caller hands one in — the tests do, offline."""
     t0 = time.time()
-    p = provider_for(provider, model, host, device)
-    tally = EmbedTally(dry_run=dry_run, provider_id=p.id)
+    pid = p.id if p else provider_id(provider, model)
+    # The scope's languages against the model, BEFORE any provider is built or called —
+    # see check_embed_model. A dry run reports a refusal and still counts.
+    check = check_embed_model(pid, s, main_tiers=main_tiers, min_chars=min_chars,
+                              max_chars=max_chars, scope_args=scope_args, force=force,
+                              on_progress=on_check_progress)
+    if on_check:
+        on_check(check)
+    tally = EmbedTally(dry_run=dry_run, provider_id=pid, check=check,
+                       refused=check.action == "refuse" and not dry_run)
+    if tally.refused:
+        tally.ms = int((time.time() - t0) * 1000)
+        return tally
+    p = p or provider_for(provider, model, host, device)
     for sh in pick_shards(s):
         try:
             store = LanceStore.open(sh.dir)
             st = embed_shard(
                 store, p, batch=batch, limit=limit, main_tiers=main_tiers,
                 min_chars=min_chars, max_chars=max_chars, dry_run=dry_run, reset=reset,
+                repair=repair,
                 on_progress=(lambda d, t, k=sh.key: on_progress(k, d, t)) if on_progress else None)
             st.key, st.bank, st.repo = sh.key, sh.bank, sh.repo
         except Exception as e:

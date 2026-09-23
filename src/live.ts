@@ -202,6 +202,7 @@ export interface CurrentSession {
   lastEventMs: number | null;
   eventAgeSec: number | null;
   confident: boolean;   // false when the transcript's own cwd did not match
+  source?: "hermes";    // no transcript: a row in the state.db named by projectDir
 }
 
 /** Read just the fields needed to identify a transcript, without parsing all of it. */
@@ -246,6 +247,7 @@ async function peek(path: string, maxLines = 400): Promise<{ cwd: string | null;
  *
  *   Claude Code   CLAUDE_CODE_SESSION_ID
  *   Codex         CODEX_THREAD_ID   (also CODEX_COMPANION_SESSION_ID when companioned)
+ *   Hermes        HERMES_SESSION_ID (not hex — see hermesIdFromEnv)
  *
  * This matters most for Codex, which the scan below CANNOT find at all: codex is the
  * only source with `walk: "flat"`, and sessionIn() skips those outright because there
@@ -265,7 +267,28 @@ export function sessionIdFromEnv(env = process.env): { id: string; via: string }
     // working filesystem scan, and these vars are inherited by every child process.
     if (/^[0-9a-fA-F][0-9a-fA-F-]{7,}$/.test(v)) return { id: v, via: key };
   }
-  return null;
+  const hermes = hermesIdFromEnv(env);
+  return hermes ? { id: hermes, via: "HERMES_SESSION_ID" } : null;
+}
+
+/*
+ * Hermes publishes its id too, as HERMES_SESSION_ID on every terminal command it runs
+ * (hermes-agent tools/environments/local.py, _inject_session_context_env). The id is not
+ * hex, so it gets its own shape rather than a looser check for the other two:
+ *
+ *   <YYYYMMDD>_<HHMMSS>_<hex>          cli.py, gateway/session.py
+ *   cron_<job>_<YYYYMMDD>_<HHMMSS>     cron/scheduler.py
+ *
+ * Asked LAST. A Claude or Codex session started from a Hermes shell inherits the variable,
+ * and must keep answering with its own id. The reverse nesting — Hermes started from a
+ * Claude shell — still answers with the Claude id: the environment cannot say which host
+ * is innermost.
+ */
+const HERMES_ID = /^(\d{8}_\d{6}_[0-9a-f]{4,}|cron_[\w-]+_\d{8}_\d{6})$/;
+
+export function hermesIdFromEnv(env = process.env): string | null {
+  const v = (env.HERMES_SESSION_ID ?? "").trim();
+  return HERMES_ID.test(v) ? v : null;
 }
 
 export async function currentSession(cwd = process.cwd()): Promise<CurrentSession | null> {
@@ -279,7 +302,10 @@ export async function currentSession(cwd = process.cwd()): Promise<CurrentSessio
    */
   const fromEnv = sessionIdFromEnv();
   if (fromEnv) {
-    const hit = await sessionByUuid(fromEnv.id, cwd);
+    // A Hermes id names a state.db row, not a file (#100).
+    const hit = fromEnv.via === "HERMES_SESSION_ID"
+      ? (await import("./live-hermes.js")).hermesCurrent(fromEnv.id, cwd)
+      : await sessionByUuid(fromEnv.id, cwd);
     if (hit) return hit;
   }
 

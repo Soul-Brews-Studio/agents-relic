@@ -286,8 +286,15 @@ none, so they read `state.db` instead, through a parallel lookup rather than
   transcripts, so the newest session wins whichever agent wrote it. When relic runs
   inside a Hermes session, that session is skipped: Hermes sets `HERMES_SESSION_ID` on
   every command it runs.
-- A gateway session (Discord, say) records no cwd. It appears in `now --all` but can
-  never be the session before this one for a directory.
+- A gateway session (Discord, say) records no cwd, so no directory can claim it. When
+  the directory has nothing worth reading and `HERMES_SESSION_ID` is set, `tail`/`recap`
+  follow the caller's own line instead: the session immediately before it on the same
+  `session_key`, the same line `lineage` draws. This is a fallback, never a first
+  choice. A Claude session started from a Hermes shell inherits the variable, and the
+  environment cannot say which agent is innermost.
+- `now` names a Hermes caller by the same variable, and `lineage` with no id draws its
+  line. Hermes ids are not hex, so they get their own shape check. The Claude and Codex
+  checks are unchanged, and those two still win when both are set.
 
 Only an enabled `hermes` source is read. When a lookup comes up empty and `~/.hermes`
 holds data with the source switched off, the miss message says so.
@@ -506,6 +513,12 @@ is written **per file**, so an interrupted run resumes rather than restarting. T
 cost of interrupting: full-text indexes are built at the end, so search falls back to a
 slower scan until a run completes.
 
+A file that is being rewritten, whether it changed on disk or the #58 re-key is
+repairing it, has its manifest row marked stale **before** its old rows are deleted. A
+run killed partway through the rewrite leaves the file looking changed, and the next
+run finishes the job. Before this, a killed re-key left the file skipped as unchanged
+and its events gone, for good.
+
 ### `--source-path` — run one source against another root
 
 ```bash
@@ -641,6 +654,7 @@ relic search "ความจริง"                     # Thai — real word
 | `--path facebook` | any substring of the working directory |
 | `--prose` | humans + assistant only — see Roles below |
 | `--role user\|assistant\|tool_use\|tool_result\|thinking` | exact role |
+| `--via discord` · `--chat 214730` · `--from-user nazt_` | channel turns only: the plugin a turn came in by, the room or thread, who sent it. Substrings, case-blind — see Channel facets below |
 | `--source claude-live\|codex` | which agent wrote it |
 | `--tier session\|subagent\|workflow_agent` | which transcript tier |
 | `--since 7d` · `--until 2026-09-17` | date range; accepts `7d` `12h` `30m` or a date |
@@ -651,6 +665,62 @@ Filters stack:
 ```bash
 relic search "vacuum" --repo my-repo --worktree refactor --since 7d --prose
 ```
+
+### Channel facets — who asked, from which room, on whose clock
+
+A turn that arrives through a channel plugin (Discord, Telegram, MQTT, an inbox) opens
+with an envelope, and the envelope is the only place those facts exist. `role: user`
+says only that *a* human spoke; a shared channel is several. Import parses the envelope
+into columns beside the text, which keeps the envelope byte for byte:
+
+| envelope | column | |
+|---|---|---|
+| `source` | `via` | verbatim — `plugin:discord:discord`, `arra-oracle-discord`, `mqtt` … |
+| `chat_id` | `chat_id` | the channel or thread |
+| `message_id` | `msg_id` | the message upstream |
+| `user` · `user_id` | `from_user` · `from_user_id` | who typed it |
+| `ts` | `sent_ts` | the sender's clock — `ts` is when the transcript was written |
+
+`via` sits beside `source` (the transcript format), not inside `kind` (what a row is):
+a turn typed into Discord is still a transcript turn. Only a turn that **opens** with an
+envelope that names its `source` counts — quoted envelopes in summaries and tool output
+are never parsed. A session row lists its rooms and senders, most frequent first.
+
+```
+nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07      a search hit
+  emraccoon (discord): ขอคำจำกัดความสั้นๆ ของเบียร์ตัวนี้ …     tail --handoff
+neo-genesis-packaged  [discord #…345195 +5 · nazt_, emraccoon]   sessions
+```
+
+Turns indexed before the columns existed cannot match a facet filter, and `search` says
+how many — counted from the rows, since one ordinary index run widens an old shard's
+schema while its older rows still hold `via = ""`. `relic index --backfill-channel`
+fills them IN PLACE: the stored text still has the envelope, so each row is read, its
+facets set, and written back by uid. Nothing is deleted, re-imported or re-read, and a
+run killed halfway leaves every row as it was or as it should be. Dry by default;
+`--apply` writes the plan it printed; `--bank`/`--repo` narrow it. `--names` also
+re-reads the transcripts whose session name is still an envelope tag and rewrites only
+that session row.
+
+### "N of M": M is a count only when it says so
+
+```
+20 of at least 8620 match(es) for plugin:discord:discord · 1141 shards · 1185 ms  ·  indexed 3.7h ago  ·  main sessions only — add --all-tiers for subagent/workflow work
+  a floor, not a count — 488 of 1141 shards hold more than 20 matches and were not read to the end. --limit 0 reads every match.
+```
+
+Every shard answers with its own top `--limit`, so the pool behind M measures the fetch,
+not the corpus. For that query M used to read 640 at `--limit 1`, 8,306 at the default
+20 and 53,892 at 400; every match is **171,790**. Each shard is asked for one row past
+the limit. When no shard returns it, every shard was read to the end and M is printed
+bare, as a count. When any does, M reads "at least", with the line above. `--json`
+carries the same as `exhaustive` and `capped` beside `total`.
+
+A true count on every search was measured and not taken: a second, count-only pass over
+the same shards adds **3.8 s** to that query when deduped the way hits are (1.7 s without
+the dedupe, which counts every cross-bank copy), and 8.8 s to the widest query in the
+trace log, against a 1-4 s search. `--limit 0` gives the exact number when it is wanted:
+171,790 hits in 6.6 s and 4.9 GB here, so pair it with `--repo`.
 
 ### Staleness, because a stale hit looks exactly like a fresh one
 
@@ -1130,9 +1200,11 @@ directory it could not list or reach, `walk-error` for a single file it could no
 Every walker used to answer those with an empty list, so an unreadable directory looked
 exactly like an empty one and `relic pending` reported `0 missing` about files it had
 never seen. Now each is one stderr line per path (ENOENT stays quiet — optional
-`subagents/` directories are the normal case), `index` logs them here, `pending` says
-its counts cover only what the walk could read, and `prune` refuses to run over a scan
-that could not see everything.
+`subagents/` directories are the normal case — and so does ENAMETOOLONG, a directory
+name derived from a deep cwd that is too long to exist), `index` logs them here,
+`pending` says its counts cover only what the walk could read, and `prune` refuses to
+run over a scan that could not see everything. The lookups report the same way:
+`lineage`, `tail`/`recap` with no id, `dig`, the shard listing and the repo index.
 
 ### `embed` — the opt-in second pass
 
@@ -1143,8 +1215,30 @@ already complete, and it is resumable, scoped, and free to skip.
 relic embed --dry-run                      # what would this cost? no provider call
 relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
 relic embed --model bge-m3 --reset         # change model: drops `vectors` first
+relic embed --force                        # an English-only model on a Thai scope, on purpose
+relic embed --repair --bank hermes         # a shard whose `vectors` no longer reads (#105)
 relic-py embed --provider st --model intfloat/multilingual-e5-small
 ```
+
+**An interrupted embed.** Re-running resumes it, because the anti-join is against what
+is on disk. A kill mid-write costs at most the batch in flight: Lance writes data files
+first and the manifest last. One state does not resume. That is a table whose current
+version references data files that are 0 bytes, which is what #105 hit. `countRows`
+still answers, but every scan fails. `embed` now says so and prints the one command
+that repairs that shard:
+
+```
+  hermes/_unresolved  SKIP  vectors table unreadable at v3 — LanceError(IO): Generic LocalFileSystem error: failed to fill whole buffer
+                            `events` and the full-text index are untouched. To repair this shard's vectors only:
+                              relic embed --repair --bank hermes --repo _unresolved
+                            that restores v1 (64 of 192 vectors) and re-embeds the rest
+```
+
+`--repair` bisects the table's versions for the newest one that reads and restores it,
+as a new version on top, so the history is kept. The same run then re-embeds what that
+version lacks. If no version reads, it drops that one shard's `vectors`, as `--reset`
+would. It never touches `events`, `sessions`, `files` or the full-text index, and it
+never touches a table that reads. A dry run never repairs.
 
 ```
 provider  ollama:all-minilm
@@ -1154,6 +1248,41 @@ scope     main tiers, text >= 24 chars, truncated at 2000
 
 74,102 embedded · 46,886 pending · 0 failed · 1 shards · 512.0s  (145/s)
 ```
+
+**The default model is English-only, so embed checks the scope first.** Before any
+provider call, `embed` samples the population it is about to embed with the same uid
+sample and the same rule as [`langs`](#langs--which-languages-so-which-model). When the
+model is English-only in `MEASURED_MODELS` and 1% or more of the eligible events carry
+Thai (or another non-Latin script), it **refuses**, exits 1, and prints why:
+
+```
+$ relic embed --repo neo-oracle --dry-run
+  ⚠ ollama:all-minilm is English-only, and this scope is not. Without --force, a real run stops here.
+    11.0% of eligible events carry Thai, at or above 1.0%. An English-only model embeds them as noise (all-minilm: Thai paraphrase MRR 0.006, bench/).
+    measured 1 in 64 by uid -> 4,238 events · ~271,232 eligible in 9 shards · 2.2 s
+    multilingual, measured here:
+      ollama 1024d    ~1.0 GiB  bge-m3                          cos en-th +0.626 (smoke test, no ranking bench yet)
+      ollama 1024d    ~1.0 GiB  qwen3-embedding:0.6b            cos en-th +0.572 (smoke test, no ranking bench yet)
+      st      384d    ~0.4 GiB  intfloat/multilingual-e5-small  MRR 0.600 · Thai paraphrase 0.214
+      st      384d    ~0.4 GiB  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2  MRR 0.430 · Thai paraphrase 0.078
+    -> relic embed --provider st --model intfloat/multilingual-e5-small --repo neo-oracle   (st:intfloat/multilingual-e5-small+passage: is already on disk here, and fits)
+    --force embeds with ollama:all-minilm anyway. The whole mix, by role, and the vectors on disk: relic langs --repo neo-oracle
+...
+0 embedded · 118,782 pending · 0 failed · 8 shards · 6.0s
+```
+
+2026-09-23, trimmed. Without the check, that command would have embedded 118,782 events
+with the English-only default, into six shards beside two that already hold e5. Without
+`--dry-run` the first line reads `embed REFUSED`, and the embed pass never starts. A
+multilingual model passes without a word. A model relic has never measured gets a note,
+not a refusal: no numbers is not "English-only".
+
+| | |
+|---|---|
+| refuse, not warn | A warning prints once, above a progress bar that then runs for hours, often in a pane nobody watches. The wrong model is paid for twice: once to embed, then again after the `--reset` that changing model needs. A refusal costs one flag, `--force`. |
+| the same scope | `--repo`, `--bank`, `--all-tiers`, `--min-chars`, `--max-chars` and `--data-root` narrow the check exactly as they narrow the embed. `--session` reads every event of that one session. |
+| a thin sample | 1 in 64 of a small repo can be a handful of events, which cannot see 1%. Under 1,000 sampled events the check reads every event: such a scope is under ~64,000 events. |
+| both front ends | `relic-py embed` runs the same check (it has no `--session`), and a test runs both CLIs over one shard and compares the result field by field, and the printed block word for word. |
 
 **Vectors go to a `vectors` table, never a column on `events`.** That is not a style
 preference — it is the only shape that works:

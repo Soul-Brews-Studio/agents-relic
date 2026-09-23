@@ -16,6 +16,8 @@ import pickle
 
 import numpy as np
 
+from report_lang import by_language
+
 r = pickle.load(open(os.environ.get("BENCH_ALL", "/tmp/bench_all_para.pkl"), "rb"))
 queries = json.load(open(os.environ.get("BENCH_PARA", "/tmp/queries_para.json")))
 known_path = os.environ.get("BENCH_ALL_KNOWN", "/tmp/bench_all.pkl")
@@ -23,7 +25,16 @@ known = pickle.load(open(known_path, "rb")) if os.path.exists(known_path) else N
 
 K = 20
 ORDER = ["FTS (ICU)", "multilingual-e5-small", "all-MiniLM-L6 (en only)",
-         "multilingual-MiniLM-L12"]
+         "multilingual-MiniLM-L12", "bge-m3", "Qwen3-Embedding-0.6B", "embeddinggemma-300m",
+         "Qwen3-0.6B, no instruct",
+         "bge-m3 (ollama)", "embeddinggemma (ollama)", "emb-gemma raw (ollama)"]
+# Column heads for the band table; truncating the labels made two of them identical.
+SHORT = {"FTS (ICU)": "FTS", "multilingual-e5-small": "e5-small",
+         "all-MiniLM-L6 (en only)": "all-MiniLM", "multilingual-MiniLM-L12": "mMiniLM",
+         "bge-m3": "bge-m3", "Qwen3-Embedding-0.6B": "Qwen3-0.6B",
+         "embeddinggemma-300m": "emb-gemma", "Qwen3-0.6B, no instruct": "Qwen3 -instr",
+         "bge-m3 (ollama)": "bge-m3 ol", "embeddinggemma (ollama)": "emb-gem ol",
+         "emb-gemma raw (ollama)": "eg-nopre ol"}
 BANDS = [("0 (no shared terms)", lambda o: o == 0),
          ("0 - 0.05", lambda o: 0 < o <= 0.05),
          ("0.05 - 0.15", lambda o: 0.05 < o <= 0.15),
@@ -37,7 +48,9 @@ for name, (rr, _ms, _note) in r.items():
         f"{name}: {len(rr)} scores for {len(queries)} queries — the position contract "
         f"between bench*.py and this report is broken; do not read these numbers")
 
-print(f"  n={len(queries)} PARAPHRASE queries  ·  pool=3,000 docs  ·  MRR@{K}")
+docs_path = os.environ.get("BENCH_DOCS", "/tmp/bench_docs.json")
+n_pool = len(json.load(open(docs_path))["uids"]) if os.path.exists(docs_path) else 3000
+print(f"  n={len(queries)} PARAPHRASE queries  ·  pool={n_pool:,} docs  ·  MRR@{K}")
 print(f"  median query/doc overlap {np.median(ov):.3f}"
       f"   ·   {int((ov == 0).sum())} queries share no term with their target\n")
 
@@ -49,14 +62,16 @@ for k in ORDER:
         continue
     v = np.array([x[0] for x in r[k][0]])
     scores[k] = v
+    mth = v[th].mean() if th.any() else float("nan")
+    men = v[~th].mean() if (~th).any() else float("nan")
     print(f"  {k:<26} {v.mean():6.3f} {(v == 1.0).mean():6.1%} {(v >= 1/10).mean():6.1%} "
-          f"{(v == 0).mean():6.1%} {v[th].mean():7.3f} {v[~th].mean():7.3f}")
+          f"{(v == 0).mean():6.1%} {mth:7.3f} {men:7.3f}")
 
 print(f"\n  BY QUERY/DOC OVERLAP — does the win survive when no words are shared?\n")
 hdr = f"  {'band':<22} {'n':>4}"
 for k in ORDER:
     if k in scores:
-        hdr += f" {k.split(' (')[0][:13]:>14}"
+        hdr += f" {SHORT[k]:>11}"
 print(hdr)
 print("  " + "-" * (len(hdr) - 2))
 for label, pred in BANDS:
@@ -66,8 +81,10 @@ for label, pred in BANDS:
     row = f"  {label:<22} {int(m.sum()):>4}"
     for k in ORDER:
         if k in scores:
-            row += f" {scores[k][m].mean():>14.3f}"
+            row += f" {scores[k][m].mean():>11.3f}"
     print(row)
+
+by_language(r, queries, ORDER)
 
 if known:
     print(f"\n  PAIRED AGAINST THE KNOWN-ITEM RUN — same 200 documents, different queries\n")

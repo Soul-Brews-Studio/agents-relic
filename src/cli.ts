@@ -8,12 +8,12 @@ import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
 import { classify, logSkipped, readSkipped, skippedPath, logSkippedFiles, readSkippedFiles } from "./noise.js";
-import { walkFailures } from "./unreadable.js";
+import { walkFailures, dirUnreadable, walkError } from "./unreadable.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
-import { stripEnvelope } from "./types.js";
+import { stripEnvelope, parseChannelEnvelope, senderOf, saidText } from "./types.js";
 import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
@@ -23,6 +23,7 @@ import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProject
 import { findHermesSessions, buildHermesLineage, hermesOffNotes } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
+import { planChannelBackfill, applyChannelBackfill } from "./backfill.js";
 
 // #37 — noise filtering is now ON by default: blob-shaped tool traffic (base64,
 // hex, JWTs, minified JS — see noise.ts's longestUnbrokenRun) inflates FTS document
@@ -37,10 +38,11 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO, unindexedHint, degradedNote, coverageNote } from "./query.js";
+         groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead, facetArg,
+         matchCount, floorNote, coverageNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
-import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
-import { scanLangs, recommend, renderLangs } from "./langs.js";
+import { embedShards, damageNote, DEFAULT_OLLAMA } from "./embed.js";
+import { scanLangs, recommend, renderLangs, renderEmbedCheck } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
 import { rebuildFts } from "./fts-rebuild.js";
@@ -92,6 +94,7 @@ function resolveSourcePath(f: Record<string, string | boolean>, only: string[] |
 
 // ---- index -----------------------------------------------------------------
 async function cmdIndex(f: Record<string, string | boolean>) {
+  if (f["backfill-channel"]) return cmdBackfillChannel(f);
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
   if (f["fts-rebuild"]) return cmdFtsRebuild(dataRoot, inRepo, Boolean(f["dry-run"]));
@@ -185,6 +188,72 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     });
     reportPrune(plan, maxDropPct);
   }
+}
+
+/**
+ * `index --backfill-channel`: fill the channel facets of rows indexed before they existed,
+ * in place, from the stored text. DRY BY DEFAULT, like prune — the counts come first, and
+ * `--apply` writes exactly the plan it printed. `--names` adds the one part that needs the
+ * transcripts: session descriptions still cut inside an envelope tag.
+ */
+async function cmdBackfillChannel(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const inRepo = Boolean(f["in-repo"]);
+  const apply = Boolean(f.apply), names = Boolean(f.names);
+  const scope = { dataRoot, inRepo, repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined };
+  const t0 = Date.now();
+  console.log(`\u{1F3FA} relic channel backfill  (${[scope.bank ? `bank ${scope.bank}` : "", scope.repo ? `repo~${scope.repo}` : "",
+              names ? "with --names" : "", apply ? "APPLY — rows are updated in place" : "dry run — nothing written"]
+              .filter(Boolean).join(" · ")})`);
+  const bar = progress();
+  const plan = await planChannelBackfill(scope, {
+    names, onShard: (done, total, key) => bar.tick(`  reading ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total),
+  });
+  bar.clear();
+  const nm = plan.names;
+  console.log(`  scanned:     ${fmt(plan.scanned)} shards in ${(plan.ms / 1000).toFixed(1)}s`);
+  console.log(`  facets:      ${fmt(plan.turns)} channel turns to fill, written back by uid from their own stored text`);
+  console.log(`  rooms:       ${fmt(plan.rooms)} session rows to list their rooms and senders`);
+  console.log(`  names:       ${fmt(nm.pending)} session rows still named by an envelope tag, ${fmt(nm.untitled)} of them (untitled)` +
+              (names ? ` · ${fmt(nm.planned)} re-read (${(nm.bytes / 1e9).toFixed(2)} GB)`
+                     : ` · --names re-reads their transcripts (${(nm.bytes / 1e9).toFixed(2)} GB) and rewrites only those rows`));
+  if (nm.gone + nm.otherShape)
+    console.log(`  skipped:     ${[nm.gone && `${fmt(nm.gone)} names whose transcript is gone or unreadable`,
+                                   nm.otherShape && `${fmt(nm.otherShape)} names on a non-Claude transcript (only that shape strips the tag)`]
+                                  .filter(Boolean).join(" · ")}`);
+  if (!plan.shards.length) { console.log(`  nothing to write.`); return; }
+  if (!apply) {
+    // The flags given, echoed exactly: dropping --data-root or --bank here turned a
+    // rehearsal on a scratch copy into a live run over every bank for whoever pasted it.
+    const again = ["relic index --backfill-channel --apply", names && "--names",
+                   dataRoot && `--data-root ${shq(dataRoot)}`, inRepo && "--in-repo",
+                   scope.bank && `--bank ${shq(scope.bank)}`, scope.repo && `--repo ${shq(scope.repo)}`].filter(Boolean).join(" ");
+    console.log(`\n  to write them:  ${again}`);
+    console.log(`  nothing is deleted or re-imported: each row is read, its facets set, and put back`);
+    return;
+  }
+
+  // The invariant, checked rather than promised: an in-place update adds and removes no row.
+  const dirs = plan.shards.map(x => x.dir);
+  const total = async () => { let n = 0; for (const d of dirs) n += (await (await LanceStore.open(d)).counts()).events; return n; };
+  const before = await total();
+  const wrote = await applyChannelBackfill(plan,
+    (done, all, key) => bar.tick(`  writing ${done}/${all} shards  ${key}   `, (done / all) * 100, done === all));
+  bar.clear();
+  const after = await total();
+  console.log(`  wrote:       ${fmt(wrote.events)} event rows · ${fmt(wrote.sessions)} session rows · ${fmt(dirs.length)} shards`);
+  console.log(`  events:      ${fmt(before)} -> ${fmt(after)}` +
+              (before === after ? `  (unchanged — nothing added, nothing removed)` : `  ⚠ CHANGED — this must not happen; stop and look`));
+  // Proven by asking again, not by trusting the counts: what is left is what the next
+  // dry run would print.
+  const left = await planChannelBackfill(scope, { names });
+  console.log(`  left:        ${fmt(left.turns)} turns · ${fmt(left.rooms)} rooms` +
+              (names ? ` · ${fmt(left.names.planned)} names` : "") + `  ·  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+}
+
+/** A flag value as the shell will read it back: bare when safe, single-quoted otherwise. */
+function shq(v: string): string {
+  return /^[\w@%+=:,./-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
@@ -362,7 +431,7 @@ async function recapTarget(arg: string | undefined): Promise<string> {
   // not data. On stdout it lands inside `--json` output and makes it unparseable:
   // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
   // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+  console.error(resolvedBanner(prev));
   return prev.id;
 }
 
@@ -542,7 +611,9 @@ async function cmdSemantic(q: string, f: Record<string, string | boolean>,
     const dup = Number((h as any)._dupes ?? 0);
     console.log(`${score}  ${h.repo}  ${h.source}/${h.tier}  ${h.role}  ${h.ts}` +
                 (dup ? `   (+${dup} identical cop${dup === 1 ? "y" : "ies"} elsewhere)` : ""));
-    console.log(`  ${h.text.replace(/\s+/g, " ").trim().slice(0, 220)}`);
+    const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
+    if (c) console.log(`  ${channelHead(c)}`);
+    console.log(`  ${(c ? c.body : h.text).replace(/\s+/g, " ").trim().slice(0, 220)}`);
     const eph = ephemeralNote(h.text, bankOfHit(h.repo));
     if (eph) console.log(eph);
     console.log(`  -> show ${h.file_path} --seq ${h.seq}\n`);
@@ -582,20 +653,33 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    * the caller picks the regime, because the caller knows whether they are recalling a
    * phrase or describing an idea, and a classifier would be guessing at that.
    */
+  // Facet values are checked here, where a mistake can still be said out loud: inside the
+  // fan-out, a bare `--via` (true) threw in every shard and read as "no matches".
+  let facets: { via?: string; chat?: string; fromUser?: string };
+  try {
+    facets = { via: facetArg("--via", f.via), chat: facetArg("--chat", f.chat), fromUser: facetArg("--from-user", f["from-user"]) };
+  } catch (e) { console.error(String((e as Error).message)); process.exit(1); }
+  if (f.semantic && (facets.via || facets.chat || facets.fromUser)) {
+    console.error("--via/--chat/--from-user filter the lexical search only; --semantic would ignore them.");
+    console.error("  drop --semantic, or drop the facet flag.");
+    process.exit(1);
+  }
+
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms, generic, degraded } = await searchEvents(q, {
+  const { hits, shards: searched, ms, capped, generic, degraded, unfaceted, unfacetedTurns } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
     org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
+    ...facets,
     allTiers: Boolean(f["all-tiers"] || f.tier),
     warnGeneric: !f["no-warn"],
   });
 
   const filters: Record<string, string> = {};
-  for (const k of ["repo", "worktree", "path", "tier", "source"]) if (f[k]) filters[k] = String(f[k]);
+  for (const k of ["repo", "worktree", "path", "tier", "source", "via", "chat", "from-user"]) if (f[k]) filters[k] = String(f[k]);
   trace({
     ts: new Date().toISOString(), q, chars: [...q].length, filters,
     shards: searched, hits: hits.length, ms, // strip the bank — the trace log keys on the bare repo
@@ -616,6 +700,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.error(`    Or narrow the scope: --repo/--since/--worktree.  Or try --semantic for a paraphrase.`);
     console.error(`    Suppress this warning: --no-warn`);
   }
+  if (unfaceted)
+    console.error(`\n  ⚠ ${fmt(unfacetedTurns ?? 0)} channel turns in ${fmt(unfaceted)} of ${fmt(searched)} shards were indexed` +
+                  ` before channel facets — --via/--chat/--from-user cannot match them.` +
+                  `\n    relic index --backfill-channel   fills them in place, from the text already stored`);
 
   // `--limit 0` (and negative) means "all", the same idiom recap teaches — so show every
   // hit the store returned rather than slicing to nothing. The store already unbounded the
@@ -624,8 +712,11 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const mode = outFmt(f);
 
   if (mode === "json") {
+    // `exhaustive: false` makes `total` a floor — the flag a script needs before it divides by it.
     console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length,
-                                 degraded: degraded ?? [], hits: top }, null, 2));
+                                 exhaustive: !capped, capped: capped ?? 0,
+                                 degraded: degraded ?? [], ...(unfaceted !== undefined && { unfaceted, unfacetedTurns }),
+                                 hits: top }, null, 2));
     return;
   }
   if (mode === "jsonl") {
@@ -659,8 +750,10 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   const fresh = await answerFreshness(
     [...new Set(top.map(h => byKey.get(h.repo)).filter(Boolean) as string[])]);
   const age = fresh ? `  ·  indexed ${humanAge(fresh.ageSec)} ago` : "";
-  console.log(`${top.length} of ${hits.length} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
+  console.log(`${matchCount(top.length, hits.length, capped)} match(es) for ${q} · ${searched} shards · ${ms} ms${age}` +
     (narrowed ? `  ·  main sessions only — add --all-tiers for subagent/workflow work` : ""));
+  const floor = floorNote(capped, searched, limit);
+  if (floor) console.log(`  ${floor}. --limit 0 reads every match.`);
   if (lossy) console.log(`  ${lossy}`);
   // Loud past a day: at that point "no hits from repo X" usually means "not indexed".
   if (fresh && fresh.ageSec > 86_400) {
@@ -673,10 +766,14 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
   }
   console.log("");
   for (const h of top) {
-    const i = h.text.toLowerCase().indexOf(q.toLowerCase());
-    const snip = i < 0 ? h.text.slice(0, 160) : h.text.slice(Math.max(0, i - 60), i + q.length + 80);
+    // A channel hit says who, where and when, then the words — not 180 chars of routing.
+    const c = h.role === "user" ? parseChannelEnvelope(h.text) : null;
+    const text = c ? c.body : h.text;
+    const i = text.toLowerCase().indexOf(q.toLowerCase());
+    const snip = i < 0 ? text.slice(0, 160) : text.slice(Math.max(0, i - 60), i + q.length + 80);
     const wt = h.worktree ? `  [${h.worktree}]` : "";
     console.log(`${h.repo.replace("github.com/", "")}${wt}  ${h.source}/${h.tier}  ${h.role} ${h.ts}`);
+    if (c) console.log(`  ${channelHead(c)}`);
     console.log(`  ...${snip.replace(/\s+/g, " ").trim()}...`);
     // Flagged against the WHOLE event text, not the 160-char snippet — the path that
     // matters is usually a tool's output line, not the part that matched the query.
@@ -698,7 +795,8 @@ async function cmdShow(path: string, f: Record<string, string | boolean>) {
   }, (f["data-root"] as string) ?? null);
 
   for (const l of await readAround(path, Number(f.seq ?? 1), Number(f.before ?? 2), Number(f.after ?? 2)))
-    console.log(`${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ${l.text.replace(/\s+/g, " ").slice(0, 300)}`);
+    console.log(`${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ` +
+                `${(l.role === "user" ? saidText(l.text) : l.text).replace(/\s+/g, " ").slice(0, 300)}`);
 }
 // ---- session (resolve one id) ----
 async function cmdSession(id: string, f: Record<string, string | boolean>) {
@@ -730,7 +828,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
     console.log(`${uuids.size} sessions named like "${id}"\n`);
     for (const r of rows)
       console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
-                  `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}`);
+                  `${String(r.event_count).padStart(6)} ev  ${r.repo.replace("github.com/", "")}  ${nameOf(r)}` +
+                  (roomTag(r) ? `  ${roomTag(r)}` : ""));
     console.log(`\npick one:  relic session <id>`);
     return;
   }
@@ -746,7 +845,8 @@ async function cmdSession(id: string, f: Record<string, string | boolean>) {
   }
 
   const wt = st.worktree ? ` [${st.worktree}]` : "";
-  console.log(`${nameOf(parent)}\n`);
+  const room = roomTag(parent);
+  console.log(`${nameOf(parent)}${room ? `  ${room}` : ""}\n`);
   console.log(`${parent.session_uuid}  ·  matched by ${matchedBy}  ·  ${st.repo.replace("github.com/", "")}${wt}`);
   console.log(`${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)}` +
               `  ·  ${fmt(st.transcripts)} transcript${st.transcripts === 1 ? "" : "s"}  ·  ${fmt(st.events)} ev` +
@@ -828,7 +928,8 @@ async function cmdSessions(f: Record<string, string | boolean>) {
     const wt = r.worktree ? `  [${r.worktree}]` : "";
     const kids = r.children ? ` +${r.children}` : "";
     console.log(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}${kids.padEnd(5)}  ${String(r.treeEvents).padStart(6)} ev  ${r.repo.replace("github.com/", "")}${wt}`);
-    console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}`);
+    const room = roomTag(r);
+    console.log(`    ${nameOf(r).replace(/\s+/g, " ").slice(0, 96)}${room ? `  ${room}` : ""}`);
   }
   if (total > top.length) console.log(`\n... and ${total - top.length} more (--limit N)`);
 }
@@ -871,23 +972,29 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * line by the time a human types, so without the exclusion `tail` would hand you your
  * own empty transcript.
  */
-async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
-  const { encodeProjectDir, sessionIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
+async function previousSessionFile(cwd: string): Promise<{ file: string; id: string; why: "here" | "session_key" } | null> {
+  const { encodeProjectDir, sessionIdFromEnv, hermesIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
   const { readdirSync, statSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const me = sessionIdFromEnv()?.id ?? "";
+  // A transcript is named by a Claude or Codex id; a Hermes id never names a file.
+  const host = sessionIdFromEnv();
+  const me = host && host.via !== "HERMES_SESSION_ID" ? host.id : "";
   const enc = encodeProjectDir(cwd);
   const found: { file: string; id: string; mtime: number }[] = [];
   for (const root of liveRoots()) {
     const dir = join(root, enc);
-    try {
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith(".jsonl")) continue;
-        const id = name.slice(0, -6);
-        if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
-        try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); } catch {}
-      }
-    } catch { /* root without this project */ }
+    let names: string[];
+    // A root without this project is ENOENT, and quiet. An unreadable one used to give
+    // the same "no earlier session found" while the session sat right there (#99).
+    try { names = readdirSync(dir); }
+    catch (e) { dirUnreadable(dir, e); continue; }
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const id = name.slice(0, -6);
+      if (me && id.startsWith(me.slice(0, 8))) continue;      // never my own transcript
+      try { found.push({ file: join(dir, name), id, mtime: statSync(join(dir, name)).mtimeMs }); }
+      catch (e) { walkError(join(dir, name), e); }
+    }
   }
   const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
@@ -897,7 +1004,7 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * join the SAME ranking instead of being tried only when the transcripts come up
    * empty. The newest session is the answer, whichever host wrote it.
    */
-  const { hermesSessionsIn } = await import("./live-hermes.js");
+  const { hermesSessionsIn, hermesPredecessor } = await import("./live-hermes.js");
   const cands = [
     ...ranked.map(c => ({ file: c.file, id: c.id, at: c.lastEventMs ?? c.mtimeMs })),
     ...hermesSessionsIn(cwd).map(h => ({ file: h.path, id: h.id, at: h.lastMs })),
@@ -919,10 +1026,32 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
-      if (human && p.events.length > 2) return { file: c.file, id: c.id };
+      if (human && p.events.length > 2) return { file: c.file, id: c.id, why: "here" };
     } catch { /* unreadable: try the next */ }
   }
-  return cands[0] ?? null;      // nothing substantial — hand back the newest and say so
+
+  /*
+   * NOTHING HERE WORTH READING, AND THE CALLER IS A HERMES SESSION: follow its own line.
+   *
+   * A gateway session (Discord, say) records no cwd, so no directory can hand it back —
+   * the case #100 reported. It does name itself in HERMES_SESSION_ID, and its row carries
+   * a session_key, so the session before it on that key is the conversation it continues.
+   *
+   * Tried only after the directory comes up empty or stubs-only, never before it: the
+   * environment cannot say which host is innermost, and a Claude session started from a
+   * Hermes shell inherits the variable. It still beats a stub, which is worse than no
+   * answer for the reason above.
+   */
+  const prior = hermesPredecessor(hermesIdFromEnv());
+  if (prior) return { file: prior.path, id: prior.id, why: "session_key" };
+  return cands[0] ? { file: cands[0].file, id: cands[0].id, why: "here" } : null;   // hand back the newest and say so
+}
+
+/** Which session was resolved, and by which rule. STDERR, not stdout — see recapTarget. */
+function resolvedBanner(prev: { id: string; why: "here" | "session_key" }): string {
+  const rule = prev.why === "session_key" ? "the session before this one on its Hermes session_key"
+                                         : "newest session here that is not this one";
+  return `\u2190 ${shortId(prev.id)}  (${rule})`;
 }
 
 /*
@@ -979,11 +1108,14 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
   console.log("");
 
   for (const e of tail) {
-    // A channel envelope is ~180 chars of routing before a word the human typed.
-    const t = (e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
+    // A channel envelope is ~180 chars of routing before a word the human typed. What
+    // survives of it is the sender — `nazt_ (discord): ` — OUTSIDE the budget, so
+    // --chars is spent on the words.
+    const c = e.role === "user" ? parseChannelEnvelope(e.text) : null;
+    const t = (c ? c.body : e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
     if (!t) continue;
     const cut = handoffBudget(e.role, chars);
-    const body = t.length > cut ? t.slice(0, cut) + " …" : t;
+    const body = (c ? `${senderOf(c)}: ` : "") + (t.length > cut ? t.slice(0, cut) + " …" : t);
     // The human unmarked at the margin, the assistant indented under it: the block
     // reads as what was asked, with what it was answering underneath.
     console.log(e.role === "user" ? `  ${body}` : `      · ${body}`);
@@ -1008,7 +1140,7 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
     // not data. On stdout it lands inside `--json` output and makes it unparseable:
     // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
     // line was an arrow. Found by piping the new default into jq.
-    console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
+    console.error(resolvedBanner(prev));
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
@@ -1151,8 +1283,18 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
                 `  drop --flat for exchanges, or --role user for what was asked.`);
   console.log("");
   for (const e of tail) {
-    console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}`);
-    const text = chars > 0 ? e.text.slice(0, chars) + (e.text.length > chars ? " …" : "") : e.text;
+    /*
+     * A channel turn is headed by its sender, and by THEIR clock when it disagrees with
+     * the transcript's by a minute or more. Usually it does not — median 195 ms over
+     * 2,777 real channel turns — but 29 waited over a minute and 13 over an hour, and
+     * those are the turns whose timing the transcript misreports.
+     */
+    const c = e.role === "user" ? parseChannelEnvelope(e.text) : null;
+    const lag = c ? Math.abs(Date.parse(e.ts ?? "") - Date.parse(c.sent_ts)) : 0;
+    console.log(`#${String(e.seq).padStart(5)} ${e.role}${e.ts ? `  ${localDateTime(e.ts)}` : ""}` +
+                (c ? `  ·  ${senderOf(c)}${lag >= 60_000 ? `, sent ${localDateTime(c.sent_ts)}` : ""}` : ""));
+    const said = c ? c.body : e.text;
+    const text = chars > 0 ? said.slice(0, chars) + (said.length > chars ? " …" : "") : said;
     console.log(text.replace(/^/gm, "  "));
     console.log();
   }
@@ -1216,6 +1358,18 @@ async function cmdReport(f: Record<string, string | boolean>) {
 
 // ---- status ----------------------------------------------------------------
 /**
+ * Every flag that narrowed a language measurement rides into the embed command it prints,
+ * so "continue with" acts on the scope that was measured — never silently on the whole index.
+ */
+function embedScopeArgs(f: Record<string, string | boolean>): string[] {
+  const out: string[] = [];
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+    if (typeof f[k] === "string") out.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) out.push(`--${k}`);
+  return out;
+}
+
+/**
  * `relic langs` — the language mix of the embeddable corpus, and which measured model
  * fits it. Read-only: it samples `events` and reads `vectors` stats, never writes.
  */
@@ -1225,12 +1379,7 @@ async function cmdLangs(f: Record<string, string | boolean>) {
     console.error("--sample takes a whole number N >= 1 (read 1 event in N; 1 reads every event)");
     process.exit(1);
   }
-  // Every flag that narrowed the measurement rides into the printed embed command, so
-  // "continue with" acts on the scope that was measured — never silently on the whole index.
-  const scopeArgs: string[] = [];
-  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
-    if (typeof f[k] === "string") scopeArgs.push(`--${k}`, f[k] as string);
-  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) scopeArgs.push(`--${k}`);
+  const scopeArgs = embedScopeArgs(f);
   const bar = progress();
   const r = await scanLangs({
     scopeArgs,
@@ -1262,6 +1411,8 @@ async function cmdLangs(f: Record<string, string | boolean>) {
  * full-text index WINS (MRR@20 0.890 vs 0.600 for the best of three models, bench/),
  * so embedding is opt-in, resumable, and scoped: `--repo`, `--bank` and `--limit` all
  * narrow it, and `--dry-run` answers "how much would this cost" without an HTTP call.
+ * Either way the scope's languages are measured first, and an English-only model on a
+ * scope that carries Thai is refused unless --force: see checkEmbedModel in langs.ts.
  */
 async function cmdEmbed(f: Record<string, string | boolean>) {
   const o = {
@@ -1283,12 +1434,30 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     dryRun: Boolean(f["dry-run"]),
     session: f.session ? String(f.session) : undefined,
     reset: Boolean(f.reset),
+    force: Boolean(f.force),
+    scopeArgs: [...embedScopeArgs(f), ...(f.session ? ["--session", String(f.session)] : [])],
+    repair: Boolean(f.repair),
   };
+  // The run's own flags, minus scope and the two that would defeat a repair (a dry run
+  // never repairs; --reset throws away what a repair keeps). A damaged shard's repair
+  // command is this run, narrowed to that shard — see damageNote().
+  const carry: string[] = [];
+  for (const k of ["data-root", "provider", "model", "host", "device", "batch", "limit", "min-chars", "max-chars", "session"] as const)
+    if (typeof f[k] === "string") carry.push(`--${k}`, f[k] as string);
+  for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) carry.push(`--${k}`);
 
   let last = 0;
   const bar = progress();
   const r = await embedShards({
     ...o,
+    // The check reads every shard in scope, which is seconds on a whole index: on a
+    // terminal, show where it is. Piped, it stays silent unless it has something to say.
+    onCheckProgress: (done, total, key) => {
+      if (outFmt(f) === "pretty" && process.stderr.isTTY)
+        bar.tick(`  language check  ${done}/${total} shards  ${key}   `, (done / total) * 100);
+    },
+    // Before any provider call, and on stderr, so --json stays one parseable document.
+    onCheck: c => { bar.clear(); const s = renderEmbedCheck(c, o.dryRun); if (s) console.error(s + "\n"); },
     onProgress: p => {
       // Was `!== "text"`, a value outFmt never returns, so it never drew; the Python port says "pretty".
       if (outFmt(f) !== "pretty" || p.done - last < 200) return;
@@ -1298,8 +1467,14 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   });
   bar.clear();
 
-  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
-  if (outFmt(f) === "jsonl") { for (const sh of r.shards) console.log(JSON.stringify(sh)); return; }
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); if (r.refused) process.exit(1); return; }
+  if (outFmt(f) === "jsonl") {
+    for (const sh of r.shards) console.log(JSON.stringify(sh));
+    if (r.refused) { console.log(JSON.stringify({ refused: true, check: r.check })); process.exit(1); }
+    return;
+  }
+  // Why is already on stderr: the check printed it before the embed pass began.
+  if (r.refused) process.exit(1);
 
   const touched = r.shards.filter(sh => sh.eligible > 0 || sh.skipped);
   if (!touched.length) {
@@ -1315,8 +1490,13 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   console.log(`provider  ${r.providerId}${r.dryRun ? "   (dry run — nothing written)" : ""}`);
   console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}\n`);
   const w = Math.max(6, ...touched.map(sh => sh.key.length));
-  for (const sh of touched.slice(0, Number(f.limit ?? 40))) {
-    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); continue; }
+  // A damaged shard is listed even past the --limit display cap, because its line carries
+  // the only command that repairs it.
+  const cap = Number(f.limit ?? 40);
+  const shown = [...touched.slice(0, cap), ...touched.slice(cap).filter(sh => sh.damage)];
+  for (const sh of shown) {
+    const note = damageNote(sh, carry).map(l => `  ${"".padEnd(w)}        ${l}`);
+    if (sh.skipped) { console.log(`  ${sh.key.padEnd(w)}  SKIP  ${sh.skipped}`); note.forEach(l => console.log(l)); continue; }
     const cov = sh.eligible ? Math.round((sh.already + sh.embedded) / sh.eligible * 100) : 0;
     console.log(`  ${sh.key.padEnd(w)}  ${String(cov).padStart(3)}%  ` +
                 `${fmt(sh.already + sh.embedded)}/${fmt(sh.eligible)} embedded` +
@@ -1324,6 +1504,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
                 (sh.pending && r.dryRun ? `  ${fmt(sh.pending)} pending` : "") +
                 (sh.failed ? `  ${fmt(sh.failed)} FAILED` : "") +
                 (sh.dim ? `  dim ${sh.dim}` : ""));
+    note.forEach(l => console.log(l));
   }
   const secs = r.ms / 1000;
   console.log(`\n${fmt(r.embedded)} embedded · ${fmt(r.pending)} pending · ${fmt(r.failed)} failed` +
@@ -1331,6 +1512,10 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
               (r.embedded && secs > 0 ? `  (${(r.embedded / secs).toFixed(0)}/s)` : ""));
   if (r.dryRun) console.log(`\nre-run without --dry-run to write. Vectors go to the per-shard`);
   if (r.dryRun) console.log(`\`vectors\` table; \`events\` and the full-text index are untouched.`);
+  // The check's block printed above the shard list, which can run 40 lines; say it again here.
+  if (r.dryRun && r.check.action === "refuse")
+    console.log(`\nBut the language check refuses ${r.providerId} for this scope, so a real run stops before` +
+                ` embedding anything: pick a multilingual model above, or add --force.`);
 }
 
 async function cmdStatus(f: Record<string, string | boolean>) {
@@ -1565,10 +1750,13 @@ async function cmdNow(f: Record<string, string | boolean>) {
     console.log(`no session transcript for this directory`);
     console.log(`  ${process.cwd()}`);
     console.log(`  relic now --all   to see every active session on this machine`);
+    for (const note of hermesOffNotes()) console.log(`  ${note}`);
     return;
   }
 
-  const all = treeFiles(cur.projectDir, cur.sessionUuid);
+  // Asked BEFORE treeFiles: a Hermes session is a row in state.db, so its projectDir is
+  // a file, and probing a transcript tree beneath it reads as an unreadable path (#99).
+  const all = cur.source === "hermes" ? [] : treeFiles(cur.projectDir, cur.sessionUuid);
   const liveFiles = all.filter(x => x.ageSec <= windowSec);
 
   if (mode === "json") {
@@ -1576,6 +1764,15 @@ async function cmdNow(f: Record<string, string | boolean>) {
     return;
   }
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
+
+  if (cur.source === "hermes") {
+    // Named by HERMES_SESSION_ID: no transcript tree to count and no timeline to draw.
+    console.log(`${cur.title ?? "(untitled)"}\n`);
+    console.log(`${cur.sessionUuid}  ·  last message ${humanAge(cur.eventAgeSec ?? cur.ageSec)} ago`);
+    console.log(cur.confident ? cur.cwd : `(no cwd recorded — a gateway session)`);
+    console.log(`hermes  ${cur.projectDir}`);
+    return;
+  }
 
   console.log(`${cur.title ?? "(untitled)"}\n`);
   console.log(`${cur.sessionUuid}  ·  ${clockLabel(cur.ageSec, cur.eventAgeSec)}`);
@@ -1635,6 +1832,9 @@ async function cmdLineage(arg: string | undefined, f: Record<string, string | bo
       }
       l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
     }
+  } else if (cur?.source === "hermes") {
+    // The caller is a Hermes session (HERMES_SESSION_ID): its line comes from state.db.
+    l = buildHermesLineage(cur.projectDir, cur.sessionUuid, { all });
   } else {
     if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
     if (!isClaudeProjectDir(cur.projectDir)) {

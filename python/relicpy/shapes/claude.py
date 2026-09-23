@@ -12,7 +12,7 @@ import os
 import re
 
 from ..models import ParsedEvent, ParsedFile
-from ..types import as_obj, block_role, flatten_content, s, strip_envelope, tree_key_of, truncate, uid_of
+from ..types import as_obj, block_role, flatten_content, parse_channel_envelope, s, strip_envelope, tree_key_of, truncate, uid_of
 
 # Roles whose text is worth full-text indexing. UI/state events are counted, not indexed.
 INDEXED = {"user", "assistant", "system"}
@@ -92,9 +92,12 @@ def parse(file_path: str) -> ParsedFile:
 
             if not description and role == "user":
                 description = truncate(strip_envelope(text), 200)
+            # A channel plugin's routing, as facets beside the text — never in place of it.
+            channel = parse_channel_envelope(text) if role == "user" else None
             events.append(ParsedEvent(
                 uid=uid_of("claude", uid_key, seq),    # root-independent by design
                 seq=seq, role=role, ts=ts, text=truncate(text), cwd=line_cwd,
+                channel=channel,
             ))
 
     return ParsedFile(

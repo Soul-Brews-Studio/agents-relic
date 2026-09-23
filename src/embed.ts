@@ -1,5 +1,6 @@
-import { LanceStore, type VectorRow } from "./store/lance.js";
+import { LanceStore, type VectorRow, type VectorDamage } from "./store/lance.js";
 import { pickShards, type Scope } from "./query.js";
+import { checkEmbedModel, type EmbedCheck } from "./langs.js";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -243,6 +244,11 @@ export interface EmbedOpts extends Scope {
   dryRun?: boolean;
   session?: string;       // embed ONE session — the /forward + /new unit
   reset?: boolean;        // drop `vectors` first — the only way to change model/dim
+  force?: boolean;        // embed with an English-only model on a scope that is not — see checkEmbedModel
+  scopeArgs?: string[];   // the flags that set this scope, echoed into the commands the check prints
+  onCheck?: (c: EmbedCheck) => void;   // once, after the language check and before any provider call
+  onCheckProgress?: (done: number, total: number, key: string) => void;   // per shard the check samples
+  repair?: boolean;       // restore (or, failing that, drop) a `vectors` table that no longer reads — #105
   onProgress?: (p: { shard: string; done: number; pending: number }) => void;
 }
 
@@ -255,12 +261,56 @@ export interface ShardEmbedStat {
   failed: number;
   model: string; dim: number;
   skipped?: string;      // why this shard was left alone
+  damage?: VectorDamage;             // `vectors` failed to read — see LanceStore.vectorDamage()
+  repaired?: "restored" | "dropped"; // what --repair did about it
+}
+
+type ShardResult = Omit<ShardEmbedStat, "key" | "bank" | "repo" | "model">;
+
+const fmtN = (n: number) => n.toLocaleString("en-US");
+const quote = (a: string) => /^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`;
+
+/** The Lance error, without the "Error: ... stream:" wrapper or the rustc source location. */
+function lanceReason(error: string): string {
+  return /LanceError\([^)]*\): [^,\n]*/.exec(error)?.[0] ?? error.replace(/^Error: /, "").slice(0, 120);
+}
+
+/**
+ * What to say under a shard whose `vectors` table failed to read (#105).
+ *
+ * Unrepaired: what is safe, and the ONE command that repairs this shard and nothing
+ * else. `carry` is the caller's own flags minus scope, which the command replaces.
+ * Provider and model have to ride along, because after the repair the same run carries
+ * on embedding, and a different model would only meet the mismatch guard. --data-root
+ * has to ride along too: a command that dropped it would act on the live index instead
+ * of the one that was read. --repair can only ever restore or drop a table that fails to
+ * read, so even if `--repo` matches as a substring, no healthy table is touched.
+ *
+ * Repaired: what was done, and what it kept.
+ */
+export function damageNote(sh: ShardEmbedStat, carry: string[], program = "relic"): string[] {
+  const d = sh.damage;
+  if (!d) return [];
+  if (sh.repaired === "restored")
+    return [`repaired: restored v${d.restorable} of \`vectors\`, keeping ${fmtN(d.keep)} of ${fmtN(d.rows)} rows; v${d.version} did not read`];
+  if (sh.repaired === "dropped")
+    return [`repaired: dropped \`vectors\` — no version of it read — so this run embeds the shard from scratch`];
+  const cmd = [program, "embed", "--repair", "--bank", sh.bank, "--repo", sh.repo, ...carry].map(quote).join(" ");
+  return [
+    `\`events\` and the full-text index are untouched. To repair this shard's vectors only:`,
+    `  ${cmd}`,
+    d.restorable === null
+      ? `no version of the table reads, so that drops it and re-embeds the shard`
+      : `that restores v${d.restorable} (${fmtN(d.keep)} of ${fmtN(d.rows)} vectors) and re-embeds the rest`,
+  ];
 }
 
 export interface EmbedTally {
   shards: ShardEmbedStat[];
   embedded: number; failed: number; pending: number;
   ms: number; dryRun: boolean; providerId: string;
+  check: EmbedCheck;      // the scope's languages against the model, measured before anything else
+  refused: boolean;       // the check stopped this run before the embed pass: no provider called
 }
 
 // -------------------------------------------------------------------- the driver
@@ -269,9 +319,7 @@ export interface EmbedTally {
  * One shard. Resumable by construction: the anti-join is against what is ON DISK, so
  * an interrupted run is re-entered by simply running the command again.
  */
-export async function embedShard(
-  store: LanceStore, p: EmbedProvider, o: EmbedOpts,
-): Promise<{ eligible: number; already: number; pending: number; embedded: number; failed: number; dim: number; skipped?: string }> {
+export async function embedShard(store: LanceStore, p: EmbedProvider, o: EmbedOpts): Promise<ShardResult> {
   const minChars = o.minChars ?? 24;
   const maxChars = o.maxChars ?? 2000;
   const batch = Math.max(1, o.batch ?? 64);
@@ -281,23 +329,52 @@ export async function embedShard(
   // --reset before the stats read, so the mismatch guard below sees the post-drop state
   // rather than refusing on vectors this run is about to discard anyway.
   if (o.reset && !o.dryRun) await store.dropVectors();
-  const prior = await store.vectorStats();
+
+  let prior: Awaited<ReturnType<LanceStore["vectorStats"]>>;
+  let todo: { uid: string; text: string }[];
+  try {
+    prior = await store.vectorStats();
+    /*
+     * A FixedSizeList has ONE width. Writing a 1024-dim vector into a table created at
+     * 384 fails mid-batch, after an arbitrary amount of work has already landed — so the
+     * mismatch is caught here, before the first HTTP call, and the shard is skipped with
+     * a reason rather than half-written. Changing model is a delete-and-rerun, and saying
+     * so is cheaper than discovering it 40 minutes in.
+     */
+    if (prior && prior.rows > 0 && prior.model && prior.model !== p.id) {
+      return { eligible, already: prior.rows, pending: 0, embedded: 0, failed: 0, dim: prior.dim,
+               skipped: `holds ${prior.rows} vectors from ${prior.model} (dim ${prior.dim}); ` +
+                        `re-embed with ${p.id} by adding --reset (drops this shard's vectors table only)` };
+    }
+    todo = await store.unembedded({ limit: o.limit, mainTiers, minChars, session: o.session });
+  } catch (err) {
+    /*
+     * A VECTORS TABLE THAT NO LONGER READS (#105).
+     *
+     * The anti-join is the first read to touch every row of `vectors`, so this is where
+     * the damage shows. It used to show as a bare SKIP carrying a Lance IO error. That
+     * repeated on every run, and the only way out was `rm -rf .../vectors.lance`: a full
+     * re-embed, which took 262 s for 1.4k events and would take hours at 3M.
+     *
+     * The diagnosis runs only after a read has failed, so a healthy shard pays nothing
+     * for it. If `vectors` still reads, the failure came from somewhere else (`events`,
+     * say) and is rethrown unchanged, so nothing is dropped on a guess. Without --repair,
+     * the shard is skipped with the damage attached, and the caller prints the one
+     * command that repairs this shard. A dry run never repairs.
+     */
+    const damage = await store.vectorDamage();
+    if (!damage) throw err;
+    if (!o.repair || o.dryRun)
+      return { eligible, already: 0, pending: 0, embedded: 0, failed: 0, dim: 0, damage,
+               skipped: `vectors table unreadable at v${damage.version} — ${lanceReason(damage.error)}` };
+    const repaired = await store.repairVectors(damage);
+    // Start over on the repaired table, so the counts, the model guard and the anti-join
+    // all read it fresh. With repair off, a table that still fails is reported, not
+    // repaired in a loop.
+    return { ...(await embedShard(store, p, { ...o, repair: false, reset: false })), damage, repaired };
+  }
   const already = prior?.rows ?? 0;
 
-  /*
-   * A FixedSizeList has ONE width. Writing a 1024-dim vector into a table created at
-   * 384 fails mid-batch, after an arbitrary amount of work has already landed — so the
-   * mismatch is caught here, before the first HTTP call, and the shard is skipped with
-   * a reason rather than half-written. Changing model is a delete-and-rerun, and saying
-   * so is cheaper than discovering it 40 minutes in.
-   */
-  if (prior && prior.rows > 0 && prior.model && prior.model !== p.id) {
-    return { eligible, already, pending: 0, embedded: 0, failed: 0, dim: prior.dim,
-             skipped: `holds ${prior.rows} vectors from ${prior.model} (dim ${prior.dim}); ` +
-                      `re-embed with ${p.id} by adding --reset (drops this shard's vectors table only)` };
-  }
-
-  const todo = await store.unembedded({ limit: o.limit, mainTiers, minChars, session: o.session });
   if (o.dryRun || !todo.length)
     return { eligible, already, pending: todo.length, embedded: 0, failed: 0, dim: prior?.dim ?? 0 };
 
@@ -329,10 +406,23 @@ export async function embedShard(
   return { eligible, already, pending: todo.length, embedded, failed, dim };
 }
 
-export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
+/** `p` comes from the flags unless a caller hands one in, which is how the tests run offline. */
+export async function embedShards(
+  o: EmbedOpts = {},
+  p: EmbedProvider = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device),
+): Promise<EmbedTally> {
   const t0 = Date.now();
-  const p = providerFor(o.provider ?? "ollama", o.model ?? "all-minilm", o.host, o.device);
-  const shards = pickShards(o);
+  // The scope's languages against the model, BEFORE any provider call: the population is
+  // the one embedShard reads below, sampled 1 in 64 by uid.
+  const check = await checkEmbedModel(p.id, {
+    dataRoot: o.dataRoot, inRepo: o.inRepo, repo: o.repo, bank: o.bank, session: o.session,
+    mainTiers: o.mainTiers !== false, minChars: o.minChars ?? 24, maxChars: o.maxChars ?? 2000,
+    scopeArgs: o.scopeArgs, force: o.force, onProgress: o.onCheckProgress,
+  });
+  o.onCheck?.(check);
+  // A dry run reports the refusal and still counts: it writes nothing and calls no provider.
+  const refused = check.action === "refuse" && !o.dryRun;
+  const shards = refused ? [] : pickShards(o);
   const out: ShardEmbedStat[] = [];
   let embedded = 0, failed = 0, pending = 0;
 
@@ -354,5 +444,5 @@ export async function embedShards(o: EmbedOpts = {}): Promise<EmbedTally> {
   // model is 500 MB of RSS that never comes back.
   p.close?.();
   return { shards: out, embedded, failed, pending, ms: Date.now() - t0,
-           dryRun: Boolean(o.dryRun), providerId: p.id };
+           dryRun: Boolean(o.dryRun), providerId: p.id, check, refused };
 }

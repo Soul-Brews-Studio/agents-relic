@@ -277,6 +277,42 @@ class LanceStore:
                 clause = f"({clause}) AND ({where})"
             return t.search().where(clause).limit(limit).to_list()
 
+    def missing_columns(self, table: str, cols: list[str]) -> Optional[list[str]]:
+        """Which of these columns the table lacks — [] when it has them all, None when there
+        is no such table. Mirror of missingColumns in src/store/lance.ts: a filter naming a
+        missing column is a hard error, not an empty result."""
+        t = self._existing(table)
+        if t is None:
+            return None
+        have = set(t.schema.names)
+        return [c for c in cols if c not in have]
+
+    def facet_filter(self, via: Optional[str] = None, chat: Optional[str] = None,
+                     from_user: Optional[str] = None) -> Optional[str]:
+        """The channel-facet predicate for this shard: "" when no facet was asked for, None
+        when the shard cannot match one because it predates the columns.
+
+        strpos, not LIKE, as in the TypeScript: a username is `nazt_`, and in a LIKE
+        pattern `_` matches any character and `%` matches everything."""
+        facets = [(c, v) for c, v in (("via", via), ("chat_id", chat), ("from_user", from_user)) if v]
+        if not facets:
+            return ""
+        if self.missing_columns("events", [c for c, _ in facets]):
+            return None
+        q = lambda v: "'" + v.lower().replace("'", "''") + "'"          # noqa: E731
+        return " AND ".join(f"strpos(lower({c}), {q(str(v))}) > 0" for c, v in facets)
+
+    def unfaceted_channel_texts(self) -> list[str]:
+        """Texts of user rows holding `<channel` with no facets — the caller counts the
+        deliveries among them. From the rows, not the schema: one ordinary index run widens
+        an old shard, and its older channel rows still hold via = ""."""
+        t = self._existing("events")
+        if t is None:
+            return []
+        faceted = self.missing_columns("events", ["via"]) == []
+        where = "role = 'user' AND text LIKE '%<channel%'" + (" AND via = ''" if faceted else "")
+        return [str(r.get("text") or "") for r in t.search().where(where).select(["text"]).limit(0).to_list()]
+
     def main_tiers_filter(self) -> str:
         """The "main" predicate: the human's own thread, plus documents.
 
@@ -375,6 +411,30 @@ class LanceStore:
         return sum(1 for r in q.limit(0).to_list()
                    if len(str(r.get("text") or "")) >= min_chars)
 
+    def lang_rows(self, where: str = "", main_tiers: bool = True, min_chars: int = 24,
+                  max_chars: int = 2000) -> list[dict]:
+        """The embeddable population as (role, text) — what embed's language check reads.
+
+        SAME eligibility as embeddable_count and unembedded, so the mix describes exactly
+        the text a model would be fed: the length is judged on the full text, and only the
+        first `max_chars` is kept. `where` narrows it further — a uid range, which is a
+        uniform sample because a uid is a sha1.
+        """
+        t = self._existing("events")
+        if t is None:
+            return []
+        filters = [f for f in (where, self.main_tiers_filter() if main_tiers else "") if f]
+        q = t.search().select(["role", "text"])
+        if filters:
+            q = q.where(" AND ".join(filters))
+        out: list[dict] = []
+        for r in q.limit(0).to_list():
+            text = str(r.get("text") or "")
+            if len(text) >= min_chars:
+                out.append({"role": str(r.get("role") or ""),
+                            "text": text[:max_chars] if max_chars else text})
+        return out
+
     # ---------------------------------------------------------------- write side
 
     def put_events(self, rows: Iterable[EventRow]) -> None:
@@ -413,6 +473,66 @@ class LanceStore:
         self.db.drop_table("vectors")
         return True
 
+    def vector_damage(self) -> Optional[dict]:
+        """Whether `vectors` still reads end to end, and if it does not, the newest
+        version that does. None means healthy, or no table. Mirrors
+        LanceStore.vectorDamage(), which has the measurements (#105).
+
+        In short: a data file that the current version references ends up 0 bytes, so
+        every scan fails while count_rows(), which reads only the manifest, still
+        answers. A kill alone did not produce that. Lance commits its manifest last, so a
+        killed commit leaves only unreferenced files, including 0-byte `.tmpXXXXXX`
+        staging files. That is why the check is a READ, not a file-size guess. The
+        newest readable version is found by bisection, since an embed only appends:
+        once a version references a damaged file, every later one does too.
+        """
+        t = self._existing("vectors")
+        if t is None:
+            return None
+
+        def reads(tbl) -> str:
+            try:
+                tbl.search().select(["uid"]).limit(0).to_arrow()
+                return ""
+            except Exception as err:          # noqa: BLE001 — any failed read is the finding
+                return str(err)
+
+        error = reads(t)
+        if not error:
+            return None
+        version, rows = t.version, t.count_rows()
+        # A second handle: checkout() is in place, and `t` must stay on the latest.
+        h = self.db.open_table("vectors")
+        older = sorted(v["version"] for v in h.list_versions() if v["version"] < version)
+
+        def reads_at(v: int) -> bool:
+            h.checkout(v)
+            return not reads(h)
+
+        if not older or not reads_at(older[0]):
+            return {"version": version, "rows": rows, "error": error, "restorable": None, "keep": 0}
+        lo, hi = 0, len(older)          # older[lo] reads; older[hi] (or `version`) does not
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if reads_at(older[mid]):
+                lo = mid
+            else:
+                hi = mid
+        h.checkout(older[lo])
+        return {"version": version, "rows": rows, "error": error,
+                "restorable": older[lo], "keep": h.count_rows()}
+
+    def repair_vectors(self, d: dict) -> str:
+        """Put a damaged `vectors` table back to a version that reads. When no version
+        reads, drop it. Restoring loses the least, because the anti-join re-embeds only
+        what that version lacks. restore() writes a NEW version, so the damaged ones stay
+        in the history. Either way only `vectors` is touched."""
+        if d["restorable"] is None:
+            self.drop_vectors()
+            return "dropped"
+        self.db.open_table("vectors").restore(d["restorable"])
+        return "restored"
+
     def _merge(self, name: str, model, key: str, rows: Iterable) -> None:
         data = [r.model_dump() for r in rows]
         if not data:
@@ -430,7 +550,29 @@ class LanceStore:
         if t is None:
             self.db.create_table(name, data=data, schema=model.to_arrow_schema())
             return
+        if self._widen(t, data[0]):
+            t = self._existing(name)      # reopen: the handle predates the new columns
         t.merge_insert(key).when_matched_update_all().when_not_matched_insert_all().execute(data)
+
+    def _widen(self, t, row: dict) -> bool:
+        """Mirror of widen() in src/store/lance.ts: add the columns a row has and the table
+        lacks, backfilled with a scalar default. Without it every shard indexed before a
+        column existed rejects the WHOLE batch — "Field 'via' not found in target schema".
+
+        Scalars only, like the TypeScript: add_columns backfills a scalar default, and a
+        list column added that way lands as text. Numbers get 0.0, because every number on
+        disk is float64 (see models.py).
+        """
+        have = set(t.schema.names)
+        missing = [k for k in row if k not in have]
+        if not missing:
+            return False
+        for k in missing:
+            if isinstance(row[k], bool) or not isinstance(row[k], (str, int, float)):
+                raise ValueError(f"lance: refusing to widen with non-scalar column {k!r} "
+                                 f"({type(row[k]).__name__}) — create a table with the right schema")
+        t.add_columns({k: "''" if isinstance(row[k], str) else "0.0" for k in missing})
+        return True
 
     def delete_events_of(self, file_path: str) -> None:
         """Drop a file's rows before its new generation lands, or the two coexist."""

@@ -25,6 +25,13 @@ export function helpText(): string {
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
+          [--backfill-channel [--apply] [--names] [--bank B] [--repo S]]
+                               fill the channel facets of turns indexed before they
+                               existed, IN PLACE: read from the stored text, written
+                               back by uid — nothing deleted, re-imported or re-read.
+                               DRY BY DEFAULT: counts first; --apply writes that plan.
+                               --names also re-reads transcripts whose session name is
+                               still an envelope tag, and rewrites only that row.
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.
@@ -44,6 +51,9 @@ export function helpText(): string {
                   [--since 7d|2026-09-01] [--until DATE] [--limit N]
                   [--prose]  humans + assistant only — 80% of a transcript is tool traffic
                   [--role user|assistant|tool_use|tool_result|thinking]
+                  [--via S] [--chat S] [--from-user S]  channel turns only: which plugin
+                  it came in by (discord matches plugin:discord:discord), which room or
+                  thread id, who sent it. Substrings, case-blind.
                   [--semantic] nearest-neighbour over relic-embed vectors instead of
                   BM25. A separate MODE, never blended: measured here, FTS wins
                   known-item 0.890 vs 0.600 and loses paraphrase 0.046 vs 0.140.
@@ -74,7 +84,9 @@ export function helpText(): string {
                                NO ARGUMENT = the session before this one, here —
                                so a /new session can read back without being told
                                an id. Found by mtime, never the index. Hermes
-                               sessions that ran in this checkout count too.
+                               sessions that ran in this checkout count too; a
+                               Hermes caller with nothing here gets the session
+                               before it on its session_key (HERMES_SESSION_ID).
                                the LAST N EXCHANGES — what was I just doing. An
                                exchange is the human's turn plus the last thing
                                the agent said before they spoke again. Takes a
@@ -83,7 +95,8 @@ export function helpText(): string {
                                55 of 63 user-channel turns were the tooling itself.
   mcp                          run the MCP server on stdio (same lookups, for a model)
   now|live [--all] [--window 300]  what is running RIGHT NOW — this session, its agents
-                               --all is machine-wide, Hermes sessions (state.db) included
+                               --all is machine-wide, Hermes sessions (state.db) included;
+                               a Hermes caller is named by its HERMES_SESSION_ID
   dig [N] [--deep] [--no-cache] session timeline as JSON — dig.py contract, all 3 tiers
   sessions [--repo S] [--bank B] [--since 24h] [--worktree S] [--count] [--limit 40]
   report  [--since 7d] [--repo S] [--bank B] [--worktree S] [--tree] [--per-repo 4]
@@ -100,8 +113,20 @@ export function helpText(): string {
                                --paths adds the full session id and absolute path.
                                --tree groups them by directory — which RUN is missing.
   embed   [--model all-minilm] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
-                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--dry-run] [--reset]
+                               [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--max-chars 2000]
+                               [--dry-run] [--reset] [--force] [--repair]
                                [--session ID]  embed ONE session — the /forward + /new unit
+                               --model all-minilm, the default, is ENGLISH-ONLY: all-MiniLM
+                               scored 0.006 on Thai paraphrase (bench/). For Thai: --model
+                               bge-m3, or --provider st --model intfloat/multilingual-e5-small.
+                               Before any provider call, embed samples the scope's languages
+                               as langs does, and REFUSES an English-only model when 1% or
+                               more of the events carry Thai, or another non-Latin script.
+                               --force embeds anyway; --dry-run shows the same check.
+                               [--repair]  a shard whose \`vectors\` no longer reads is put back
+                               to its newest version that does (dropped if none does), then
+                               embedding carries on. Without it, that shard SKIPs and prints
+                               the exact command. Only \`vectors\` is ever touched.
                                second pass, opt-in: writes a per-shard \`vectors\` table,
                                never a column on \`events\`. Resumable — re-run to continue.
                                Measured first: FTS beats every model tried here (bench/).
