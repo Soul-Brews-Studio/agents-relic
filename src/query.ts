@@ -123,6 +123,7 @@ export interface SearchResult {
   ms: number;
   total: number;           // hits before the limit slice
   generic?: GenericCheck;  // set when warnGeneric ran; undefined if skipped or < 2 shards
+  degraded?: string[];     // keys of searched shards on the `simple` tokenizer — Thai substrings missed there
 }
 
 /*
@@ -291,10 +292,19 @@ export async function checkGenericQuery(q: string, shards: { dir: string }[]): P
   return decideGeneric(results);
 }
 
+/** One line for a search header when any searched shard fell back to `simple` — null otherwise. */
+export function degradedNote(degraded: string[] | undefined, searched: number): string | null {
+  if (!degraded?.length) return null;
+  const names = degraded.slice(0, 3).map(k => k.replace("github.com/", "")).join(", ");
+  return `\u26A0 ${degraded.length} of ${searched} shards searched use the \`simple\` tokenizer (no ICU where they were ` +
+         `indexed) — Thai word-internal matches are missed there: ${names}${degraded.length > 3 ? ", ..." : ""}`;
+}
+
 export async function searchEvents(q: string, o: SearchOpts = {}): Promise<SearchResult> {
   const limit = o.limit ?? 20;
   const shards = pickShards(o);
   const hits: (EventRow & { repo: string })[] = [];
+  const degraded: string[] = [];
   let searched = 0;
   const t0 = performance.now();
 
@@ -366,6 +376,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
         const store = await LanceStore.open(s.dir);
         for (const h of await store.search(q, opts)) hits.push({ ...h, repo: s.key });
         searched++;
+        if ((await store.ftsTokenizer()) === "simple") degraded.push(s.key);
       } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
     }
   }));
@@ -395,7 +406,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const generic = o.warnGeneric === false ? undefined : (await checkGenericQuery(q, shards)) ?? undefined;
 
   return { hits, shards: searched, available: shards.length,
-           ms: Math.round(performance.now() - t0), total: hits.length, generic };
+           ms: Math.round(performance.now() - t0), total: hits.length, generic, degraded: degraded.sort() };
 }
 
 export interface SemanticOpts extends Scope {
@@ -813,6 +824,8 @@ export interface ShardStat {
   lastIndexed: string;
   /** max(sessions.started_at) — when this shard's newest transcript began. "" if none. */
   newestSession: string;
+  /** The full-text tokenizer: "simple" = Thai substring search degraded, "none" = LIKE scan. */
+  fts: "icu" | "simple" | "none";
 }
 
 /**
@@ -876,7 +889,8 @@ export async function indexStatus(
       const c = await st.counts();
       const fr = s.freshness === false ? { lastIndexed: "", newestSession: "" } : await st.freshness();
       rows.push({ key: sh.key, bank: sh.bank, repo: sh.repo, events: c.events, sessions: c.sessions,
-                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession });
+                  lastIndexed: fr.lastIndexed, newestSession: fr.newestSession,
+                  fts: (await st.ftsTokenizer()) ?? "none" });
     } catch { /* skip unreadable shard */ }
   }
   rows.sort((a, b) => b.events - a.events);

@@ -1,5 +1,5 @@
 import * as lancedb from "@lancedb/lancedb";
-import { Index } from "@lancedb/lancedb";
+import { ensureFtsIndex, type Tokenizer } from "./store/fts.js";
 import { resolveRepoKey, repoKeyOf, contextOf, cwdOfFile } from "./repo.js";
 
 /**
@@ -30,6 +30,7 @@ export interface AttachResult {
   dir: string;
   events: number;
   ftsBuiltMs: number;
+  tokenizer: Tokenizer;
   facets: number;
   repos: number;
   worktrees: number;
@@ -63,13 +64,7 @@ export async function attach(dir: string, opts: { rebuild?: boolean } = {}): Pro
 
   // 1. the full-text index, on their column
   const t0 = Date.now();
-  const has = (await events.listIndices()).some(i => i.columns.includes("text"));
-  if (!has || opts.rebuild) {
-    await events.createIndex("text", {
-      config: Index.fts({ baseTokenizer: "icu", stem: false, maxTokenLength: 128 }),
-      replace: true,
-    });
-  }
+  const { tokenizer } = await ensureFtsIndex(events, { rebuild: opts.rebuild });
   const ftsBuiltMs = Date.now() - t0;
 
   // 2. the facets sidecar, derived from their provenance table
@@ -104,7 +99,7 @@ export async function attach(dir: string, opts: { rebuild?: boolean } = {}): Pro
     }
   }
 
-  return { dir, events: total, ftsBuiltMs, facets: rows.length, repos: repos.size, worktrees: worktrees.size, skippedNoPath };
+  return { dir, events: total, ftsBuiltMs, tokenizer, facets: rows.length, repos: repos.size, worktrees: worktrees.size, skippedNoPath };
 }
 
 export interface AttachedHit {
