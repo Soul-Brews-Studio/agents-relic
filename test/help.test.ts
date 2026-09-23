@@ -45,7 +45,8 @@ describe("the help text parses and is whole", () => {
 
   test("embed marks its default model English-only where the model is chosen (#101)", () => {
     const embed = helpText().split("\n  langs")[0].split("\n  embed")[1];
-    expect(embed).toContain("--model all-minilm, the default, is ENGLISH-ONLY");
+    expect(embed).toContain("--model embeddinggemma, the default, is multilingual");
+    expect(embed).toContain("--model all-minilm is ENGLISH-ONLY");
     expect(embed).toContain("--force");
     expect(embed).toContain("--max-chars 2000");
   });

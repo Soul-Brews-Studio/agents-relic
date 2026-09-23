@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from .embed import DEFAULT_MODEL
 from .models import Scope
 from .progress import Progress
 from .query import floor_note, group_by_bank, index_status, match_count, search_events
@@ -144,7 +145,7 @@ def cmd_embed(a: argparse.Namespace) -> int:
     carry: list[str] = []
     if getattr(a, "data_root", None):
         carry += ["--data-root", a.data_root]
-    for flag, val, default in (("--provider", a.provider, "ollama"), ("--model", a.model, "all-minilm"),
+    for flag, val, default in (("--provider", a.provider, "ollama"), ("--model", a.model, DEFAULT_MODEL),
                                ("--host", a.host, None), ("--device", a.device, None),
                                ("--batch", a.batch, 64), ("--limit", a.limit, None),
                                ("--min-chars", a.min_chars, 24), ("--max-chars", a.max_chars, 2000)):
@@ -1173,10 +1174,10 @@ def main(argv: list[str] | None = None) -> int:
     em.add_argument("--bank"); em.add_argument("--repo")
     em.add_argument("--provider", default="ollama", choices=["ollama", "st"],
                     help="ollama (default, no extra deps) or st (sentence-transformers)")
-    em.add_argument("--model", default="all-minilm",
-                    help="the default, all-minilm, is ENGLISH-ONLY (Thai paraphrase MRR 0.006, "
-                         "bench/). For Thai: bge-m3, or --provider st --model "
-                         "intfloat/multilingual-e5-small")
+    em.add_argument("--model", default=DEFAULT_MODEL,
+                    help="the default, embeddinggemma, is multilingual and sent with its "
+                         "model-card prompts, recorded in the stored id (#101). all-minilm "
+                         "is ENGLISH-ONLY (Thai paraphrase MRR 0.006, bench/)")
     em.add_argument("--host", default=None, help="ollama base URL")
     em.add_argument("--device", default=None, help="st only: cpu | mps | cuda")
     em.add_argument("--batch", type=int, default=64)
@@ -1191,7 +1192,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="drop `vectors` first — the only way to change model or dim")
     em.add_argument("--force", action="store_true",
                     help="embed with an English-only model even when 1%% or more of the "
-                         "scope carries Thai (the default, all-minilm, is English-only)")
+                         "scope carries Thai (all-minilm is English-only)")
     em.add_argument("--repair", action="store_true",
                     help="put a shard whose `vectors` no longer reads back to its newest "
                          "version that does (drop it if none does), then carry on (#105)")

@@ -119,7 +119,7 @@ paraphrase `fa8bc3d958224e8d`, generator `gemma3:27b` `a418f5838eaf`).
 index is only read. Models on MPS via sentence-transformers (`st`) or a local Ollama
 (`ollama`), prefixes from each model card (`bench_models.py`). `embeddinggemma-300m`
 has no `st` row: the HF copy is gated (401). `emb-gemma raw` and `Qwen3, no instruct`
-are controls: raw text both ways, which is what relic's ollama provider sends today.
+are controls: raw text both ways, which is what relic's ollama provider sent before #101.
 
 **Parity.** `bge-m3` through `st` and through Ollama score 0.562/0.563 known-item,
 0.345/0.344 Thai-only, 0.194/0.195 paraphrase — the same model. The Ollama rows are
@@ -170,8 +170,8 @@ in the top 20 for 63.5% of paraphrases (e5-small 32.5%), median rank 8 of 3,000 
 
 **Prompts are half of embeddinggemma's result.** Without its `task:`/`title:` prefixes it
 drops from 0.646 to 0.557 known-item, 0.476 to 0.330 Thai, 0.318 to 0.170 paraphrase —
-back among the others. Qwen3 without its query instruction loses 0.06-0.07 on every set. relic's
-ollama provider sends raw text, so as shipped it would get the `raw` rows.
+back among the others. Qwen3 without its query instruction loses 0.06-0.07 on every set.
+relic's ollama provider sent raw text until #101, which sends the prompts.
 
 **Cost**, `cost.py`, taken at a 1-min load of 4-9 (600 docs cut at 2,000 chars, batch 32,
 M-series MPS; Ollama loads lazily, so its load column is not comparable):

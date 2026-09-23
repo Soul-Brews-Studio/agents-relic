@@ -1,11 +1,12 @@
-import { expect, test, describe, afterAll } from "bun:test";
+import { expect, test, describe, afterAll, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, existsSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lancedb from "@lancedb/lancedb";
 import { LanceStore } from "../src/store/lance.js";
-import { l2normalise, providerFor, queryProviderFor, embedShard, embedShards, damageNote,
+import { l2normalise, providerFor, queryProviderFor, embedShard, embedShards, damageNote, DEFAULT_MODEL,
          type EmbedProvider, type ShardEmbedStat } from "../src/embed.js";
+import { semanticSearch } from "../src/query.js";
 import { checkEmbedModel, renderEmbedCheck, CHECK_MIN_EVENTS, type EmbedCheck } from "../src/langs.js";
 import { shardDirFor } from "../src/repo.js";
 import { uidOf } from "../src/types.js";
@@ -239,6 +240,89 @@ describe("queryProviderFor — reading a writer's id back", () => {
   });
 });
 
+describe("Ollama model-card prompts (#101)", () => {
+  /*
+   * embeddinggemma without its prompts falls from 0.318 to 0.170 paraphrase MRR (#122),
+   * and nothing errors: raw text embeds fine. So what goes over the wire is asserted
+   * here, through a fetch that records the request body instead of reaching Ollama.
+   */
+  const DOC = "title: none | text: ", QUERY = "task: search result | query: ";
+  const GEMMA_ID = "ollama:embeddinggemma+title: none | text:";
+  let sent: { model: string; input: string[] }[] = [];
+  const realFetch = globalThis.fetch;
+  const stub = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    sent.push(body);
+    return new Response(JSON.stringify({
+      embeddings: body.input.map((t: string) => Array.from({ length: 8 }, (_, i) => (t.charCodeAt(i % t.length) % 17) + 1)),
+    }));
+  }) as unknown as typeof fetch;
+  beforeEach(() => { sent = []; globalThis.fetch = stub; });
+  afterEach(() => { globalThis.fetch = realFetch; });
+
+  test("embed sends the document prompt, and records it in the id", async () => {
+    const p = providerFor("ollama", "embeddinggemma");
+    expect(p.id).toBe(GEMMA_ID);
+    await p.embed(["hello", "สวัสดี"]);
+    expect(sent).toEqual([{ model: "embeddinggemma", input: [DOC + "hello", DOC + "สวัสดี"] }]);
+  });
+
+  test("a tagged name finds the same entry, and keeps its tag in the id", () => {
+    expect(providerFor("ollama", "embeddinggemma:300m").id).toBe("ollama:embeddinggemma:300m+title: none | text:");
+  });
+
+  test("the stored id round-trips to the QUERY prompt", async () => {
+    const q = queryProviderFor(providerFor("ollama", "embeddinggemma").id);
+    expect(q.id).toBe("ollama:embeddinggemma+task: search result | query:");
+    await q.embed(["where did we fix the parser"]);
+    expect(sent).toEqual([{ model: "embeddinggemma", input: [QUERY + "where did we fix the parser"] }]);
+    expect(queryProviderFor("ollama:embeddinggemma:300m+title: none | text:").id)
+      .toBe("ollama:embeddinggemma:300m+task: search result | query:");
+  });
+
+  test("an Ollama model with no entry sends raw text, both ways, as before", async () => {
+    const p = providerFor("ollama", "bge-m3");
+    expect(p.id).toBe("ollama:bge-m3");
+    await p.embed(["hello"]);
+    await queryProviderFor(p.id).embed(["a query"]);
+    expect(sent.map(b => b.input)).toEqual([["hello"], ["a query"]]);
+  });
+
+  test("an old id without a prefix still gets raw queries, even for embeddinggemma", async () => {
+    // Written raw before the prompts existed: a prompted query would sit in another space.
+    const q = queryProviderFor("ollama:embeddinggemma");
+    expect(q.id).toBe("ollama:embeddinggemma");
+    await q.embed(["a query"]);
+    expect(sent).toEqual([{ model: "embeddinggemma", input: ["a query"] }]);
+  });
+
+  test("a stored prefix the table does not know is refused, not guessed", () => {
+    expect(() => queryProviderFor("ollama:embeddinggemma+something else:")).toThrow(/no query prompt known/);
+    expect(() => queryProviderFor("ollama:bge-m3+title: none | text:")).toThrow(/no entry/);
+  });
+
+  test("embed then search --semantic: documents prompted one way, the query the other", async () => {
+    const root = join(tmp, "gemma-root");
+    const store = await LanceStore.open(shardDirFor("github.com/o/g", root));
+    await store.putEvents(["the parser dropped a token", "ข้อความภาษาไทยที่ยาวพอจะผ่านเกณฑ์"].map((text, seq) => ({
+      uid: uidOf("claude", "g.jsonl", seq), session_uuid: "s", file_path: "/g.jsonl", repo_key: "github.com/o/g",
+      seq, role: "user", ts: "", text: text + " — long enough to pass min-chars", source: "claude",
+      tier: "session", kind: "transcript", worktree: "", cwd: "", org: "o", project: "", dir: "",
+      mem_type: "", origin_session: "",
+    })));
+    const t = await embedShards({ dataRoot: root });   // the default provider and model
+    expect(t.providerId).toBe(GEMMA_ID);
+    expect(t.embedded).toBe(2);
+    expect((await store.vectorStats())?.model).toBe(GEMMA_ID);
+    expect(sent.flatMap(b => b.input).every(x => x.startsWith(DOC))).toBe(true);
+
+    sent = [];
+    const r = await semanticSearch("parser token", { dataRoot: root, limit: 2 });
+    expect(r.model).toBe(GEMMA_ID);
+    expect(sent).toEqual([{ model: "embeddinggemma", input: [QUERY + "parser token"] }]);
+  });
+});
+
 describe("vectorSearch", () => {
   const mk = async (name: string) => {
     const s = await LanceStore.open(join(tmp, name));
@@ -329,13 +413,14 @@ describe("the language check — embed measures its scope before any provider ca
     expect(p.calls()).toBe(0);
     expect(await vectorsIn(root, "mix")).toBeNull();
 
-    // The multilingual candidates come from recommend(): Ollama first, as embed's default provider.
-    expect(r.check.candidates.map(c => c.model)).toEqual(["bge-m3", "qwen3-embedding:0.6b",
+    // The multilingual candidates come from recommend(): Ollama first, as embed's default
+    // provider, and within it the model bench/ ranked above the smoke-test-only ones.
+    expect(r.check.candidates.map(c => c.model)).toEqual(["embeddinggemma", "bge-m3", "qwen3-embedding:0.6b",
       "intfloat/multilingual-e5-small", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]);
     const text = renderEmbedCheck(r.check);
     expect(text).toContain("embed REFUSED — ollama:all-minilm is English-only, and this scope is not");
     expect(text).toContain("33.3% of eligible events carry Thai, at or above 1.0%");
-    expect(text).toContain("-> relic embed --model bge-m3");
+    expect(text).toContain("-> relic embed --model embeddinggemma");
     expect(text).toContain("--force embeds with ollama:all-minilm anyway. The whole mix, by role, and the vectors on disk: relic langs");
   });
 
@@ -439,7 +524,7 @@ describe("the language check — embed measures its scope before any provider ca
       scopeArgs: ["--session", session] }, provider("ollama:all-minilm"));
     const th = (await run("th")).check;
     expect(th).toMatchObject({ action: "refuse", rate: 1, events: 5, thaiShare: 1 });
-    expect(th.command).toBe("relic embed --model bge-m3 --session th");
+    expect(th.command).toBe("relic embed --model embeddinggemma --session th");
     expect(th.langsCommand).toBe("relic langs");     // langs takes no --session
     expect((await run("en")).check).toMatchObject({ action: "pass", events: 40 });
   });
@@ -448,7 +533,7 @@ describe("the language check — embed measures its scope before any provider ca
     const root = await mkRoot("check-scope-args", { mix: THAI_MIX });
     const c = (await embedShards({ dataRoot: root, repo: "mix", dryRun: true,
       scopeArgs: ["--data-root", root, "--repo", "mix"] }, provider("ollama:all-minilm"))).check;
-    expect(c.command).toBe(`relic embed --model bge-m3 --data-root ${root} --repo mix`);
+    expect(c.command).toBe(`relic embed --model embeddinggemma --data-root ${root} --repo mix`);
     expect(c.langsCommand).toBe(`relic langs --data-root ${root} --repo mix`);
   });
 
@@ -472,26 +557,29 @@ describe("the language check — embed measures its scope before any provider ca
 
     test("a refusal exits 1 with the reason on stderr, and --json stays one document", async () => {
       const root = await mkRoot("check-cli", { mix: THAI_MIX });
-      const plain = relic(root);
+      // all-minilm by name: the default is multilingual now, and passes this scope.
+      const plain = relic(root, "--model", "all-minilm");
       expect(plain.code).toBe(1);
       expect(plain.stderr).toContain("embed REFUSED — ollama:all-minilm is English-only");
       expect(plain.stdout).toBe("");
-      const json = relic(root, "--json");
+      const json = relic(root, "--model", "all-minilm", "--json");
       expect(json.code).toBe(1);
       expect(JSON.parse(json.stdout)).toMatchObject({ refused: true, shards: [], check: { action: "refuse" } });
     });
 
     test("--dry-run prints the check, the counts, and the refusal again under them", async () => {
       const root = await mkRoot("check-cli-dry", { mix: THAI_MIX });
-      const dry = relic(root, "--dry-run");
+      const dry = relic(root, "--dry-run", "--model", "all-minilm");
       expect(dry.code).toBe(0);
       expect(dry.stderr).toContain("Without --force, a real run stops here");
       expect(dry.stdout).toContain("30 pending");
       expect(dry.stdout).toContain("the language check refuses ollama:all-minilm for this scope");
-      // A model that fits prints nothing about languages at all.
-      const multi = relic(root, "--dry-run", "--model", "bge-m3");
-      expect(multi.code).toBe(0);
-      expect(multi.stderr).toBe("");
+      // A model that fits prints nothing about languages at all, the default included.
+      for (const model of [["--model", "bge-m3"], []]) {
+        const multi = relic(root, "--dry-run", ...model);
+        expect(multi.code).toBe(0);
+        expect(multi.stderr).toBe("");
+      }
     });
   });
 });
@@ -661,7 +749,7 @@ describe("an interrupted embed, and a vectors table that no longer reads (#105)"
   test("the CLI prints that command, with --data-root, where it used to print a bare SKIP", async () => {
     const root = join(tmp, "cli-root");
     // Written under the CLI's default model, so the model guard lets the run reach the scan.
-    await damaged(shardDirFor(null, root, false, "hermes"), [1, 2], { ...fake(8), id: "ollama:all-minilm" });
+    await damaged(shardDirFor(null, root, false, "hermes"), [1, 2], { ...fake(8), id: providerFor("ollama", DEFAULT_MODEL).id });
     const cli = join(import.meta.dir, "..", "src", "cli.ts");
     const run = (...args: string[]) => {
       const p = Bun.spawnSync(["bun", cli, "embed", "--data-root", root, "--bank", "hermes", "--batch", "4", ...args],

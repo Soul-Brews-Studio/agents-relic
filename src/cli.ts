@@ -41,7 +41,7 @@ import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession,
          groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead, facetArg,
          matchCount, floorNote } from "./query.js";
 import { sessionRecap } from "./recap.js";
-import { embedShards, damageNote, DEFAULT_OLLAMA } from "./embed.js";
+import { embedShards, damageNote, DEFAULT_OLLAMA, DEFAULT_MODEL } from "./embed.js";
 import { scanLangs, recommend, renderLangs, renderEmbedCheck } from "./langs.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
 import { repoIndex, resolveRepoKey, repoKeyOf, cwdOfFile, ghqRoot, defaultRoot, listShards } from "./repo.js";
@@ -1416,7 +1416,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     repo: f.repo ? String(f.repo) : undefined,
     bank: f.bank ? String(f.bank) : undefined,
     provider: f.provider ? String(f.provider) : "ollama",
-    model: f.model ? String(f.model) : "all-minilm",
+    model: f.model ? String(f.model) : DEFAULT_MODEL,
     host: f.host ? String(f.host) : DEFAULT_OLLAMA,
     device: f.device ? String(f.device) : undefined,
     batch: f.batch ? Number(f.batch) : 64,

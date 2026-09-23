@@ -1213,9 +1213,9 @@ already complete, and it is resumable, scoped, and free to skip.
 
 ```bash
 relic embed --dry-run                      # what would this cost? no provider call
-relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable
+relic embed --repo neo-oracle --limit 5000 # a shard at a time, resumable (embeddinggemma, the default)
 relic embed --model bge-m3 --reset         # change model: drops `vectors` first
-relic embed --force                        # an English-only model on a Thai scope, on purpose
+relic embed --model all-minilm --force     # an English-only model on a Thai scope, on purpose
 relic embed --repair --bank hermes         # a shard whose `vectors` no longer reads (#105)
 relic-py embed --provider st --model intfloat/multilingual-e5-small
 ```
@@ -1249,18 +1249,19 @@ scope     main tiers, text >= 24 chars, truncated at 2000
 74,102 embedded · 46,886 pending · 0 failed · 1 shards · 512.0s  (145/s)
 ```
 
-**The default model is English-only, so embed checks the scope first.** Before any
+**An English-only model is refused on a scope that is not.** Before any
 provider call, `embed` samples the population it is about to embed with the same uid
 sample and the same rule as [`langs`](#langs--which-languages-so-which-model). When the
 model is English-only in `MEASURED_MODELS` and 1% or more of the eligible events carry
 Thai (or another non-Latin script), it **refuses**, exits 1, and prints why:
 
 ```
-$ relic embed --repo neo-oracle --dry-run
+$ relic embed --model all-minilm --repo neo-oracle --dry-run
   ⚠ ollama:all-minilm is English-only, and this scope is not. Without --force, a real run stops here.
     11.0% of eligible events carry Thai, at or above 1.0%. An English-only model embeds them as noise (all-minilm: Thai paraphrase MRR 0.006, bench/).
     measured 1 in 64 by uid -> 4,238 events · ~271,232 eligible in 9 shards · 2.2 s
     multilingual, measured here:
+      ollama  768d    ~0.8 GiB  embeddinggemma                  MRR 0.646 · Thai paraphrase 0.398
       ollama 1024d    ~1.0 GiB  bge-m3                          cos en-th +0.626 (smoke test, no ranking bench yet)
       ollama 1024d    ~1.0 GiB  qwen3-embedding:0.6b            cos en-th +0.572 (smoke test, no ranking bench yet)
       st      384d    ~0.4 GiB  intfloat/multilingual-e5-small  MRR 0.600 · Thai paraphrase 0.214
@@ -1271,8 +1272,9 @@ $ relic embed --repo neo-oracle --dry-run
 0 embedded · 118,782 pending · 0 failed · 8 shards · 6.0s
 ```
 
-2026-09-23, trimmed. Without the check, that command would have embedded 118,782 events
-with the English-only default, into six shards beside two that already hold e5. Without
+2026-09-23, trimmed (the embeddinggemma row added since). Without the check, that command
+would have embedded 118,782 events with `all-minilm`, then the default, into six shards
+beside two that already hold e5. Without
 `--dry-run` the first line reads `embed REFUSED`, and the embed pass never starts. A
 multilingual model passes without a word. A model relic has never measured gets a note,
 not a refusal: no numbers is not "English-only".
@@ -1295,6 +1297,32 @@ preference — it is the only shape that works:
 
 `widen()` now refuses a non-scalar column outright, so the first failure above can no
 longer happen to any future field either.
+
+**The default model is `embeddinggemma`, sent with its model-card prompts (#101).** It
+is the best vector model bench/ measured on this corpus (#122: 3,000 docs from all
+banks, 400 of them Thai, MRR@20):
+
+| model | known-item, Thai-only | paraphrase |
+|---|---|---|
+| e5-small (384) | 0.347 | 0.143 |
+| bge-m3 (1024) | 0.345 | 0.194 |
+| **embeddinggemma (768), model-card prompts** | **0.476** | **0.318** |
+| embeddinggemma, raw text | 0.330 | 0.170 |
+| FTS | 0.871 | 0.032 |
+
+Without its prompts it falls back to bge-m3's level, so the Ollama provider sends them:
+`title: none | text: ` before every document, `task: search result | query: ` before a
+search string. They live in `OLLAMA_PROMPTS` in `embed.ts` (and `embed.py`), keyed by
+model, and a model with no entry is sent raw text as before. The document prompt is
+recorded in the stored id, as st records e5's `+passage:`, so every vector says how it
+was made: `ollama:embeddinggemma+title: none | text:`. `search --semantic` reads that id
+back and embeds the query with the matching query prompt. A shard written as plain
+`ollama:embeddinggemma`, before the prompts, gets raw queries.
+
+**An index that already holds another model keeps it.** A shard never mixes two models:
+embed skips a shard holding e5 with the reason and the `--reset` that switches it, and
+`relic langs` advises keeping a model on disk that fits. Switching is a deliberate full
+re-embed (about 14 h at 84 docs/s for 4.1M events), never a side effect of the default.
 
 **Providers.** `ollama` is the default in both implementations — HTTP, no dependency
 added to a three-dependency tool, and identical output from either front end. Measured
@@ -1382,7 +1410,7 @@ median target rank 68 of 3,000 is a different failure from FTS's, not a better o
 
 ### `langs` — which languages, so which model
 
-The default model, `all-minilm`, is English-only: Thai paraphrase MRR **0.006** in
+`all-minilm`, the default until #101, is English-only: Thai paraphrase MRR **0.006** in
 bench/. Whether that matters is a fact about the corpus, so `langs` measures it on the
 population `embed` would feed a model: the same tiers, the same `--min-chars`, the same
 first `--max-chars` of each event.
@@ -1421,7 +1449,7 @@ model    MULTILINGUAL. 11.0% of eligible events carry Thai, at or above 1.0%. ..
 | script, not a detector | Thai against Latin is a Unicode-block question and needs no model. Latin text is split by English function words, so `en` is prose and `latin` is code, JSON, paths and ids. Single letters do not count: `a` is the commonest function word in prose and the commonest variable name in code. |
 | the sample | `uid < '0400'` is 1 in 64. Every shape mints uids with `uidOf`, a sha1, so a hex range is uniform and repeatable, and the filter runs inside Lance instead of reading text that would be thrown away. A test pins the premise on 64,000 real uids. |
 | the rule | at least 1% of eligible events carrying Thai, or dominated by another non-Latin script, means multilingual. |
-| the candidates | `MEASURED_MODELS` in `embed.ts`: only models measured here, with the evidence each one has. The Ollama en-th cosine and the bench/ MRR are never ranked against each other. |
+| the candidates | `MEASURED_MODELS` in `embed.ts`: only models measured here, with the evidence each one has. The Ollama en-th cosine and the bench/ MRR are never ranked against each other: within a provider, a model bench/ ranked goes above every smoke-test-only one. |
 | keep beats switch | when the vectors already on disk fit, the advice is to keep that model. embed refuses a second model per shard (`--reset` drops the vectors), and semantic search embeds a query with the model its shard stores. |
 
 ### `attach` — index someone else's LanceDB

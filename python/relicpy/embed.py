@@ -27,6 +27,17 @@ from .query import pick_shards
 from .store import LanceStore
 
 DEFAULT_OLLAMA = "http://localhost:11434"
+# embed's default: the best vector model bench/ measured on this corpus, with its prompts (#101).
+DEFAULT_MODEL = "embeddinggemma"
+
+# Model-card prompts for the Ollama models that want them — OLLAMA_PROMPTS in
+# src/embed.ts, entry for entry (test_embed.py compares the two). Ollama sends text as
+# given, and embeddinggemma without its prompts falls from 0.318 to 0.170 paraphrase MRR
+# (bench/README.md, #122). `doc` goes on what embed writes, `query` on a search string.
+# Keyed by model name without its Ollama tag. A model with no entry is sent raw text.
+OLLAMA_PROMPTS: dict[str, dict[str, str]] = {
+    "embeddinggemma": {"doc": "title: none | text: ", "query": "task: search result | query: "},
+}
 
 
 # --------------------------------------------------------------------- providers
@@ -41,7 +52,16 @@ class Provider:
     encode: Callable[[list[str]], list[list[float]]]
 
 
-def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
+def ollama_prompts(model: str) -> Optional[dict[str, str]]:
+    return OLLAMA_PROMPTS.get(re.sub(r":[^:/]*$", "", model))
+
+
+def _ollama_id(model: str, prefix: str) -> str:
+    return f"ollama:{model}" + (f"+{prefix.strip()}" if prefix else "")
+
+
+def ollama_provider(model: str, host: str = DEFAULT_OLLAMA,
+                    prefix: Optional[str] = None) -> Provider:
     """Ollama over HTTP, on urllib — no dependency added to a 3-dependency tool.
 
     The DEFAULT for both implementations, and the reason `relic embed` and
@@ -55,18 +75,24 @@ def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
         mxbai-embed-large     1024                                    +0.479
         qwen3-embedding:0.6b  1024   multi                            +0.572
         bge-m3                1024   multi                            +0.626
+        embeddinggemma         768   multi    paraphrase MRR 0.318 with its prompts (#122)
 
     That cosine is a SMOKE TEST, not a benchmark: one English string against its Thai
     translation, which says whether a model places the two languages in one space at
     all, and nothing about ranking quality. The same numbers, as data, are
     MEASURED_MODELS in langs.py — what the embed check reads.
+
+    `prefix` defaults to the model's OLLAMA_PROMPTS document prompt and is recorded in
+    the id, as st_provider records e5's.
     """
     base = host.rstrip("/")
+    pre = (ollama_prompts(model) or {}).get("doc", "") if prefix is None else prefix
 
     def encode(texts: list[str]) -> list[list[float]]:
         req = urllib.request.Request(
             f"{base}/api/embed",
-            data=json.dumps({"model": model, "input": texts}).encode(),
+            data=json.dumps({"model": model,
+                             "input": [pre + t for t in texts] if pre else texts}).encode(),
             headers={"content-type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=300) as r:
@@ -80,7 +106,7 @@ def ollama_provider(model: str, host: str = DEFAULT_OLLAMA) -> Provider:
             raise RuntimeError(f"ollama returned {len(vecs)} vectors for {len(texts)} inputs")
         return vecs
 
-    return Provider(id=f"ollama:{model}", encode=encode)
+    return Provider(id=_ollama_id(model, pre), encode=encode)
 
 
 def st_provider(model: str, device: Optional[str] = None,
@@ -148,7 +174,7 @@ def provider_id(name: str, model: str) -> str:
     from here instead.
     """
     if name == "ollama":
-        return f"ollama:{model}"
+        return _ollama_id(model, (ollama_prompts(model) or {}).get("doc", ""))
     if name == "st":
         doc = _doc_prefix(model)
         return f"st:{model}" + (f"+{doc.strip()}" if doc else "")
@@ -322,7 +348,7 @@ def embed_shard(store: LanceStore, p: Provider, *, batch: int = 64,
     return st
 
 
-def embed_shards(s: Scope, *, provider: str = "ollama", model: str = "all-minilm",
+def embed_shards(s: Scope, *, provider: str = "ollama", model: str = DEFAULT_MODEL,
                  host: Optional[str] = None, device: Optional[str] = None,
                  batch: int = 64, limit: Optional[int] = None,
                  main_tiers: bool = True, min_chars: int = 24, max_chars: int = 2000,

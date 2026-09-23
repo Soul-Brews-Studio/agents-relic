@@ -15,7 +15,8 @@ import subprocess
 import lancedb
 import pytest
 
-from relicpy.embed import Provider, embed_shard, embed_shards, l2_normalise, provider_for, provider_id
+from relicpy.embed import (DEFAULT_MODEL, OLLAMA_PROMPTS, Provider, embed_shard, embed_shards,
+                           l2_normalise, ollama_provider, provider_for, provider_id)
 from relicpy.langs import CHECK_MIN_EVENTS, MEASURED_MODELS, check_embed_model, lang_of, render_embed_check
 from relicpy.models import EventRow, FileRow, Scope
 from relicpy.repo import shard_dir_for
@@ -86,6 +87,59 @@ def test_provider_ids_are_qualified():
     assert provider_for("ollama", "all-minilm").id == "ollama:all-minilm"
     with pytest.raises(ValueError):
         provider_for("nope", "x")
+
+
+# ------------------------------------------------- Ollama model-card prompts (#101)
+
+@pytest.fixture
+def ollama_wire(monkeypatch):
+    """urlopen, recorded: what goes over the wire is the whole point, and nothing errors
+    when it is wrong — raw text embeds fine, just worse (0.318 -> 0.170, #122)."""
+    import io
+
+    from relicpy import embed as E
+
+    sent: list[dict] = []
+
+    def urlopen(req, timeout=None):
+        body = json.loads(req.data)
+        sent.append(body)
+        vecs = [[float((ord(t[i % len(t)]) % 17) + 1) for i in range(8)] for t in body["input"]]
+        return io.BytesIO(json.dumps({"embeddings": vecs}).encode())
+
+    monkeypatch.setattr(E.urllib.request, "urlopen", urlopen)
+    return sent
+
+
+def test_embeddinggemma_is_sent_its_document_prompt_and_records_it(ollama_wire):
+    p = provider_for("ollama", "embeddinggemma")
+    assert p.id == "ollama:embeddinggemma+title: none | text:" == provider_id("ollama", "embeddinggemma")
+    p.encode(["hello", "สวัสดี"])
+    assert ollama_wire == [{"model": "embeddinggemma",
+                            "input": ["title: none | text: hello", "title: none | text: สวัสดี"]}]
+
+
+def test_an_ollama_model_with_no_entry_is_sent_raw_text(ollama_wire):
+    p = provider_for("ollama", "bge-m3")
+    assert p.id == "ollama:bge-m3" == provider_id("ollama", "bge-m3")
+    p.encode(["hello"])
+    assert ollama_wire == [{"model": "bge-m3", "input": ["hello"]}]
+
+
+def test_an_explicit_prefix_wins_over_the_table(ollama_wire):
+    # How a query side is built: the query prompt, or "" for a shard written raw.
+    ollama_provider("embeddinggemma", prefix="task: search result | query: ").encode(["q"])
+    ollama_provider("embeddinggemma", prefix="").encode(["q"])
+    assert [b["input"] for b in ollama_wire] == [["task: search result | query: q"], ["q"]]
+
+
+def test_the_default_model_writes_its_prompted_id(tmp_path, ollama_wire):
+    s = mkstore(tmp_path, "gemma", 3)
+    t = embed_shards(Scope(data_root=str(tmp_path / "none")))   # no shards: just the id
+    assert t.provider_id == "ollama:embeddinggemma+title: none | text:"
+    r = embed_shard(s, provider_for("ollama", DEFAULT_MODEL))
+    assert r.embedded == 3 and s.vector_stats()["model"] == t.provider_id
+    assert all(x.startswith("title: none | text: ") for b in ollama_wire for x in b["input"])
 
 
 # ---------------------------------------------------------------------- embed_shard
@@ -255,12 +309,12 @@ def test_an_english_only_model_on_a_thai_scope_is_refused_before_any_provider_ca
     assert abs(t.check.thai_share - 1 / 3) < 1e-9
     assert t.shards == [] and calls["n"] == 0 and vectors_in(root, "mix") is None
     assert [c.m.model for c in t.check.candidates] == [
-        "bge-m3", "qwen3-embedding:0.6b", "intfloat/multilingual-e5-small",
+        "embeddinggemma", "bge-m3", "qwen3-embedding:0.6b", "intfloat/multilingual-e5-small",
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"]
     text = render_embed_check(t.check)
     assert "embed REFUSED — ollama:all-minilm is English-only, and this scope is not" in text
     assert "33.3% of eligible events carry Thai, at or above 1.0%" in text
-    assert "-> relic embed --model bge-m3" in text
+    assert "-> relic embed --model embeddinggemma" in text
     assert "--force embeds with ollama:all-minilm anyway." in text
 
 
@@ -343,13 +397,17 @@ def test_the_cli_refuses_with_exit_1_and_json_stays_one_document(tmp_path, capsy
     from relicpy.cli import main
 
     root = mkroot(tmp_path, {"mix": THAI_MIX})
-    assert main(["embed", "--data-root", root]) == 1
+    # all-minilm by name: the default is multilingual now, and passes this scope.
+    en = ["--model", "all-minilm"]
+    assert main(["embed", "--data-root", root, *en]) == 1
     out = capsys.readouterr()
     assert "embed REFUSED — ollama:all-minilm is English-only" in out.err and out.out == ""
-    assert main(["embed", "--data-root", root, "--json"]) == 1
+    assert main(["embed", "--data-root", root, *en, "--json"]) == 1
     j = json.loads(capsys.readouterr().out)
     assert j["refused"] is True and j["shards"] == [] and j["check"]["action"] == "refuse"
     assert main(["embed", "--data-root", root, "--dry-run"]) == 0
+    assert capsys.readouterr().err == ""                   # the default fits: nothing to say
+    assert main(["embed", "--data-root", root, *en, "--dry-run"]) == 0
     out = capsys.readouterr()
     assert "Without --force, a real run stops here" in out.err
     assert "30 pending" in out.out and "the language check refuses ollama:all-minilm" in out.out
@@ -380,6 +438,20 @@ def _bun(args: list[str], home) -> subprocess.CompletedProcess:
                           env={**os.environ, "HOME": str(home)})
 
 
+def test_ollama_prompts_and_default_match_typescript(tmp_path):
+    out = _bun(["-e", "import { OLLAMA_PROMPTS, DEFAULT_MODEL, providerFor, queryProviderFor } from './src/embed.ts';"
+                      " const ids = ['embeddinggemma', 'embeddinggemma:300m', 'bge-m3', 'all-minilm']"
+                      "   .map(m => providerFor('ollama', m).id);"
+                      " console.log(JSON.stringify({ OLLAMA_PROMPTS, DEFAULT_MODEL, ids,"
+                      "   query: queryProviderFor(ids[0]).id }))"], tmp_path)
+    assert out.returncode == 0, out.stderr
+    ts = json.loads(out.stdout)
+    assert ts["OLLAMA_PROMPTS"] == OLLAMA_PROMPTS and ts["DEFAULT_MODEL"] == DEFAULT_MODEL
+    ids = [provider_id("ollama", m) for m in ("embeddinggemma", "embeddinggemma:300m", "bge-m3", "all-minilm")]
+    assert ids == ts["ids"]
+    assert ts["query"] == "ollama:embeddinggemma+task: search result | query:"
+
+
 def test_measured_models_match_the_typescript_table(tmp_path):
     out = _bun(["-e", "import { MEASURED_MODELS } from './src/embed.ts';"
                       " console.log(JSON.stringify(MEASURED_MODELS))"], tmp_path)
@@ -399,10 +471,11 @@ def test_the_check_matches_typescript_over_one_shard(tmp_path):
     embed_shard(LanceStore.open(shard_dir_for("github.com/o/mix", root)),
                 counting("st:intfloat/multilingual-e5-small+passage:")[0])
 
-    ts = _bun(["src/cli.ts", "embed", "--data-root", root, "--dry-run", "--json"], tmp_path)
+    ts = _bun(["src/cli.ts", "embed", "--data-root", root, "--model", "all-minilm", "--dry-run", "--json"], tmp_path)
     assert ts.returncode == 0, ts.stderr
     want = json.loads(ts.stdout)["check"]
-    check = embed_shards(Scope(data_root=root), dry_run=True, scope_args=["--data-root", root]).check
+    check = embed_shards(Scope(data_root=root), model="all-minilm", dry_run=True,
+                         scope_args=["--data-root", root]).check
     got = check.to_json()
     for c in (want, got):
         c.pop("ms")
