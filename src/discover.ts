@@ -1,7 +1,7 @@
 import { readdirSync, statSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { bankOf, loadSources } from "./sources.js";
+import { bankOf, loadSources, homeProjectRoots } from "./sources.js";
 import { repoKeyOf } from "./repo.js";
 import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
@@ -525,9 +525,7 @@ export interface PathOverride { key: string; path: string }
  * killed run has the most useful half.
  */
 export function walkClaudeHome(home: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
-  const roots = dirs(home).filter(d => d === "projects" || d.startsWith("projects-"));
-  roots.sort((a, b) => (a === "projects" ? -1 : b === "projects" ? 1 : a.localeCompare(b)));
-  for (const r of roots) walkClaude(join(home, r), sinceMs, out, srcKey, parser);
+  for (const r of homeProjectRoots(home)) walkClaude(r, sinceMs, out, srcKey, parser);
 }
 
 export function discover(only: string[] | null, sinceMs: number | null,

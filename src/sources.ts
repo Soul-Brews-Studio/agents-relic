@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -91,6 +91,23 @@ export function envHomes(): { agent: string; env: string; path: string; isDefaul
 
 /** A source's bank, defaulting to its key. The only place this fallback lives. */
 export function bankOf(s: SourceDef): string { return s.bank || s.key; }
+
+/** `projects` and `projects-*` inside one agent home, the live root first. */
+export function homeProjectRoots(home: string): string[] {
+  let names: string[];
+  try { names = readdirSync(home, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); }
+  catch { return []; }
+  return names.filter(d => d === "projects" || d.startsWith("projects-"))
+    .sort((a, b) => (a === "projects" ? -1 : b === "projects" ? 1 : a.localeCompare(b)))
+    .map(d => join(home, d));
+}
+
+/** Directories whose children are transcript project dirs; a declared home is not one itself. */
+export function transcriptRoots(src: SourceDef): string[] {
+  if (src.walk === "claude-tiers" || src.walk === "omp") return [src.path];
+  if (src.walk === "claude-home") return homeProjectRoots(src.path);
+  return [];
+}
 
 /**
  * Agent transcript sources.
@@ -370,6 +387,9 @@ export function loadSources(): SourceDef[] {
 }
 
 /** What is actually on this machine, for the `sources` command. */
+// <projects-root>/<encoded-project>/memory/<name>.md — exactly what walkMemory enumerates.
+const MEMORY_FILE = /\/-[^/]*\/memory\/[^/]+\.md$/;
+
 /**
  * Which parser handles this file, chosen by the source whose root contains it.
  *
@@ -378,14 +398,21 @@ export function loadSources(): SourceDef[] {
  * fallback is the Claude parser, since that is the only shape whose files can appear
  * outside any configured root (a transcript copied somewhere for inspection).
  */
-export function parserFor(filePath: string): Parser {
+export function parserFor(filePath: string, sources: SourceDef[] = loadSources()): Parser {
+  const memoryFile = MEMORY_FILE.test(filePath);
   let best: SourceDef | null = null;
-  for (const s of loadSources()) {
-    if (!filePath.startsWith(s.path)) continue;
+  for (const s of sources) {
+    const root = s.path.replace(/\/+$/, "");
+    // A bare prefix would let `projects` claim files under `projects-archive`.
+    if (filePath !== root && !filePath.startsWith(root + "/")) continue;
+    // Memory and transcript sources share roots, so the file's kind decides which may claim it.
+    if (s.walk === "memory" && !memoryFile) continue;
+    if ((s.walk === "claude-tiers" || s.walk === "claude-home") && memoryFile) continue;
     // Longest matching root wins — sources can nest (a vault inside a repo).
     if (!best || s.path.length > best.path.length) best = s;
   }
   if (best) return best.parser;
+  if (memoryFile) return parseMemory;
   return filePath.endsWith(".md") ? parseVault : parseClaude;
 }
 
