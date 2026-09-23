@@ -18,8 +18,8 @@ import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
-import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
-import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
+import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, shortId, type Lineage } from "./lineage.js";
+import { findHermesSessions, buildHermesLineage, hermesOffNotes } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 
@@ -302,17 +302,21 @@ async function cmdPrune(f: Record<string, string | boolean>) {
 async function recapTarget(arg: string | undefined): Promise<string> {
   if (arg) return arg;
   const prev = await previousSessionFile(process.cwd());
-  if (!prev) {
-    console.error(`no earlier session found for ${process.cwd()}`);
-    console.error(`  relic now --all   lists what is running, anywhere`);
-    process.exit(1);
-  }
+  if (!prev) noEarlierSession(process.cwd());
   // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
   // not data. On stdout it lands inside `--json` output and makes it unparseable:
   // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
   // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+  console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
   return prev.id;
+}
+
+/** Nothing earlier in this directory: point at the machine-wide view, and at Hermes data left switched off. */
+function noEarlierSession(cwd: string): never {
+  console.error(`no earlier session found for ${cwd}`);
+  console.error(`  relic now --all   lists what is running, anywhere`);
+  for (const note of hermesOffNotes()) console.error(`  ${note}`);
+  process.exit(1);
 }
 
 /*
@@ -389,9 +393,11 @@ async function cmdRecap(id: string, f: Record<string, string | boolean>) {
   });
   if (!r) {
     // recap reads the INDEX, so "no match" also covers "ran too recently to be in it".
+    // A Hermes id names a different corpus, and indexing claude-live would not add it.
+    const corpus = findHermesSessions(id).length ? "hermes" : "claude-live";
     console.error(`no session matched ${id}`);
     console.error(`  if it only just ran, it is in the file but not the index yet:`);
-    console.error(`  relic index --corpus claude-live    (or: relic tail ${id}, which reads the file)`);
+    console.error(`  relic index --corpus ${corpus}    (or: relic tail ${id}, which reads the file)`);
     process.exit(1);
   }
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
@@ -831,6 +837,18 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
   const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
   /*
+   * HERMES HAS NO FILE IN THAT DIRECTORY (#100). Its sessions are rows in state.db, each
+   * carrying its own cwd and its own event clock — the newest active message — so they
+   * join the SAME ranking instead of being tried only when the transcripts come up
+   * empty. The newest session is the answer, whichever host wrote it.
+   */
+  const { hermesSessionsIn } = await import("./live-hermes.js");
+  const cands = [
+    ...ranked.map(c => ({ file: c.file, id: c.id, at: c.lastEventMs ?? c.mtimeMs })),
+    ...hermesSessionsIn(cwd).map(h => ({ file: h.path, id: h.id, at: h.lastMs })),
+  ].sort((a, b) => b.at - a.at);
+
+  /*
    * NEWEST IS NOT THE SAME AS WORTH READING.
    *
    * Measured here: the newest non-self transcript in this directory was `b658931d`,
@@ -842,14 +860,14 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * filter. Parsing stops at the first real hit, so the normal case costs one parse.
    */
   const { parserFor } = await import("./sources.js");
-  for (const c of ranked.slice(0, 8)) {
+  for (const c of cands.slice(0, 8)) {
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
       if (human && p.events.length > 2) return { file: c.file, id: c.id };
     } catch { /* unreadable: try the next */ }
   }
-  return ranked[0] ?? null;     // nothing substantial — hand back the newest and say so
+  return cands[0] ?? null;      // nothing substantial — hand back the newest and say so
 }
 
 /*
@@ -929,28 +947,37 @@ async function cmdTail(target: string, f: Record<string, string | boolean>) {
   let file = target;
   if (!target || target === "--last") {
     const prev = await previousSessionFile(process.cwd());
-    if (!prev) {
-      console.error(`no earlier session found for ${process.cwd()}`);
-      console.error(`  relic now --all   lists what is running, anywhere`);
-      process.exit(1);
-    }
+    if (!prev) noEarlierSession(process.cwd());
     file = prev.file;
     // STDERR, not stdout. This banner says which session was resolved — a diagnostic,
-  // not data. On stdout it lands inside `--json` output and makes it unparseable:
-  // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
-  // line was an arrow. Found by piping the new default into jq.
-  console.error(`\u2190 ${prev.id.slice(0, 8)}  (newest session here that is not this one)`);
+    // not data. On stdout it lands inside `--json` output and makes it unparseable:
+    // `relic recap --json | jq` failed with "Invalid numeric literal" because the first
+    // line was an arrow. Found by piping the new default into jq.
+    console.error(`\u2190 ${shortId(prev.id)}  (newest session here that is not this one)`);
   } else if (!target.includes("/")) {
     const res = await resolveSession(target, scope, { noIndex: true } as any).catch(() => null) as any;
     const rows: any[] = res?.rows ?? [];
-    if (!rows.length) {
-      console.error(`no session matches ${target}`);
-      console.error(`  relic now --all   lists what is running; relic report --since 7d  what ran lately`);
-      process.exit(1);
+    if (rows.length) {
+      // The PARENT transcript: a subagent's tail answers what an agent said to itself.
+      const parent = rows.find((r: any) => r.tier === "session") ?? rows[0];
+      file = String(parent.file_path);
+    } else {
+      // Not in the index. A Hermes id reads straight from its state.db, as lineage does —
+      // `now --all` lists live Hermes sessions, and a session it lists must be tailable (#100).
+      const hermes = findHermesSessions(target);
+      if (hermes.length > 1) {
+        console.error(`${target} matches ${hermes.length} Hermes sessions — give more of the id:`);
+        for (const h of hermes.slice(0, 10)) console.error(`  ${h.id}  ${h.db}`);
+        process.exit(1);
+      }
+      if (!hermes.length) {
+        console.error(`no session matches ${target}`);
+        console.error(`  relic now --all   lists what is running; relic report --since 7d  what ran lately`);
+        for (const note of hermesOffNotes()) console.error(`  ${note}`);
+        process.exit(1);
+      }
+      file = `${hermes[0].db}#${hermes[0].id}`;
     }
-    // The PARENT transcript: a subagent's tail answers what an agent said to itself.
-    const parent = rows.find((r: any) => r.tier === "session") ?? rows[0];
-    file = String(parent.file_path);
   }
 
   const { parserFor } = await import("./sources.js");
@@ -1420,11 +1447,15 @@ async function cmdNow(f: Record<string, string | boolean>) {
     const live = await liveSessions(windowSec, Number(f.limit ?? 20));
     if (mode === "json") { console.log(JSON.stringify({ windowSec, sessions: live }, null, 2)); return; }
     if (mode === "plain") { for (const s of live) console.log([s.sessionUuid, s.ageSec, s.agents, s.cwd ?? ""].join("\t")); return; }
-    if (!live.length) { console.log(`nothing written in the last ${humanAge(windowSec)}`); return; }
+    if (!live.length) {
+      console.log(`nothing written in the last ${humanAge(windowSec)}`);
+      for (const note of hermesOffNotes()) console.log(`  ${note}`);
+      return;
+    }
     console.log(`${live.length} session${live.length === 1 ? "" : "s"} active in the last ${humanAge(windowSec)}\n`);
     for (const s of live) {
       const wrote = Math.abs(s.ageSec - s.eventAgeSec) > 180 ? `  (write ${humanAge(s.ageSec)} ago)` : "";
-      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
+      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${shortId(s.sessionUuid)}  ` +
         `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}${wrote}`);
       console.log(`            ${s.cwd ?? s.projectDir}`);
     }
@@ -1501,8 +1532,7 @@ async function cmdLineage(arg: string | undefined, f: Record<string, string | bo
       }
       if (!hermes.length) {
         console.error(`no Claude Code transcript or Hermes session matches ${arg}`);
-        for (const r of disabledHermesRoots())
-          console.error(`  (${r} holds Hermes data, but its source is disabled — enable "hermes" in ~/.relic/sources.json)`);
+        for (const note of hermesOffNotes()) console.error(`  ${note}`);
         process.exit(1);
       }
       l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });

@@ -387,6 +387,7 @@ export interface LiveSession {
   ageSec: number;         // freshest write in the tree
   eventAgeSec: number;    // freshest event in the tree — what the window is judged on
   agents: number;         // live children
+  source?: "hermes";      // no transcript: rows in the state.db named by projectDir, so files is empty
 }
 
 /**
@@ -531,6 +532,10 @@ export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSes
                    agents: files.filter(f => f.tier !== "session").length });
     }
   }
+  // Hermes writes no transcript for the sweep to find; its sessions come from state.db
+  // (#100). Imported here, not at the top: live-hermes -> lineage-hermes -> lineage -> here.
+  const { hermesLive } = await import("./live-hermes.js");
+  found.push(...hermesLive(windowSec));
   found.sort((a, b) => a.eventAgeSec - b.eventAgeSec);
   return found.slice(0, limit);
 }
