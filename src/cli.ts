@@ -12,6 +12,7 @@ import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
+import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
@@ -256,7 +257,7 @@ async function cmdPrune(f: Record<string, string | boolean>) {
   const found = discover(only, null);
   const tally = await importFiles(found, { dataRoot, inRepo, noWrite: true, progress: true,
                                           verbose: Boolean(f.verbose) }, t0);
-  process.stderr.write("\r" + " ".repeat(96) + "\r");
+  clearLine();
 
   console.log(`  scanned:     ${fmt(found.length)} files -> ${tally.seen.size} shards reached`);
   if (tally.failed) console.log(`  \u26A0 failed:    ${fmt(tally.failed)} (re-run with --verbose to see why)`);
@@ -1128,19 +1129,18 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     reset: Boolean(f.reset),
   };
 
-  let last = 0, drew = false;
+  let last = 0;
+  const bar = progress();
   const r = await embedShards({
     ...o,
     onProgress: p => {
-      if (outFmt(f) !== "text" || p.done - last < 200) return;
-      last = p.done; drew = true;
-      process.stderr.write(`\r  ${p.shard}  ${fmt(p.done)}/${fmt(p.pending)}   `);
+      // Was `!== "text"`, a value outFmt never returns, so it never drew; the Python port says "pretty".
+      if (outFmt(f) !== "pretty" || p.done - last < 200) return;
+      last = p.done;
+      bar.tick(`  ${p.shard}  ${fmt(p.done)}/${fmt(p.pending)}   `, (p.done / Math.max(1, p.pending)) * 100);
     },
   });
-  // Only erase a line that was actually drawn. Clearing unconditionally writes 78
-  // spaces into a terminal that never showed progress, which lands as indentation in
-  // front of the first line of output.
-  if (drew) process.stderr.write("\r" + " ".repeat(78) + "\r");
+  bar.clear();
 
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
   if (outFmt(f) === "jsonl") { for (const sh of r.shards) console.log(JSON.stringify(sh)); return; }
