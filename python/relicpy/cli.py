@@ -65,10 +65,13 @@ def cmd_embed(a: argparse.Namespace) -> int:
     Deliberately not part of `index`. The measured result on this corpus is that the
     full-text index WINS (MRR@20 0.890 vs 0.600 for the best of three models, bench/),
     so embedding is opt-in, resumable, and scoped — and --dry-run answers "how much
-    would this cost" without a single call to the provider.
+    would this cost" without a single call to the provider. Either way the scope's
+    languages are measured first, and an English-only model on a scope that carries
+    Thai is refused unless --force: see check_embed_model in langs.py.
     """
     from .embed import damage_note, embed_shards   # imported here so `relic-py --help`
                                                    # never touches an optional model runtime
+    from .langs import render_embed_check
 
     main_tiers = not a.all_tiers
     last = [0]
@@ -80,12 +83,27 @@ def cmd_embed(a: argparse.Namespace) -> int:
         last[0] = done
         bar.tick(f"  {key}  {done:,}/{total:,}   ", done / max(1, total) * 100)
 
+    def check_progress(done: int, total: int, key: str) -> None:
+        # The check reads every shard in scope: on a terminal, show where it is.
+        if _fmt(a) == "pretty" and sys.stderr.isatty():
+            bar.tick(f"  language check  {done}/{total} shards  {key}   ", done / total * 100)
+
+    def check(c) -> None:
+        # Before any provider is built, and on stderr, so --json stays one document.
+        bar.clear()
+        text = render_embed_check(c, a.dry_run)
+        if text:
+            print(text + "\n", file=sys.stderr)
+
     try:
         t = embed_shards(_scope(a), provider=a.provider, model=a.model, host=a.host,
                          device=a.device, batch=a.batch, limit=a.limit,
                          main_tiers=main_tiers, min_chars=a.min_chars,
                          max_chars=a.max_chars, dry_run=a.dry_run, reset=a.reset,
-                         repair=a.repair, on_progress=progress)
+                         force=a.force, scope_args=_embed_scope_args(a),
+                         repair=a.repair,
+                         on_check=check, on_check_progress=check_progress,
+                         on_progress=progress)
     except (ValueError, RuntimeError) as e:
         # A bad --provider or a missing optional dependency is a usage error, not a
         # traceback: the message already says what to run instead.
@@ -97,8 +115,12 @@ def cmd_embed(a: argparse.Namespace) -> int:
         print(json.dumps({"provider": t.provider_id, "dryRun": t.dry_run,
                           "embedded": t.embedded, "pending": t.pending,
                           "failed": t.failed, "ms": t.ms,
-                          "shards": [vars(x) for x in t.shards]}, indent=2))
-        return 0
+                          "shards": [vars(x) for x in t.shards],
+                          "check": t.check.to_json(), "refused": t.refused},
+                         indent=2, ensure_ascii=False))
+        return 1 if t.refused else 0
+    if t.refused:
+        return 1          # why is already on stderr, printed before the embed pass began
 
     touched = [x for x in t.shards if x.eligible > 0 or x.skipped]
     if not touched:
@@ -162,7 +184,31 @@ def cmd_embed(a: argparse.Namespace) -> int:
     if t.dry_run:
         print("\nre-run without --dry-run to write. Vectors go to the per-shard "
               "`vectors`\ntable; `events` and the full-text index are untouched.")
+    # The check's block printed above the shard list, which can run 40 lines; say it again.
+    if t.dry_run and t.check.action == "refuse":
+        print(f"\nBut the language check refuses {t.provider_id} for this scope, so a real run "
+              f"stops before embedding anything: pick a multilingual model above, or add --force.")
     return 0
+
+
+def _embed_scope_args(a: argparse.Namespace) -> list[str]:
+    """The flags that narrowed embed's scope, echoed into the commands the check prints —
+    as src/cli.ts does, so a printed command acts on the scope that was measured."""
+    out: list[str] = []
+    for flag, v in (("--data-root", getattr(a, "data_root", None)), ("--repo", a.repo),
+                    ("--bank", a.bank)):
+        if v:
+            out += [flag, v]
+    # argparse fills in defaults, so only a value that differs from one was typed.
+    if a.min_chars != 24:
+        out += ["--min-chars", str(a.min_chars)]
+    if a.max_chars != 2000:
+        out += ["--max-chars", str(a.max_chars)]
+    if getattr(a, "in_repo", False):
+        out.append("--in-repo")
+    if a.all_tiers:
+        out.append("--all-tiers")
+    return out
 
 
 def cmd_recap(a) -> int:
@@ -1127,7 +1173,10 @@ def main(argv: list[str] | None = None) -> int:
     em.add_argument("--bank"); em.add_argument("--repo")
     em.add_argument("--provider", default="ollama", choices=["ollama", "st"],
                     help="ollama (default, no extra deps) or st (sentence-transformers)")
-    em.add_argument("--model", default="all-minilm")
+    em.add_argument("--model", default="all-minilm",
+                    help="the default, all-minilm, is ENGLISH-ONLY (Thai paraphrase MRR 0.006, "
+                         "bench/). For Thai: bge-m3, or --provider st --model "
+                         "intfloat/multilingual-e5-small")
     em.add_argument("--host", default=None, help="ollama base URL")
     em.add_argument("--device", default=None, help="st only: cpu | mps | cuda")
     em.add_argument("--batch", type=int, default=64)
@@ -1140,6 +1189,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="count what would be embedded; no call to the provider")
     em.add_argument("--reset", action="store_true",
                     help="drop `vectors` first — the only way to change model or dim")
+    em.add_argument("--force", action="store_true",
+                    help="embed with an English-only model even when 1%% or more of the "
+                         "scope carries Thai (the default, all-minilm, is English-only)")
     em.add_argument("--repair", action="store_true",
                     help="put a shard whose `vectors` no longer reads back to its newest "
                          "version that does (drop it if none does), then carry on (#105)")

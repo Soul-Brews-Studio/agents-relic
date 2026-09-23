@@ -806,17 +806,21 @@ export class LanceStore {
   /**
    * The embeddable population, as (role, text) — what `relic langs` measures.
    *
-   * SAME eligibility as embeddableCount and unembedded: main tiers when asked, length
-   * filtered here rather than in SQL, so the language mix describes exactly the text a
-   * model would be fed. `where` narrows it further — `relic langs` passes a uid range,
-   * which is a uniform sample because a uid is a sha1.
+   * SAME eligibility as embeddableCount and unembedded: one session and main tiers when
+   * asked, length filtered here rather than in SQL, so the language mix describes exactly
+   * the text a model would be fed. `where` narrows it further — `relic langs` passes a uid
+   * range, which is a uniform sample because a uid is a sha1.
    */
-  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number } = {}): Promise<{ role: string; text: string }[]> {
+  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number; session?: string } = {}): Promise<{ role: string; text: string }[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const minChars = opts.minChars ?? 24;
     let q = t.query().select(["role", "text"]);
-    const filters = [opts.where ?? "", opts.mainTiers ? await this.mainTiersFilter(t) : ""].filter(Boolean);
+    const filters = [
+      opts.where ?? "",
+      opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
+      opts.mainTiers ? await this.mainTiersFilter(t) : "",
+    ].filter(Boolean);
     if (filters.length) q = q.where(filters.join(" AND "));
     const out: { role: string; text: string }[] = [];
     for (const r of await q.toArray()) {
