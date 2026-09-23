@@ -85,8 +85,8 @@ TOOLS = [
     {
         "name": "relic_sessions",
         "description": "List or count indexed sessions, newest first, each with its "
-                       "NAME. Filters on the session's own first timestamp, not file "
-                       "mtime — an old session that got one new line stays old.",
+                       "NAME. A session matches any window it was active in, on its "
+                       "own event timestamps — not file mtime.",
         "inputSchema": {"type": "object", "properties": {
             "repo": _str(REPO_DESC), "bank": _str(BANK_DESC),
             "since": _str(SINCE_DESC), "until": _str(SINCE_DESC),

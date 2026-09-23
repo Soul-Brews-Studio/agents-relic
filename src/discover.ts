@@ -1,7 +1,7 @@
 import { readdirSync, statSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { bankOf, loadSources } from "./sources.js";
+import { bankOf, loadSources, homeProjectRoots } from "./sources.js";
 import { repoKeyOf } from "./repo.js";
 import { hermesSessions } from "./shapes/hermes.js";
 import type { Parser } from "./types.js";
@@ -451,7 +451,8 @@ function progressLine(msg: string): void {
  * mtime changes constantly while its rows mostly do not, so keying on the file would
  * re-import every session on every run.
  */
-function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+/** Every Hermes state.db under a root — one per profile, at most 3 levels down. */
+export function hermesDbs(root: string): string[] {
   const dbs: string[] = [];
   const scan = (dir: string, depth: number) => {
     if (depth > 3) return;
@@ -459,8 +460,11 @@ function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: 
     for (const d of dirs(dir)) scan(join(dir, d), depth + 1);
   };
   scan(root, 0);
+  return dbs;
+}
 
-  for (const db of dbs) {
+function walkHermes(root: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
+  for (const db of hermesDbs(root)) {
     for (const s of hermesSessions(db)) {
       if (sinceMs && s.mtime * 1000 < sinceMs) continue;
       out.push({
@@ -525,9 +529,7 @@ export interface PathOverride { key: string; path: string }
  * killed run has the most useful half.
  */
 export function walkClaudeHome(home: string, sinceMs: number | null, out: Found[], srcKey: string, parser: Parser) {
-  const roots = dirs(home).filter(d => d === "projects" || d.startsWith("projects-"));
-  roots.sort((a, b) => (a === "projects" ? -1 : b === "projects" ? 1 : a.localeCompare(b)));
-  for (const r of roots) walkClaude(join(home, r), sinceMs, out, srcKey, parser);
+  for (const r of homeProjectRoots(home)) walkClaude(r, sinceMs, out, srcKey, parser);
 }
 
 export function discover(only: string[] | null, sinceMs: number | null,

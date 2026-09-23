@@ -74,6 +74,19 @@ export function dur(ms: number): string {
 }
 
 /**
+ * The stamps a header may speak from: parsed, finite, in order. Separate from the
+ * arithmetic below because "how many usable stamps are there" and "what is the span"
+ * are different questions, and a caller that conflates them reports NONE when it has
+ * ONE — a session of a single turn is dated, it just has nothing to be spaced against.
+ */
+export function usableStamps(stamps: (string | number | null | undefined)[]): number[] {
+  return stamps
+    .map(v => (typeof v === "number" ? v : v ? Date.parse(v) : NaN))
+    .filter(n => Number.isFinite(n))
+    .sort((a, b) => a - b);
+}
+
+/**
  * The shape of a run of turns: when it started, when it ended, and how the turns were
  * spaced. This is the arithmetic `relic tail --handoff` does so the NEXT session does
  * not have to — pacing is the intention signal, and a fresh model should be handed it,
@@ -88,10 +101,7 @@ export function dur(ms: number): string {
  */
 export function handoffStats(stamps: (string | number | null | undefined)[]):
   { firstMs: number; lastMs: number; spanMs: number; medianGapMs: number; maxGapMs: number } | null {
-  const ms = stamps
-    .map(v => (typeof v === "number" ? v : v ? Date.parse(v) : NaN))
-    .filter(n => Number.isFinite(n))
-    .sort((a, b) => a - b);
+  const ms = usableStamps(stamps);
   if (ms.length < 2) return null;
   const gaps = ms.slice(1).map((t, i) => t - ms[i]).sort((a, b) => a - b);
   return {
