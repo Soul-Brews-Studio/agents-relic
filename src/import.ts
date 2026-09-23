@@ -101,6 +101,8 @@ export interface ImportTally {
   ftsBuilt: number; ftsFailed: number; ftsMs: number;
   /** "bank/repo" of shards left on the `simple` tokenizer, and why ICU was refused. */
   ftsSimple: string[]; ftsNoIcu: string; ftsUpgraded: number;
+  /** Indexes rebuilt because they were built with other stop-word settings (#97). */
+  ftsDrifted: number;
 }
 
 /** Paths that share a basename but not a tree key — the pairs the basename-only uid collided (#58). */
@@ -351,7 +353,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   if (o.noWrite)
     return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
              ftsBuilt: 0, ftsFailed: 0, ftsMs: 0,
-             ftsSimple: [], ftsNoIcu: "", ftsUpgraded: 0 };
+             ftsSimple: [], ftsNoIcu: "", ftsUpgraded: 0, ftsDrifted: 0 };
 
   await flush();   // anything left below the batch threshold
 
@@ -366,7 +368,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
    */
   const tf0 = Date.now();
   const keys = shards.keys();
-  let ftsBuilt = 0, ftsFailed = 0, ftsUpgraded = 0, ftsNoIcu = "";
+  let ftsBuilt = 0, ftsFailed = 0, ftsUpgraded = 0, ftsDrifted = 0, ftsNoIcu = "";
   const ftsSimple: string[] = [];
   const ftsBar = progress();
   for (let i = 0; i < keys.length; i++) {
@@ -376,6 +378,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       const r = await shards.byKey(keys[i])!.ensureFtsIndex();
       ftsBuilt++;
       if (r?.upgraded) ftsUpgraded++;
+      if (r?.drifted) ftsDrifted++;
       if (r?.tokenizer === "simple") {
         const { bank, repo } = splitShardKey(keys[i]);
         ftsSimple.push(`${bank}/${repo}`);
@@ -389,5 +392,5 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
   }
   if (o.progress) ftsBar.clear();
   return { added, skipped, failed, filtered, skippedNoise, done, imported, repaired, shards, seen,
-           ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0, ftsSimple, ftsNoIcu, ftsUpgraded };
+           ftsBuilt, ftsFailed, ftsMs: Date.now() - tf0, ftsSimple, ftsNoIcu, ftsUpgraded, ftsDrifted };
 }

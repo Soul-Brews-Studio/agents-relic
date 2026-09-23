@@ -18,6 +18,10 @@ export function helpText(): string {
   return `relic — per-repo LanceDB index of Claude Code + Codex session JSONL
 
   index   [--corpus ...] [--since 7d] [--repo SUBSTR] [--keep-noise] [--dry-run] [--prune]
+          [--fts-rebuild]      rebuild the full-text index of EVERY shard on disk, every
+                               bank, and import nothing. Once per machine after an FTS
+                               setting changes: an index keeps the settings it was built
+                               with, and a run only reaches the shards it discovers.
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
@@ -123,7 +127,9 @@ export function helpText(): string {
                                not a summary: session gives shape, recap gives content.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
-  skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
+  skipped [--files] [--json]   what noise filtering dropped, and the proof (--keep-noise disables it)
+                               --files: paths the walk could NOT READ, so nothing in them was
+                               indexed — one row per path, newest first. Index runs log them.
   serve   [--host 127.0.0.1] [--port 4319] [--token T] [--origin URL,URL]
                                the MCP tools over HTTP at /mcp, for clients that are not
                                a child process — a browser UI, another machine, another

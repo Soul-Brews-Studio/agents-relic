@@ -20,9 +20,19 @@ from .models import EventRow, FileRow, SessionRow, vector_row_model
 # The fallback index's NAME is the per-shard record — same name as src/store/fts.ts.
 SIMPLE_INDEX = "text_fts_simple"
 
+# What _create_fts writes into every index, and what _drifted reads back — same as src/store/fts.ts.
+REMOVE_STOP_WORDS = False
+
 
 def _no_icu(err: Exception) -> bool:
     return "unknown base tokenizer" in str(err).lower()
+
+
+def _drifted(details) -> bool:
+    """An index built with another stop-word setting than _create_fts writes (#97).
+    No details, or no field in them, is unknown, not drift — as drifted() in src/store/fts.ts."""
+    removed = details.get("remove_stop_words") if isinstance(details, dict) else None
+    return isinstance(removed, bool) and removed != REMOVE_STOP_WORDS
 
 
 def _create_fts(t, tokenizer: str, name: Optional[str]) -> None:
@@ -39,12 +49,19 @@ def _create_fts(t, tokenizer: str, name: Optional[str]) -> None:
     # that `sessions` no longer matches `session`, which is the right trade when a
     # 3,000-event sample holds 354 distinct identifiers over 21 characters.
     #
+    # remove_stop_words=False — LanceDB defaults it to True, and with base_tokenizer
+    # "icu" and no custom list that filters 21 languages at once (5,200 words,
+    # `language` ignored): `nas`, `na`, `bin`, `min`, `var`, `del` never reach the
+    # index, and a query made of them tokenizes to nothing and answers 0 hits (#97).
+    # This port always passed False; src/store/fts.ts left the default until #97, so
+    # this was the one line where "matches" was not true.
+    #
     # max_token_length=128 — long identifiers and 64-char hashes survive whole.
     #
     # create_index(config=FTS(...)) replaces create_fts_index(), deprecated in
     # LanceDB 0.25.0 — native FTS only now, so there is no use_tantivy to pass.
     t.create_index("text", config=FTS(base_tokenizer=tokenizer, stem=False,
-                                       remove_stop_words=False, max_token_length=128),
+                                       remove_stop_words=REMOVE_STOP_WORDS, max_token_length=128),
                    replace=True, name=name)
 
 
@@ -482,11 +499,14 @@ class LanceStore:
         if t is None:
             return None
         create = create or _create_fts
-        names = [i.name for i in t.list_indices() if "text" in i.columns]
-        simple = SIMPLE_INDEX in names
-        icu = any(n != SIMPLE_INDEX for n in names)
-        if icu and not rebuild:
-            if simple:
+        text = [i for i in t.list_indices() if "text" in i.columns]
+        simple = next((i for i in text if i.name == SIMPLE_INDEX), None)
+        icu = next((i for i in text if i.name != SIMPLE_INDEX), None)
+        # #97: an index built with other stop-word settings is rebuilt as if asked to.
+        stale_icu = icu is not None and _drifted(getattr(icu, "index_details", None))
+        stale_simple = simple is not None and _drifted(getattr(simple, "index_details", None))
+        if icu is not None and not rebuild and not stale_icu:
+            if simple is not None:
                 t.drop_index(SIMPLE_INDEX)  # an upgrade interrupted between create and drop
             return {"tokenizer": "icu", "built": False}
         try:
@@ -494,10 +514,18 @@ class LanceStore:
         except Exception as err:
             if not _no_icu(err):
                 raise
-            if simple and not rebuild:
+            if icu is not None:  # never ICU -> `simple`: two indexes on one column
+                return {"tokenizer": "icu", "built": False, "fell_back": str(err)}
+            if simple is not None and not rebuild and not stale_simple:
                 return {"tokenizer": "simple", "built": False, "fell_back": str(err)}
             create(t, "simple", SIMPLE_INDEX)
-            return {"tokenizer": "simple", "built": True, "fell_back": str(err)}
-        if simple:
+            out = {"tokenizer": "simple", "built": True, "fell_back": str(err)}
+            if stale_simple:
+                out["drifted"] = True
+            return out
+        if simple is not None:
             t.drop_index(SIMPLE_INDEX)
-        return {"tokenizer": "icu", "built": True, "upgraded": simple}
+        out = {"tokenizer": "icu", "built": True, "upgraded": simple is not None}
+        if stale_icu:
+            out["drifted"] = True
+        return out
