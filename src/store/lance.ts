@@ -978,12 +978,15 @@ export class LanceStore {
       .select(["text"]).toArray()).map(r => String(r.text));
   }
 
-  /** Session rows whose stored name still opens with an envelope tag — written before #92. */
+  /**
+   * Session rows whose stored name still opens with an envelope tag — written before #92.
+   * A prefix test by strpos, not LIKE: in `<hook_prompt%` the `_` matches any character.
+   */
   async namedByEnvelope(): Promise<Record<string, unknown>[]> {
     const t = await this.existing("sessions");
     if (!t) return [];
     return (await t.query()
-      .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `description LIKE '${p}%'`).join(" OR "))
+      .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `strpos(description, ${sqlStr(p)}) = 1`).join(" OR "))
       .toArray()).map(r => ({ ...r }));
   }
 

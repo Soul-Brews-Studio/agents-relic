@@ -277,6 +277,17 @@ describe("facet filters match what was typed, literally", () => {
     expect(await who("NAZT")).toEqual(["naztX", "nazt_"]);   // code-unit order: X before _
   });
 
+  test("a session name is an envelope tag only when it opens with one, character for character", async () => {
+    const store = await LanceStore.open(join(tmp, "names-literal", "banks", BANK, "github.com", "acme", "names"));
+    const se = (file_path: string, description: string) => ({
+      session_uuid: file_path, file_path, repo_key: REPO, project_dir: "", tier: "session", source: "claude", cwd: "",
+      model: "", worktree: "", workflow_run_id: "", agent_id: "", file_mtime: 0, file_size: 0, line_count: 0,
+      event_count: 0, bad_lines: 0, started_at: "", ended_at: "", description, imported_at: "", title: "", git_branch: "" });
+    await store.putSessions([se("/a.jsonl", "<hook_prompt x>go"), se("/b.jsonl", "<hookXprompt x>go"),
+                             se("/c.jsonl", "<channel source=\"mqtt\">hi"), se("/d.jsonl", "say <channel source=\"mqtt\">")] as any);
+    expect((await store.namedByEnvelope()).map(r => String(r.file_path)).sort()).toEqual(["/a.jsonl", "/c.jsonl"]);
+  });
+
   test("a value that is not a string is converted or refused at the edge", () => {
     expect(facetArg("chat", 214730)).toBe("214730");            // an MCP client sending a number
     expect(facetArg("--via", undefined)).toBeUndefined();
