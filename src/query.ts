@@ -1,5 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble } from "./types.js";
+import { isHostPreamble, stripEnvelope } from "./types.js";
 export { isHostPreamble };
 import os from "node:os";
 import { createInterface } from "node:readline";
@@ -74,7 +74,7 @@ export function toISO(v: unknown, endOfDay = false): string | undefined {
  * of 2,403 hits (8.9%) for one query, 85 of 1,235 for another.
  *
  * THE KEY IS (ts, role, text), NOT uid — and that is the opposite of what it looks like
- * it should be. `uidOf(shape, basename, seq)` hashes a LINE SLOT, not an event: a resumed
+ * it should be. `uidOf(shape, treeKeyOf(path), seq)` hashes a LINE SLOT, not an event: a resumed
  * Claude session writes a NEW file under the SAME uuid containing NONE of the earlier
  * lines, so slot `seq` in the two copies holds two DIFFERENT events under one uid.
  * Measured across 13 real projects∩projects-1sep pairs: 4 byte-identical, 1 a strict
@@ -999,6 +999,10 @@ export function nameOf(r: { title?: unknown; description?: unknown }): string {
   // boilerplate as the session's name.
   // A host's own boot directive is not a name. Claude's two shapes were already
   // handled below; Codex's three were not, and they account for 64% of its sessions.
+  if (isHostPreamble(d)) return "(untitled)";
+
+  // Rows indexed before import stripped envelopes still carry them, cut at 200 chars.
+  d = stripEnvelope(d.replace(/\.\.\.\[\+\d+\]$/, ""));
   if (isHostPreamble(d)) return "(untitled)";
 
   d = d.replace(/<local-command-caveat>[\s\S]*$/, "")

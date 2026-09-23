@@ -74,12 +74,22 @@ export const MAX_TEXT = 16_000;
 const SEP = String.fromCharCode(31); // unit separator — cannot occur in a path or seq
 
 /**
- * Event identity. Deliberately excludes the directory: only the basename and the
- * line number participate, so the same transcript discovered under two roots
- * (live + archive, or two machines) collapses to one row instead of doubling.
+ * Event identity. Deliberately excludes the root and project directory: only the path
+ * INSIDE the session tree (see treeKeyOf) and the line number participate, so the same
+ * transcript discovered under two roots (live + archive, or two machines) collapses to
+ * one row instead of doubling.
  */
 export function uidOf(source: string, fileKey: string, seq: number): string {
   return createHash("sha1").update([source, fileKey, seq].join(SEP)).digest("hex");
+}
+
+// Basename at the top of a project dir, path from the session dir below it: one agent file can sit in two trees (#58).
+export function treeKeyOf(filePath: string): string {
+  const parts = filePath.split("/");
+  const n = parts.length;
+  if (n >= 5 && parts[n - 3] === "workflows" && parts[n - 4] === "subagents") return parts.slice(n - 5).join("/");
+  if (n >= 3 && parts[n - 2] === "subagents") return parts.slice(n - 3).join("/");
+  return parts[n - 1];
 }
 
 export function asObj(v: unknown): Record<string, unknown> | null {
@@ -170,4 +180,30 @@ const HOST_PREAMBLE = [
 export function isHostPreamble(text: unknown): boolean {
   const t = String(text ?? "").trimStart();
   return HOST_PREAMBLE.some(rx => rx.test(t));
+}
+
+// Tags whose content later code reads: slash-command promotion and the caveat drop.
+const STRUCTURAL_TAGS = new Set([
+  "command-name", "command-message", "command-args",
+  "local-command-caveat", "local-command-stdout", "local-command-stderr",
+]);
+
+// The channel tag itself, open or close, anywhere in the text (from #80). Followed by space
+// or `>`, so a `<channel-id>` placeholder in quoted CLI usage is left alone.
+const CHANNEL_TAG = /<\/?channel(?=[\s>])[^>]*>/gi;
+
+// Host envelopes, wrapped text kept. Leading: any tag of any length, cut-off ones included
+// (<channel …>, <teammate-message …>, <hook_prompt …>). Anywhere: channel tags only.
+export function stripEnvelope(text: string): string {
+  const raw = String(text ?? "");
+  let t = raw;
+  for (let i = 0; i < 8; i++) {
+    const m = /^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)/.exec(t);
+    if (!m || STRUCTURAL_TAGS.has(m[1].toLowerCase()) || isHostPreamble(t)) break;
+    t = t.slice(m[0].length);
+    const close = t.indexOf(`</${m[1]}>`);
+    if (close >= 0) t = t.slice(0, close) + " " + t.slice(close + m[1].length + 3);
+  }
+  t = t.replace(CHANNEL_TAG, " ");
+  return t === raw ? raw : t.trim();
 }

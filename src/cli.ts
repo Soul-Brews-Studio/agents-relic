@@ -12,6 +12,7 @@ import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
+import { stripEnvelope } from "./types.js";
 import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
@@ -140,6 +141,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
+  if (tally.repaired) console.log(`  repaired:    ${fmt(tally.repaired)} files re-keyed — same-named transcripts had overwritten each other's events (#58)`);
   if (skipped_noise) console.log(`  noise:       ${fmt(skipped_noise)} events dropped (--keep-noise to disable) -> relic skipped`);
   if (failed) console.log(`  \u26A0 failed:    ${fmt(failed)} (re-run with --verbose to see why)`);
   console.log(`  shards:      ${shards.size} (bank,repo) pair${shards.size === 1 ? "" : "s"}` +
@@ -884,7 +886,8 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
   console.log("");
 
   for (const e of tail) {
-    const t = e.text.replace(/\s+/g, " ").trim();
+    // A channel envelope is ~180 chars of routing before a word the human typed.
+    const t = (e.role === "user" ? stripEnvelope(e.text) : e.text).replace(/\s+/g, " ").trim();
     if (!t) continue;
     const cut = handoffBudget(e.role, chars);
     const body = t.length > cut ? t.slice(0, cut) + " …" : t;

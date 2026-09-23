@@ -20,16 +20,28 @@ SEP = chr(31)
 
 
 def uid_of(source: str, file_key: str, seq: int) -> str:
-    """Event identity. Deliberately EXCLUDES the directory.
+    """Event identity. Deliberately EXCLUDES the root and project directory.
 
-    Only the basename and the line number participate, so the same transcript found
-    under two roots (live + archive, or two machines) collapses to one row.
+    Only the path INSIDE the session tree (see tree_key_of) and the line number
+    participate, so the same transcript found under two roots (live + archive, or two
+    machines) collapses to one row.
 
     It hashes a LINE SLOT, not an event — which is why search dedup keys on content
     instead of uid. A resumed session writes a new file under the same uuid whose
     slot 7 holds a different event entirely.
     """
     return hashlib.sha1(SEP.join([source, file_key, str(seq)]).encode("utf-8")).hexdigest()
+
+
+def tree_key_of(file_path: str) -> str:
+    # Basename at the top of a project dir, path from the session dir below it: one agent file can sit in two trees (#58).
+    parts = file_path.split("/")
+    n = len(parts)
+    if n >= 5 and parts[n - 3] == "workflows" and parts[n - 4] == "subagents":
+        return "/".join(parts[n - 5:])
+    if n >= 3 and parts[n - 2] == "subagents":
+        return "/".join(parts[n - 3:])
+    return parts[n - 1]
 
 
 def as_obj(v: Any) -> Optional[dict]:
@@ -173,3 +185,29 @@ _HOST_PREAMBLE = [
 def is_host_preamble(text) -> bool:
     t = str(text or "").lstrip()
     return any(rx.match(t) for rx in _HOST_PREAMBLE)
+
+
+# Tags whose content later code reads: slash-command promotion and the caveat drop.
+_STRUCTURAL_TAGS = {
+    "command-name", "command-message", "command-args",
+    "local-command-caveat", "local-command-stdout", "local-command-stderr",
+}
+_ENVELOPE = re.compile(r"^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)")
+# The channel tag itself, anywhere (from #80); `<channel-id>` in quoted CLI usage is not it.
+_CHANNEL_TAG = re.compile(r"</?channel(?=[\s>])[^>]*>", re.I)
+
+
+def strip_envelope(text) -> str:
+    """Mirror of stripEnvelope in src/types.ts — same cases, same results."""
+    raw = str(text or "")
+    t = raw
+    for _ in range(8):
+        m = _ENVELOPE.match(t)
+        if not m or m.group(1).lower() in _STRUCTURAL_TAGS or is_host_preamble(t):
+            break
+        t = t[m.end():]
+        close = t.find(f"</{m.group(1)}>")
+        if close >= 0:
+            t = t[:close] + " " + t[close + len(m.group(1)) + 3:]
+    t = _CHANNEL_TAG.sub(" ", t)
+    return raw if t == raw else t.strip()
