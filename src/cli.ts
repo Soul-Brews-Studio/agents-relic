@@ -17,7 +17,7 @@ import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
 import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
-import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
 import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
 import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
@@ -799,8 +799,8 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * that nothing carries over. So the recovery prompt must not contain an id, or it
  * goes stale the moment it is used once.
  *
- * FILESYSTEM, NOT THE INDEX. mtime is the only thing that knows which transcript was
- * written last, and the index is always at least one run behind a live session.
+ * FILESYSTEM, NOT THE INDEX — the index is always at least one run behind a live session.
+ * Ranked by last event, not mtime: a metadata-only rewrite must not resurrect an idle one (#67).
  *
  * The current session is excluded by id from the host env when it is set, and by
  * "youngest file" when it is not — a brand new session has usually already flushed a
@@ -808,7 +808,7 @@ async function cmdSessions(f: Record<string, string | boolean>) {
  * own empty transcript.
  */
 async function previousSessionFile(cwd: string): Promise<{ file: string; id: string } | null> {
-  const { encodeProjectDir, sessionIdFromEnv, liveRoots } = await import("./live.js");
+  const { encodeProjectDir, sessionIdFromEnv, liveRoots, rankByLastEvent } = await import("./live.js");
   const { readdirSync, statSync } = await import("node:fs");
   const { join } = await import("node:path");
   const me = sessionIdFromEnv()?.id ?? "";
@@ -825,7 +825,7 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
       }
     } catch { /* root without this project */ }
   }
-  found.sort((a, b) => b.mtime - a.mtime);
+  const ranked = rankByLastEvent(found.map(x => ({ ...x, path: x.file, mtimeMs: x.mtime })), 8);
 
   /*
    * NEWEST IS NOT THE SAME AS WORTH READING.
@@ -839,14 +839,14 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
    * filter. Parsing stops at the first real hit, so the normal case costs one parse.
    */
   const { parserFor } = await import("./sources.js");
-  for (const c of found.slice(0, 8)) {
+  for (const c of ranked.slice(0, 8)) {
     try {
       const p = await parserFor(c.file)(c.file);
       const human = p.events.some(e => e.role === "user" && !isHarnessTurn(e.text));
       if (human && p.events.length > 2) return { file: c.file, id: c.id };
     } catch { /* unreadable: try the next */ }
   }
-  return found[0] ?? null;      // nothing substantial — hand back the newest and say so
+  return ranked[0] ?? null;     // nothing substantial — hand back the newest and say so
 }
 
 /*
@@ -1417,8 +1417,9 @@ async function cmdNow(f: Record<string, string | boolean>) {
     if (!live.length) { console.log(`nothing written in the last ${humanAge(windowSec)}`); return; }
     console.log(`${live.length} session${live.length === 1 ? "" : "s"} active in the last ${humanAge(windowSec)}\n`);
     for (const s of live) {
-      console.log(`${humanAge(s.ageSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
-        `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}`);
+      const wrote = Math.abs(s.ageSec - s.eventAgeSec) > 180 ? `  (write ${humanAge(s.ageSec)} ago)` : "";
+      console.log(`${humanAge(s.eventAgeSec).padStart(5)} ago  ${s.sessionUuid.slice(0, 8)}  ` +
+        `${String(s.agents).padStart(3)} live agent${s.agents === 1 ? " " : "s"}  ${s.title ?? "(untitled)"}${wrote}`);
       console.log(`            ${s.cwd ?? s.projectDir}`);
     }
     return;
@@ -1442,7 +1443,7 @@ async function cmdNow(f: Record<string, string | boolean>) {
   if (mode === "plain") { console.log(cur.sessionUuid); return; }
 
   console.log(`${cur.title ?? "(untitled)"}\n`);
-  console.log(`${cur.sessionUuid}  ·  last write ${humanAge(cur.ageSec)} ago`);
+  console.log(`${cur.sessionUuid}  ·  ${clockLabel(cur.ageSec, cur.eventAgeSec)}`);
   console.log(`${cur.cwd}`);
   // The encoding maps both "/" and "." to "-", so two checkouts CAN land in the same
   // project directory. Say so rather than presenting a guess as a fact.

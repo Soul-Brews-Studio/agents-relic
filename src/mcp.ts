@@ -9,7 +9,7 @@ import {
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
-import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
+import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
 import { trace } from "./trace.js";
 
 /**
@@ -183,7 +183,8 @@ const TOOLS = [
       "the working directory and lists its live agents plus an activity timeline. " +
       "With all=true: every session written to recently across this machine, newest " +
       "first — the 'which agents are alive' question. " +
-      "Answered from file mtime, NOT the index: a transcript being appended to right now " +
+      "Answered from the files, NOT the index (mtime prefilters, the last timestamped record " +
+      "ranks — hosts rewrite metadata without one): a transcript being appended to right now " +
       "cannot be in an index that already ran, so this is the only tool here that is " +
       "current to the second. Use it to learn your own session id.",
     inputSchema: {
@@ -275,7 +276,7 @@ async function run(name: string, a: any): Promise<string> {
       if (!live.length) return `nothing written in the last ${humanAge(windowSec)}`;
       const L = [`${live.length} session(s) active in the last ${humanAge(windowSec)}`, ""];
       for (const x of live) {
-        L.push(`${humanAge(x.ageSec).padStart(5)} ago  ${x.sessionUuid}  ` +
+        L.push(`${humanAge(x.eventAgeSec).padStart(5)} ago  ${x.sessionUuid}  ` +
                `${x.agents} live agent(s)  ${x.title ?? "(untitled)"}`);
         L.push(`            ${x.cwd ?? x.projectDir}`);
       }
@@ -290,7 +291,7 @@ async function run(name: string, a: any): Promise<string> {
     const agents = all.filter(x => x.tier !== "session" && x.ageSec <= windowSec);
     const L = [
       cur.title ?? "(untitled)",
-      `${cur.sessionUuid} · last write ${humanAge(cur.ageSec)} ago`,
+      `${cur.sessionUuid} · ${clockLabel(cur.ageSec, cur.eventAgeSec)}`,
       cur.cwd,
     ];
     // The encoding maps both "/" and "." to "-", so two checkouts can share a project
