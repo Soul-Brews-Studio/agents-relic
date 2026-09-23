@@ -10,6 +10,7 @@ import { resolveRepoKey, listShards, repoKeyOf } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
 import { importFiles } from "./import.js";
 import { buildChain, type Chain, type ChainRow } from "./chain.js";
+import { treeFiles } from "./live.js";
 
 /**
  * Reading from the index — every lookup relic can do, as functions that return DATA.
@@ -697,12 +698,45 @@ export async function resolveSession(
   return { rows: byName, imported: 0, matchedBy: "name" };
 }
 
+export interface Unindexed { missing: number; onDisk: number; repo: string }
+
+/**
+ * Transcripts of this tree that exist on disk but have no index row. A --since-windowed
+ * index silently drops old subagents, and `chain` then reads as "nothing ran" (#72).
+ */
+export function unindexedOf(rows: ChainRow[]): Unindexed | null {
+  const trees = new Map<string, { dir: string; uuid: string; paths: Set<string>; repo: string }>();
+  for (const r of rows) {
+    const i = r.project_dir ? r.file_path.indexOf(`/${r.project_dir}/`) : -1;
+    if (i < 0) continue;
+    const dir = r.file_path.slice(0, i + 1 + r.project_dir.length);
+    const k = `${dir}\0${r.session_uuid}`;
+    if (!trees.has(k)) trees.set(k, { dir, uuid: r.session_uuid, paths: new Set(), repo: r.repo_key });
+    trees.get(k)!.paths.add(r.file_path);
+  }
+  let worst: Unindexed | null = null;
+  for (const t of trees.values()) {
+    const files = treeFiles(t.dir, t.uuid);
+    // Claude's layout only: <dir>/<uuid>.jsonl plus <dir>/<uuid>/subagents/.
+    if (!files.some(f => f.tier === "session")) continue;
+    const missing = files.filter(f => !t.paths.has(f.path)).length;
+    if (missing && (!worst || missing > worst.missing)) worst = { missing, onDisk: files.length, repo: t.repo };
+  }
+  return worst;
+}
+
+export function unindexedHint(u: Unindexed): string {
+  const repo = u.repo && u.repo !== "_unresolved" ? ` --repo ${u.repo.replace(/^github\.com\//, "")}` : "";
+  return `(!) ${u.missing} of ${u.onDisk} transcripts in this tree are not indexed — reindex: relic index${repo}`;
+}
+
 /** The session tree on one time axis. Resolves the id the same way `session` does. */
 export async function chainOf(
   id: string, s: Scope & { noIndex?: boolean; skipNoise?: boolean } = {},
-): Promise<{ chain: Chain | null; imported: number }> {
+): Promise<{ chain: Chain | null; imported: number; unindexed: Unindexed | null }> {
   const { rows, imported } = await resolveSession(id, s);
-  return { chain: rows.length ? buildChain(id, rows as ChainRow[]) : null, imported };
+  return { chain: rows.length ? buildChain(id, rows as ChainRow[]) : null, imported,
+           unindexed: rows.length ? unindexedOf(rows as ChainRow[]) : null };
 }
 
 export interface ContextLine { seq: number; role: string; text: string; target: boolean }
