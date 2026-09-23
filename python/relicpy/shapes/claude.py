@@ -12,7 +12,7 @@ import os
 import re
 
 from ..models import ParsedEvent, ParsedFile
-from ..types import as_obj, block_role, flatten_content, s, tree_key_of, truncate, uid_of
+from ..types import as_obj, block_role, flatten_content, s, strip_envelope, tree_key_of, truncate, uid_of
 
 # Roles whose text is worth full-text indexing. UI/state events are counted, not indexed.
 INDEXED = {"user", "assistant", "system"}
@@ -91,7 +91,7 @@ def parse(file_path: str) -> ParsedFile:
             role = block_role(raw) or (s(msg.get("role")) if msg else None) or typ
 
             if not description and role == "user":
-                description = truncate(text, 200)
+                description = truncate(strip_envelope(text), 200)
             events.append(ParsedEvent(
                 uid=uid_of("claude", uid_key, seq),    # root-independent by design
                 seq=seq, role=role, ts=ts, text=truncate(text), cwd=line_cwd,

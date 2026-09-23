@@ -181,3 +181,29 @@ export function isHostPreamble(text: unknown): boolean {
   const t = String(text ?? "").trimStart();
   return HOST_PREAMBLE.some(rx => rx.test(t));
 }
+
+// Tags whose content later code reads: slash-command promotion and the caveat drop.
+const STRUCTURAL_TAGS = new Set([
+  "command-name", "command-message", "command-args",
+  "local-command-caveat", "local-command-stdout", "local-command-stderr",
+]);
+
+// The channel tag itself, open or close, anywhere in the text (from #80). Followed by space
+// or `>`, so a `<channel-id>` placeholder in quoted CLI usage is left alone.
+const CHANNEL_TAG = /<\/?channel(?=[\s>])[^>]*>/gi;
+
+// Host envelopes, wrapped text kept. Leading: any tag of any length, cut-off ones included
+// (<channel …>, <teammate-message …>, <hook_prompt …>). Anywhere: channel tags only.
+export function stripEnvelope(text: string): string {
+  const raw = String(text ?? "");
+  let t = raw;
+  for (let i = 0; i < 8; i++) {
+    const m = /^\s*<([a-zA-Z][\w-]*)\b[^>]*(?:>|$)/.exec(t);
+    if (!m || STRUCTURAL_TAGS.has(m[1].toLowerCase()) || isHostPreamble(t)) break;
+    t = t.slice(m[0].length);
+    const close = t.indexOf(`</${m[1]}>`);
+    if (close >= 0) t = t.slice(0, close) + " " + t.slice(close + m[1].length + 3);
+  }
+  t = t.replace(CHANNEL_TAG, " ");
+  return t === raw ? raw : t.trim();
+}

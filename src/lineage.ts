@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { loadSources, transcriptRoots } from "./sources.js";
 import { encodeProjectDir, treeFiles } from "./live.js";
 import { dur, zoneOffset } from "./time.js";
+import { stripEnvelope } from "./types.js";
 
 /**
  * Which session ids are ONE line of work.
@@ -124,7 +125,8 @@ export function probe(path: string, id: string): LineageNode {
     if (r.type === "user" && !r.isMeta) {
       const text = textOf(r.message?.content).trim();
       if (!started && text.includes("<command-name>/clear</command-name>")) started = "clear";
-      if (!prompt && text && !text.startsWith("<")) prompt = text.split("\n")[0].slice(0, 60);
+      const said = stripEnvelope(text);
+      if (!prompt && said && !said.startsWith("<")) prompt = said.split("\n")[0].slice(0, 60);
     }
     if (r.type === "custom-title" && typeof r.customTitle === "string") custom = r.customTitle;
     if (r.type === "ai-title" && typeof r.aiTitle === "string") ai = r.aiTitle;
