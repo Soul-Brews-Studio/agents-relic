@@ -9,6 +9,7 @@ import { queryProviderFor } from "./embed.js";
 import { discover, parseSince } from "./discover.js";
 import { resolveRepoKey, listShards, repoKeyOf } from "./repo.js";
 import { seekOnDisk } from "./seek.js";
+import { walkFailures, type WalkFailure } from "./unreadable.js";
 import { importFiles } from "./import.js";
 import { buildChain, type Chain, type ChainRow } from "./chain.js";
 import { treeFiles } from "./live.js";
@@ -190,10 +191,10 @@ export interface SearchResult {
  * single rare identifier, and fires for "herdr pane run agent prompt
  * recent-unwrapped" (every remaining term >= 0.55) — the two ends of the measured
  * range. "the"/"in"/"of" never reach the probe at all: they are stopwords in
- * `contentTerms`, matching the fact that the FTS index itself returns 0 hits for
- * them (measured: `t.search("the", "fts")` on a live shard — the tokenizer drops
- * them, so counting them toward rarity would misclassify every stopword as
- * "specific").
+ * `contentTerms`. That began as matching the index, whose tokenizer dropped them —
+ * `t.search("the", "fts")` returned 0 hits, which the probe would read as "rare".
+ * Since #97 the index keeps every word, so "the" would probe as common instead;
+ * skipping it now just saves a probe, since a stopword can never anchor a query.
  *
  * MIN TERM COUNT IS 2, NOT NAT'S PROPOSED 3: the issue's own motivating failure —
  * "facebook transcribe" — is two words. Gating on 3 would never fire on the report
@@ -1315,6 +1316,12 @@ export interface PendingReport {
   files: PendingFile[];
   /** Pending files that exist but were not listed, because `list` capped the output. */
   filesOmitted: number;
+  /**
+   * Paths discovery could not read (#99). Files under them are in none of the counts
+   * above, so "nothing pending" is only true of what the walk could see — this is how
+   * a caller that never sees stderr (an MCP client) finds out.
+   */
+  unreadable: WalkFailure[];
 }
 
 /**
@@ -1376,6 +1383,7 @@ export async function pendingReport(
   // above; without the same filter here, discover() returns every source's files and
   // each one counts as `missing` against a manifest that was never asked for them.
   const found = discover(s.corpus ?? null, sinceMs).filter(f => !s.bank || f.bank === s.bank);
+  const unreadable = walkFailures();
 
   const groups = new Map<string, PendingGroup>();
   let indexed = 0, changed = 0, missing = 0, newest: number | null = null;
@@ -1440,5 +1448,6 @@ export async function pendingReport(
     found: found.length, indexed, changed, missing,
     newestPendingMs: newest, scanMs: Date.now() - t0,
     files, filesOmitted: Math.max(0, pending.length - files.length),
+    unreadable,
   };
 }

@@ -373,7 +373,7 @@ function markLines(n: LineageNode): string[] {
 }
 
 // A uuid is unique in 8 chars; a Hermes id opens with its date, so it is kept whole.
-const shortId = (id: string) => (/^[0-9a-f]{8}-/i.test(id) ? id.slice(0, 8) : id);
+export const shortId = (id: string) => (/^[0-9a-f]{8}-/i.test(id) ? id.slice(0, 8) : id);
 
 function linkLine(l: Link): string {
   const gap = dur(l.gapMs);

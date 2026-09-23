@@ -54,6 +54,7 @@ export function hermesSessions(dbPath: string): { id: string; mtime: number; row
       LEFT JOIN messages m ON m.session_id = s.id AND m.active = 1
       GROUP BY s.id
       HAVING n > 0
+      ORDER BY ts DESC, s.id
     `).all() as { id: string; ts: number; n: number }[];
     return rows.map(r => ({
       id: String(r.id),

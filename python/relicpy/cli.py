@@ -400,6 +400,10 @@ def cmd_pending(a) -> int:
         return 0
     print(f"found {r.found:,}  indexed {r.indexed:,}  missing {r.missing:,}  "
           f"changed {r.changed:,}   {r.scan_ms} ms")
+    if r.unreadable:
+        n = len(r.unreadable)
+        print(f"⚠ {n:,} path{'' if n == 1 else 's'} could not be read (named on stderr) — "
+              f"files under {'it are' if n == 1 else 'them are'} in none of these counts")
     # "is anything pending, and how recent" is one question; the TypeScript CLI has
     # always answered the second half and this one silently dropped it.
     if r.newest_pending_ms:
@@ -433,7 +437,8 @@ def cmd_pending(a) -> int:
             if a.paths:
                 print(f"  {'':<17} {x.path}")
     elif r.missing + r.changed == 0:
-        print("\nnothing pending — every discovered file is in the index.")
+        print("\nnothing pending among the files the walk could read." if r.unreadable else
+              "\nnothing pending — every discovered file is in the index.")
     if r.files_omitted:
         print(f"\n  ... and {r.files_omitted:,} more pending (--list N)")
     return 0
@@ -551,6 +556,8 @@ def _resolve_source_path(a, only) -> Optional[tuple[str, str]]:
 def cmd_index(a) -> int:
     from .discover import discover, parse_since
     from .importer import import_files
+    from .noise import log_skipped
+    from .unreadable import walk_failures
     only = a.corpus.split(",") if a.corpus and a.corpus != "all" else None
     since_ms = parse_since(a.since)
     override = _resolve_source_path(a, only)
@@ -560,20 +567,29 @@ def cmd_index(a) -> int:
           f"{'since ' + a.since if a.since else 'full history'}"
           f"{' · DRY RUN — no writes' if a.dry_run else ''})", file=sys.stderr)
     found = discover(only, since_ms, override)
+    unreadable = walk_failures()
     print(f"  scanned {len(found):,} files", file=sys.stderr)
     if a.dry_run:
         print("--dry-run: nothing written")
         return 0
+    log_skipped(unreadable, getattr(a, "data_root", None))
     t = import_files(found, data_root=getattr(a, "data_root", None),
                      in_repo=getattr(a, "in_repo", False),
                      repo_filter=a.repo, progress=True, verbose=a.verbose)
     print(f"  scanned:     {len(found):,} files")
+    if unreadable:
+        n = len(unreadable)
+        print(f"  ⚠ unreadable: {n:,} path{'' if n == 1 else 's'} could not be read, "
+              f"nothing in {'it' if n == 1 else 'them'} indexed -> relic skipped --files")
     print(f"  unchanged:   {t.skipped:,} (mtime+size match, never re-read)")
     print(f"  imported:    {t.imported:,} files -> {t.added:,} events")
     print(f"  shards:      {t.shards.size} (bank,repo) pairs, {t.fts_built} fts index "
           f"built in {t.fts_ms/1000:.1f}s")
     if t.fts_upgraded:
         print(f"  fts:         {t.fts_upgraded} shard(s) rebuilt from `simple` to ICU")
+    if t.fts_drifted:
+        print(f"  fts:         {t.fts_drifted} shard(s) rebuilt — the old index dropped stop words, "
+              f"\"nas\" and \"bin\" among them (#97)")
     if t.fts_simple:
         print(f"  ! fts:       {len(t.fts_simple)} shard(s) on the `simple` tokenizer — this LanceDB "
               f"build has no ICU. Thai substring search degraded on this shard; a later run "
@@ -594,7 +610,7 @@ def cmd_index(a) -> int:
         plan = prune(t, apply=True, max_drop_pct=max_drop, force=getattr(a, "force", False),
                      data_root=getattr(a, "data_root", None),
                      in_repo=getattr(a, "in_repo", False),
-                     since_ms=since_ms, repo_filter=a.repo)
+                     since_ms=since_ms, repo_filter=a.repo, unreadable=len(unreadable))
         _report_prune(plan, max_drop)
     return 0
 
@@ -670,6 +686,7 @@ def cmd_prune(a) -> int:
     from .discover import discover
     from .importer import import_files
     from .prune import prune, DEFAULT_MAX_DROP_PCT
+    from .unreadable import walk_failures
 
     # --since/--repo would silently change WHAT WAS SCANNED, so reject them before the
     # scan rather than refusing after it.
@@ -699,16 +716,20 @@ def cmd_prune(a) -> int:
           f"{'APPLY — rows will be deleted' if apply_it else 'dry run'} · "
           f"ceiling {max_drop:g}%)", file=sys.stderr)
     found = discover(only, None)
+    unreadable = len(walk_failures())
     t = import_files(found, data_root=getattr(a, "data_root", None),
                      in_repo=getattr(a, "in_repo", False),
                      progress=True, verbose=a.verbose, no_write=True)
     print(f"  scanned:     {len(found):,} files -> {len(t.seen)} shards reached")
     if t.failed:
         print(f"  ⚠ failed:    {t.failed:,} (re-run with --verbose to see why)")
+    if unreadable:
+        print(f"  ⚠ unreadable: {unreadable:,} path{'' if unreadable == 1 else 's'} (named on stderr)")
 
     plan = prune(t, apply=apply_it, max_drop_pct=max_drop, force=getattr(a, "force", False),
                  data_root=getattr(a, "data_root", None),
-                 in_repo=getattr(a, "in_repo", False), since_ms=None, repo_filter=None)
+                 in_repo=getattr(a, "in_repo", False), since_ms=None, repo_filter=None,
+                 unreadable=unreadable)
     _report_prune(plan, max_drop)
     print(f"  {time.time()-t0:.1f}s")
     return 1 if plan.refused else 0
@@ -808,21 +829,55 @@ def cmd_trace(a) -> int:
     return 0
 
 
+def cmd_skipped_files(a) -> int:
+    """Paths the walk could not read (#99): the file-scoped half of the proof log. One row
+    per PATH — an unreadable directory is logged again by every index run until fixed."""
+    from .noise import read_skipped_files
+    from .time import local_date_time
+    r = read_skipped_files(getattr(a, "data_root", None))
+    if _json(a):
+        print(json.dumps(r, indent=2))
+        return 0
+    if not r["total"]:
+        print("no unreadable paths logged")
+        return 0
+    print(f"{r['total']:,} path{'' if r['total'] == 1 else 's'} the walk could not read — "
+          f"nothing in {'it' if r['total'] == 1 else 'them'} was indexed\n")
+    for b in r["by_rule"]:
+        print(f"  {b['rule']:<26} {b['n']:>7,}")
+    for b in r["by_rule"]:
+        rows = [x for x in r["paths"] if x["rule"] == b["rule"]]
+        print(f"\n  [{b['rule']}]")
+        for x in rows[:a.limit]:
+            runs = f"  ·  logged by {x['runs']:,} runs" if x["runs"] > 1 else ""
+            print(f"    {x['path']}")
+            print(f"        {x['error']}  ·  last {local_date_time(x['ts'])}{runs}")
+        if len(rows) > a.limit:
+            print(f"    ... and {len(rows) - a.limit:,} more (--limit N, or --json)")
+    return 0
+
+
 def cmd_skipped(a) -> int:
-    from .noise import read_skipped
+    if getattr(a, "files", False):
+        return cmd_skipped_files(a)
+    from .noise import read_skipped, read_skipped_files
     r = read_skipped(getattr(a, "data_root", None), a.limit)
     if _json(a):
         print(json.dumps(r, indent=2))
         return 0
     if not r["total"]:
         print("nothing dropped yet — --skip-noise is opt-in, and every drop is logged here")
-        return 0
-    print(f"{r['total']:,} events dropped · {r['bytes']/1e6:.2f} MB\n")
-    for b in r["by_rule"]:
-        print(f"  {b['rule']:<22} {b['n']:>7}  {b['bytes']/1e6:>7.2f} MB")
-    print("\nmost recent:")
-    for x in r["rows"]:
-        print(f"  {x.get('rule','?'):<22} {str(x.get('head',''))[:80]}")
+    else:
+        print(f"{r['total']:,} events dropped · {r['bytes']/1e6:.2f} MB\n")
+        for b in r["by_rule"]:
+            print(f"  {b['rule']:<22} {b['n']:>7}  {b['bytes']/1e6:>7.2f} MB")
+        print("\nmost recent:")
+        for x in r["rows"]:
+            print(f"  {x.get('rule','?'):<22} {str(x.get('head',''))[:80]}")
+    # Same log, other kind of row: point at it rather than fold paths into event counts.
+    lost = read_skipped_files(getattr(a, "data_root", None))["total"]
+    if lost:
+        print(f"\n{lost:,} path{'' if lost == 1 else 's'} the walk could not read -> relic skipped --files")
     return 0
 
 
@@ -1021,6 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
     sk = sub.add_parser("skipped", parents=[common],
                         help="what --skip-noise dropped, and the proof")
     sk.add_argument("--limit", type=int, default=20)
+    sk.add_argument("--files", action="store_true",
+                    help="paths the walk could not read, so nothing in them was indexed")
     sk.set_defaults(func=cmd_skipped)
 
     bk = sub.add_parser("backend", parents=[common],

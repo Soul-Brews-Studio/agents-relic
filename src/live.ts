@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { loadSources, transcriptRoots } from "./sources.js";
+import { dirUnreadable, walkError, reachable } from "./unreadable.js";
 
 /**
  * What is running RIGHT NOW — answered from the filesystem, never from the index.
@@ -139,20 +140,23 @@ export interface LiveFile {
   eventAgeSec?: number;
 }
 
+// An unreadable directory would hide an ACTIVE session from now/live with no
+// diagnostic, so anything but ENOENT is reported (#99) — see unreadable.ts.
 function jsonlIn(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isFile() && e.name.endsWith(".jsonl")).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(dir, e); return []; }
 }
 function subdirs(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isDirectory()).map(e => e.name);
-  } catch { return []; }
+  } catch (e) { dirUnreadable(dir, e); return []; }
 }
 function statOf(p: string) {
-  try { const s = statSync(p); return { mtimeMs: s.mtimeMs, size: s.size }; } catch { return null; }
+  try { const s = statSync(p); return { mtimeMs: s.mtimeMs, size: s.size }; }
+  catch (e) { walkError(p, e); return null; }
 }
 
 /**
@@ -387,6 +391,7 @@ export interface LiveSession {
   ageSec: number;         // freshest write in the tree
   eventAgeSec: number;    // freshest event in the tree — what the window is judged on
   agents: number;         // live children
+  source?: "hermes";      // no transcript: rows in the state.db named by projectDir, so files is empty
 }
 
 /**
@@ -497,7 +502,7 @@ export function liveRoots(): string[] {
   const seen = new Set<string>();
   for (const src of loadSources())
     for (const root of transcriptRoots(src))
-      if (existsSync(root)) seen.add(root);
+      if (reachable(root)) seen.add(root);
   return [...seen];
 }
 
@@ -531,6 +536,10 @@ export async function liveSessions(windowSec = 300, limit = 20): Promise<LiveSes
                    agents: files.filter(f => f.tier !== "session").length });
     }
   }
+  // Hermes writes no transcript for the sweep to find; its sessions come from state.db
+  // (#100). Imported here, not at the top: live-hermes -> lineage-hermes -> lineage -> here.
+  const { hermesLive } = await import("./live-hermes.js");
+  found.push(...hermesLive(windowSec));
   found.sort((a, b) => a.eventAgeSec - b.eventAgeSec);
   return found.slice(0, limit);
 }
