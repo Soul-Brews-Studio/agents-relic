@@ -204,8 +204,9 @@ class LanceStore:
                 q = q.where(where)
             return q.to_list()
         except Exception:
-            safe = query.replace("'", "''")
-            clause = f"text LIKE '%{safe}%'"
+            # FTS lower-cases its tokens; a raw LIKE does not, so fold both sides.
+            safe = query.lower().replace("'", "''")
+            clause = f"lower(text) LIKE '%{safe}%'"
             if where:
                 clause = f"({clause}) AND ({where})"
             return t.search().where(clause).limit(limit).to_list()

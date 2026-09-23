@@ -23,6 +23,17 @@ import { truncate, uidOf, type ParsedEvent, type Parser } from "../types.js";
  * Claude transcript, no path guessing.
  */
 
+const warned = new Set<string>();
+
+/** One stderr line per DB and error, so a schema mismatch is visible without flooding a walk. */
+export function warnOnce(dbPath: string, e: unknown): void {
+  const msg = e instanceof Error ? e.message : String(e);
+  const key = `${dbPath}\0${msg}`;
+  if (warned.has(key)) return;
+  warned.add(key);
+  process.stderr.write(`hermes: ${dbPath}: ${msg}\n`);
+}
+
 /** Split "<db path>#<session id>" back into its parts. */
 export function splitHermesPath(p: string): { db: string; sessionId: string } {
   const i = p.lastIndexOf("#");
@@ -34,9 +45,10 @@ export function hermesSessions(dbPath: string): { id: string; mtime: number; row
   let db: Database | null = null;
   try {
     db = new Database(dbPath, { readonly: true });
+    // Newest active message, not `last_activity_at`: some 0.19.1 builds lack that column (#60).
     const rows = db.query(`
       SELECT s.id AS id,
-             COALESCE(s.last_activity_at, s.started_at, 0) AS ts,
+             COALESCE(MAX(m.timestamp), s.started_at, 0) AS ts,
              COUNT(m.id) AS n
       FROM sessions s
       LEFT JOIN messages m ON m.session_id = s.id AND m.active = 1
@@ -49,7 +61,10 @@ export function hermesSessions(dbPath: string): { id: string; mtime: number; row
       mtime: Math.floor(Number(r.ts) || 0),
       rows: Number(r.n) || 0,
     }));
-  } catch { return []; }
+  } catch (e) {
+    warnOnce(dbPath, e);
+    return [];
+  }
   finally { db?.close(); }
 }
 
@@ -137,7 +152,10 @@ export const parseHermes: Parser = async (filePath) => {
         seq, role, ts, text: truncate(text),
       });
     }
-  } catch { /* unreadable or locked DB -> empty session, never a crash */ }
+  } catch (e) {
+    // Unreadable, locked or schema-drifted -> empty session, never a crash, but never silent.
+    warnOnce(dbPath, e);
+  }
   finally { db?.close(); }
 
   return {

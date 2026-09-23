@@ -3,7 +3,7 @@ import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
-import { loadSources } from "./sources.js";
+import { loadSources, transcriptRoots } from "./sources.js";
 
 /**
  * What is running RIGHT NOW — answered from the filesystem, never from the index.
@@ -248,7 +248,8 @@ async function sessionByUuid(uuid: string, cwd: string): Promise<CurrentSession 
           for (const d of desc(join(src.path, y, m)))
             roots.push(join(src.path, y, m, d));
     } else {
-      for (const proj of subdirs(src.path)) roots.push(join(src.path, proj));
+      for (const root of transcriptRoots(src))
+        for (const proj of subdirs(root)) roots.push(join(root, proj));
     }
     for (const dir of roots) {
       for (const f of jsonlIn(dir)) {
@@ -282,15 +283,17 @@ async function sessionIn(cand: string, cwd: string): Promise<CurrentSession | nu
   let best: { uuid: string; path: string; mtimeMs: number; dir: string } | null = null;
 
   for (const src of loadSources()) {
-    if (src.walk === "flat") continue;              // Codex has no project-dir layout
-    const dir = join(src.path, encodeFor(src.walk, cand));
-    if (!existsSync(dir)) continue;
+    // Codex has no project-dir layout, so transcriptRoots gives it nothing to encode into.
+    for (const root of transcriptRoots(src)) {
+      const dir = join(root, encodeFor(src.walk, cand));
+      if (!existsSync(dir)) continue;
 
-    for (const f of jsonlIn(dir)) {
-      const st = statOf(join(dir, f));
-      if (!st) continue;
-      if (best && st.mtimeMs <= best.mtimeMs) continue;
-      best = { uuid: uuidFromFile(src.walk, f), path: join(dir, f), mtimeMs: st.mtimeMs, dir };
+      for (const f of jsonlIn(dir)) {
+        const st = statOf(join(dir, f));
+        if (!st) continue;
+        if (best && st.mtimeMs <= best.mtimeMs) continue;
+        best = { uuid: uuidFromFile(src.walk, f), path: join(dir, f), mtimeMs: st.mtimeMs, dir };
+      }
     }
   }
   if (!best) return null;
@@ -419,11 +422,9 @@ function tsFresh(roots: string[], windowSec: number): FreshMap {
  */
 export function liveRoots(): string[] {
   const seen = new Set<string>();
-  for (const src of loadSources()) {
-    if (src.walk !== "claude-tiers" && src.walk !== "omp") continue;
-    if (!existsSync(src.path)) continue;
-    seen.add(src.path);
-  }
+  for (const src of loadSources())
+    for (const root of transcriptRoots(src))
+      if (existsSync(root)) seen.add(root);
   return [...seen];
 }
 

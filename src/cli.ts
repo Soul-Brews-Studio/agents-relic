@@ -13,11 +13,13 @@ import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
 import { helpText } from "./help.js";
 import { stripEnvelope } from "./types.js";
+import { progress, clearLine } from "./progress.js";
 import { flags } from "./flags.js";
 import { isHarnessTurn, handoffBudget, isInboundTurn } from "./recap.js";
-import { localDateTime, localTime, zoneOffset, dur, handoffStats } from "./time.js";
+import { localDateTime, localTime, zoneOffset, dur, handoffStats, usableStamps } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge } from "./live.js";
-import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir } from "./lineage.js";
+import { findSessions, buildLineage, renderLineage, lineageJSON, isClaudeProjectDir, type Lineage } from "./lineage.js";
+import { findHermesSessions, buildHermesLineage, disabledHermesRoots } from "./lineage-hermes.js";
 import { dig as runDig, defaultProjectDirs } from "./dig.js";
 import { Shards, importFiles, type ImportOpts, type ImportTally } from "./import.js";
 
@@ -34,7 +36,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO } from "./query.js";
+         groupByBank, maxISO, unindexedHint } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { ephemeralNote, bankOfHit } from "./ephemeral.js";
@@ -257,7 +259,7 @@ async function cmdPrune(f: Record<string, string | boolean>) {
   const found = discover(only, null);
   const tally = await importFiles(found, { dataRoot, inRepo, noWrite: true, progress: true,
                                           verbose: Boolean(f.verbose) }, t0);
-  process.stderr.write("\r" + " ".repeat(96) + "\r");
+  clearLine();
 
   console.log(`  scanned:     ${fmt(found.length)} files -> ${tally.seen.size} shards reached`);
   if (tally.failed) console.log(`  \u26A0 failed:    ${fmt(tally.failed)} (re-run with --verbose to see why)`);
@@ -858,10 +860,11 @@ async function previousSessionFile(cwd: string): Promise<{ file: string; id: str
 function printHandoff(title: string | undefined, tail: { role: string; ts?: string | null; text: string }[],
                       total: number, chars: number) {
   const humans = tail.filter(e => e.role === "user");
-  const st = handoffStats(humans.map(e => e.ts));
+  const stamps = usableStamps(humans.map(e => e.ts));
+  const st = handoffStats(stamps);
 
   if (title) console.log(title);
-  const counts = `${humans.length} human turns of ${fmt(total)}`;
+  const counts = `${humans.length} human turn${humans.length === 1 ? "" : "s"} of ${fmt(total)}`;
   if (st) {
     // Drop the repeated date on the end ONLY when it is the same day. A 30-hour
     // session printing "22:34 → 04:31" reads as six hours, and the span beside it
@@ -870,6 +873,12 @@ function printHandoff(title: string | undefined, tail: { role: string; ts?: stri
     const end = a.slice(0, 10) === b.slice(0, 10) ? b.slice(11) : b;
     console.log(`${counts}  ·  ${a} → ${end}  ·  ${dur(st.spanMs)} span  ·  ` +
                 `median gap ${dur(st.medianGapMs)}  ·  longest ${dur(st.maxGapMs)}`);
+  } else if (stamps.length === 1) {
+    // One turn has no span to report, but it IS dated, and a handoff block the next
+    // session pastes as its first prompt should say when the work it describes happened.
+    // Saying "no usable timestamps" here reads as a damaged transcript; on a host that
+    // opens a session per inbound message, single-turn sessions are the normal shape.
+    console.log(`${counts}  ·  ${localDateTime(stamps[0])}`);
   } else {
     console.log(`${counts}  ·  no usable timestamps`);
   }
@@ -1130,19 +1139,18 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     reset: Boolean(f.reset),
   };
 
-  let last = 0, drew = false;
+  let last = 0;
+  const bar = progress();
   const r = await embedShards({
     ...o,
     onProgress: p => {
-      if (outFmt(f) !== "text" || p.done - last < 200) return;
-      last = p.done; drew = true;
-      process.stderr.write(`\r  ${p.shard}  ${fmt(p.done)}/${fmt(p.pending)}   `);
+      // Was `!== "text"`, a value outFmt never returns, so it never drew; the Python port says "pretty".
+      if (outFmt(f) !== "pretty" || p.done - last < 200) return;
+      last = p.done;
+      bar.tick(`  ${p.shard}  ${fmt(p.done)}/${fmt(p.pending)}   `, (p.done / Math.max(1, p.pending)) * 100);
     },
   });
-  // Only erase a line that was actually drawn. Clearing unconditionally writes 78
-  // spaces into a terminal that never showed progress, which lands as indentation in
-  // front of the first line of output.
-  if (drew) process.stderr.write("\r" + " ".repeat(78) + "\r");
+  bar.clear();
 
   if (outFmt(f) === "json") { console.log(JSON.stringify(r, null, 2)); return; }
   if (outFmt(f) === "jsonl") { for (const sh of r.shards) console.log(JSON.stringify(sh)); return; }
@@ -1434,26 +1442,41 @@ async function cmdNow(f: Record<string, string | boolean>) {
 
 async function cmdLineage(arg: string | undefined, f: Record<string, string | boolean>) {
   const cur = await currentSession();
-  let target: { id: string; projectDir: string };
+  const all = Boolean(f.all);
+  let l: Lineage;
   if (arg) {
     const hits = findSessions(arg);
-    if (!hits.length) { console.error(`no Claude Code transcript matches ${arg}`); process.exit(1); }
     if (hits.length > 1) {
       console.error(`${arg} matches ${hits.length} sessions — give more of the id:`);
       for (const h of hits.slice(0, 10)) console.error(`  ${h.id}  ${h.projectDir}`);
       process.exit(1);
     }
-    target = hits[0];
+    if (hits.length === 1) l = await buildLineage(hits[0].projectDir, hits[0].id, { all });
+    else {
+      // Not a Claude transcript: a Hermes id links from state.db rows instead (#74).
+      const hermes = findHermesSessions(arg);
+      if (hermes.length > 1) {
+        console.error(`${arg} matches ${hermes.length} Hermes sessions — give more of the id:`);
+        for (const h of hermes.slice(0, 10)) console.error(`  ${h.id}  ${h.db}`);
+        process.exit(1);
+      }
+      if (!hermes.length) {
+        console.error(`no Claude Code transcript or Hermes session matches ${arg}`);
+        for (const r of disabledHermesRoots())
+          console.error(`  (${r} holds Hermes data, but its source is disabled — enable "hermes" in ~/.relic/sources.json)`);
+        process.exit(1);
+      }
+      l = buildHermesLineage(hermes[0].db, hermes[0].id, { all });
+    }
   } else {
     if (!cur) { console.error(`no session transcript for ${process.cwd()} — pass an id`); process.exit(1); }
     if (!isClaudeProjectDir(cur.projectDir)) {
       console.error(`lineage reads Claude Code transcripts; this session is under ${cur.projectDir}`);
       process.exit(1);
     }
-    target = { id: cur.sessionUuid, projectDir: cur.projectDir };
+    l = await buildLineage(cur.projectDir, cur.sessionUuid, { all });
   }
 
-  const l = await buildLineage(target.projectDir, target.id, { all: Boolean(f.all) });
   const mode = outFmt(f);
   if (mode === "json") { console.log(JSON.stringify(lineageJSON(l), null, 2)); return; }
   if (mode === "plain" || mode === "jsonl") {
@@ -1723,14 +1746,17 @@ else if (cmd === "trace") {
 else if (cmd === "lineage") await cmdLineage(pos[1], f);
 else if (cmd === "chain") {
   if (!pos[1]) { console.error("chain needs a session id or prefix"); process.exit(1); }
-  const { chain, imported } = await chainOf(pos[1], {
+  const { chain, imported, unindexed } = await chainOf(pos[1], {
     dataRoot: (f["data-root"] as string) ?? null, inRepo: Boolean(f["in-repo"]),
     noIndex: Boolean(f["no-index"]), skipNoise: wantSkipNoise(f),
   });
   if (imported) process.stderr.write(`not indexed — found ${imported} file(s) on disk, imported\n`);
   if (!chain) console.log(`no session matches ${pos[1]}`);
-  else if (outFmt(f) === "json") console.log(JSON.stringify(chain, null, 2));
-  else console.log(renderChain(chain, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
+  else if (outFmt(f) === "json") console.log(JSON.stringify({ ...chain, unindexed }, null, 2));
+  else {
+    console.log(renderChain(chain, { width: Number(f.width ?? 40), maxRows: Number(f.limit ?? 8) }));
+    if (unindexed) console.log(`\n${unindexedHint(unindexed)}`);
+  }
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);

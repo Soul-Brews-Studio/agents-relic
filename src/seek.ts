@@ -1,6 +1,6 @@
 import { readdirSync, statSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
-import { bankOf, loadSources } from "./sources.js";
+import { bankOf, loadSources, transcriptRoots } from "./sources.js";
 import type { Found, Tier } from "./discover.js";
 
 /**
@@ -42,7 +42,7 @@ export function seekOnDisk(id: string): Found[] {
     // TRANSCRIPT layouts only. `claude-memory` points at the SAME directory as
     // `claude-live`, so without this gate every session id matches a second time, is
     // parsed by parseMemory, and lands as a bogus one-event row in the memory bank.
-    if (src.walk !== "claude-tiers" && src.walk !== "flat" && src.walk !== "omp") continue;
+    if (src.walk !== "claude-tiers" && src.walk !== "claude-home" && src.walk !== "flat" && src.walk !== "omp") continue;
     // Same bank the bulk walker would have stamped. Without it an on-demand
     // `relic session <id>` import writes into the fallback bank instead of the
     // source's own — a misfile that no error would report.
@@ -66,8 +66,9 @@ export function seekOnDisk(id: string): Found[] {
     }
 
     // Claude layout: check all three tiers, since a session id names a TREE.
-    for (const project of dirs(src.path)) {
-      const pp = join(src.path, project);
+    const projects = transcriptRoots(src).flatMap(root => dirs(root).map(name => ({ root, name })));
+    for (const { root, name: project } of projects) {
+      const pp = join(root, project);
 
       for (const f of files(pp)) {
         if (!want(f)) continue;
