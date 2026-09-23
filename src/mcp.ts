@@ -6,6 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
   statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote,
+  matchCount, floorNote,
 } from "./query.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
@@ -370,7 +371,7 @@ async function run(name: string, a: any): Promise<string> {
       return `no shards match${a?.repo ? ` repo~${a.repo}` : ""} — call relic_status to see what is indexed`;
 
     const limit = Number(a.limit ?? 20);
-    const { hits, shards, ms, total, degraded } = await searchEvents(q, {
+    const { hits, shards, ms, total, capped, degraded } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
       allTiers: Boolean(a.all_tiers || a.tier),
@@ -386,10 +387,16 @@ async function run(name: string, a: any): Promise<string> {
     const lossy = degradedNote(degraded, shards);
     if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + (lossy ? `\n${lossy}` : "");
     const narrowed = !a.all_tiers && !a.tier;
-    const L = [`${Math.min(total, limit)} of ${total} matches · ${shards} shards · ${ms} ms` +
+    // Sliced the way the CLI slices since #107, so limit:0 lists every hit here too
+    // rather than "0 of N". A model divides, compares and reports M, so it says when
+    // M is a floor.
+    const top = limit > 0 ? hits.slice(0, limit) : hits;
+    const floor = floorNote(capped, shards, limit);
+    const L = [`${matchCount(top.length, total, capped)} matches · ${shards} shards · ${ms} ms` +
       (narrowed ? "  ·  main sessions only — pass all_tiers:true for subagent/workflow work" : ""),
+      ...(floor ? [`${floor}. limit:0 reads every match — pass repo with it.`] : []),
       ...(lossy ? [lossy] : []), ""];
-    for (const h of hits.slice(0, limit)) {
+    for (const h of top) {
       const i = h.text.toLowerCase().indexOf(q.toLowerCase());
       const snip = i < 0 ? h.text.slice(0, 200) : h.text.slice(Math.max(0, i - 70), i + q.length + 130);
       L.push(`${h.repo}${h.worktree ? ` [${h.worktree}]` : ""} · ${h.source}/${h.tier} · ${h.role} · ${h.ts}`);

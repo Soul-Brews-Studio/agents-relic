@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from .models import Scope
 from .progress import Progress
-from .query import group_by_bank, index_status, search_events
+from .query import floor_note, group_by_bank, index_status, match_count, search_events
 from .repo import banks as list_bank_names
 from .repo import default_root
 
@@ -225,15 +225,22 @@ def cmd_search(a: argparse.Namespace) -> int:
         return 1
     res = search_events(q, _scope(a), limit=a.limit, all_tiers=a.all_tiers)
     if _json(a):
-        print(json.dumps({**{k: res[k] for k in ("shards", "total", "ms")},
+        print(json.dumps({**{k: res[k] for k in ("shards", "total")},
+                          "exhaustive": not res["capped"], "capped": res["capped"], "ms": res["ms"],
                           "hits": [h.model_dump() for h in res["hits"]]}, indent=2))
         return 0
     if not res["hits"]:
         print(f'no matches for "{q}" across {res["shards"]} shards ({res["ms"]} ms)')
         return 0
     narrowed = "" if a.all_tiers else "  ·  main sessions only — --all-tiers for subagent work"
-    print(f'{len(res["hits"])} of {res["total"]} matches · {res["shards"]} shards · '
-          f'{res["ms"]} ms{narrowed}\n')
+    print(f'{match_count(len(res["hits"]), res["total"], res["capped"])} matches · '
+          f'{res["shards"]} shards · {res["ms"]} ms{narrowed}')
+    # Not "--limit 0" as the TypeScript CLI says: here 0 still returns nothing (#94 was
+    # fixed in TypeScript only).
+    floor = floor_note(res["capped"], res["shards"], a.limit)
+    if floor:
+        print(f"  {floor}. Narrow the scope or raise --limit for an exact count.")
+    print()
     for h in res["hits"]:
         wt = f" [{h.worktree}]" if h.worktree else ""
         print(f"{h.repo}{wt} · {h.source}/{h.tier} · {h.role} · {h.ts}")

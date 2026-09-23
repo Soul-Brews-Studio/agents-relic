@@ -121,7 +121,8 @@ export interface SearchResult {
   shards: number;          // shards actually read
   available: number;       // shards that matched the scope
   ms: number;
-  total: number;           // hits before the limit slice
+  total: number;           // hits before the limit slice — every match when `capped` is 0, a floor otherwise
+  capped?: number;         // shards holding more than `limit`, so not read to the end (#95); lexical search only
   generic?: GenericCheck;  // set when warnGeneric ran; undefined if skipped or < 2 shards
   degraded?: string[];     // keys of searched shards on the `simple` tokenizer — Thai substrings missed there
 }
@@ -292,6 +293,25 @@ export async function checkGenericQuery(q: string, shards: { dir: string }[]): P
   return decideGeneric(results);
 }
 
+/**
+ * "N of M" for a search header, where M is called a count only when it is one (#95).
+ *
+ * `total` is what the shards returned, deduped — and each shard is asked for its own
+ * top `limit`, so it measured the fetch, not the corpus: one query read "1 of 640" at
+ * --limit 1 and "400 of 53892" at --limit 400, over the same 1,141 shards. Every match
+ * is 171,790. When no shard was capped, M is that count; when any was, M is a floor.
+ */
+export function matchCount(shown: number, total: number, capped?: number): string {
+  return capped ? `${shown} of at least ${total}` : `${shown} of ${total}`;
+}
+
+/** The line under a header whose total is a floor — null when the total is a count. */
+export function floorNote(capped: number | undefined, searched: number, limit: number): string | null {
+  if (!capped) return null;
+  return `a floor, not a count — ${capped} of ${searched} shards hold more than ${limit} ` +
+         `match${limit === 1 ? "" : "es"} and were not read to the end`;
+}
+
 /** One line for a search header when any searched shard fell back to `simple` — null otherwise. */
 export function degradedNote(degraded: string[] | undefined, searched: number): string | null {
   if (!degraded?.length) return null;
@@ -362,11 +382,24 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
    */
   const mainOnly = !o.tier && !o.allTiers;
   const tier = o.tier;
-  const opts = { limit, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
+  /*
+   * ONE PAST THE LIMIT, so the header knows whether its total is a count (#95).
+   *
+   * A shard that returns limit+1 rows provably holds more than the page; one that
+   * returns fewer was read to the end. If none is capped, the deduped pool IS every
+   * match; if any is, it is a floor. The probe row stays in the pool — it is a real
+   * match, so the floor it raises is still true. It reaches the top `limit` shown only
+   * if a duplicate above it is folded away: its own shard ranks `limit` rows higher.
+   *
+   * Clamped at the native u32: LanceDB wraps anything larger, and 4294967295 + 1 would
+   * arrive as 0 — the k = 0 panic of #94. A limit <= 0 already means every match (#94).
+   */
+  const perShard = limit > 0 ? Math.min(limit + 1, 0xffff_ffff) : limit;
+  const opts = { limit: perShard, tier, mainTiers: mainOnly, source: o.source, worktree: o.worktree, path: o.path,
                  org: o.org, project: o.project, dir: o.dir, memType: o.memType,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose };
 
-  let next = 0;
+  let next = 0, capped = 0;
   await Promise.all(Array.from({ length: Math.min(CAP, shards.length) }, async () => {
     for (;;) {
       const i = next++;
@@ -374,7 +407,9 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
       const s = shards[i];
       try {
         const store = await LanceStore.open(s.dir);
-        for (const h of await store.search(q, opts)) hits.push({ ...h, repo: s.key });
+        const got = await store.search(q, opts);
+        if (limit > 0 && got.length > limit) capped++;
+        for (const h of got) hits.push({ ...h, repo: s.key });
         searched++;
         if ((await store.ftsTokenizer()) === "simple") degraded.push(s.key);
       } catch { /* a shard mid-write can throw; skip rather than abort the fan-out */ }
@@ -406,7 +441,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
   const generic = o.warnGeneric === false ? undefined : (await checkGenericQuery(q, shards)) ?? undefined;
 
   return { hits, shards: searched, available: shards.length,
-           ms: Math.round(performance.now() - t0), total: hits.length, generic, degraded: degraded.sort() };
+           ms: Math.round(performance.now() - t0), total: hits.length, capped, generic, degraded: degraded.sort() };
 }
 
 export interface SemanticOpts extends Scope {
