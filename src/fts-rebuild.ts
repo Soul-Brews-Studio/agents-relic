@@ -6,6 +6,7 @@ export interface FtsRebuild {
   shards: number;                          // on disk, every bank
   rebuilt: number;
   drifted: number;                         // of those, built with other stop-word settings (#97)
+  covered: number;                         // rows the old indexes did not cover, now inside them (#115)
   empty: number;                           // no `events` table, so nothing to index
   kept: number;                            // an ICU index this LanceDB build cannot rewrite
   failed: { key: string; err: string }[];
@@ -28,7 +29,7 @@ export interface FtsRebuild {
 export async function rebuildFts(o: { dataRoot: string | null; inRepo: boolean; progress?: boolean }): Promise<FtsRebuild> {
   const t0 = Date.now();
   const all = listShards(o.dataRoot, o.inRepo);
-  const out: FtsRebuild = { shards: all.length, rebuilt: 0, drifted: 0, empty: 0, kept: 0,
+  const out: FtsRebuild = { shards: all.length, rebuilt: 0, drifted: 0, covered: 0, empty: 0, kept: 0,
                             failed: [], simple: [], noIcu: "", ms: 0 };
   const bar = progress();
   for (let i = 0; i < all.length; i++) {
@@ -41,6 +42,7 @@ export async function rebuildFts(o: { dataRoot: string | null; inRepo: boolean; 
       if (!r.built) { out.kept++; continue; }
       out.rebuilt++;
       if (r.drifted) out.drifted++;
+      out.covered += r.covered ?? 0;
       if (r.tokenizer === "simple") out.simple.push(all[i].key);
     } catch (err) {
       out.failed.push({ key: all[i].key, err: String(err).slice(0, 160) });

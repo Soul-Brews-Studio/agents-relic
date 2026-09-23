@@ -1,7 +1,7 @@
 import * as lancedb from "@lancedb/lancedb";
 import { Index } from "@lancedb/lancedb";
 import { mkdirSync } from "node:fs";
-import { ensureFtsIndex as ensureFts, tokenizerOf, type FtsOutcome, type Tokenizer } from "./fts.js";
+import { ensureFtsIndex as ensureFts, tokenizerOf, ftsStateOf, type FtsOutcome, type Tokenizer } from "./fts.js";
 
 /**
  * The only store. LanceDB holds events, sessions and the manifest; there is no
@@ -345,6 +345,12 @@ export class LanceStore {
     const t = await this.existing("events");
     if (!t) return null;
     return ensureFts(t, opts, config);
+  }
+
+  /** The tokenizer, and the rows its index does not cover yet (#115) — for status, in one listIndices call. */
+  async ftsState(): Promise<{ tokenizer: Tokenizer | null; unindexed: number }> {
+    const t = await this.existing("events");
+    return t ? ftsStateOf(t) : { tokenizer: null, unindexed: 0 };
   }
 
   /** "simple" marks a shard where Thai substring search is degraded; null = no index, LIKE scan. */

@@ -35,6 +35,23 @@ def _drifted(details) -> bool:
     return isinstance(removed, bool) and removed != REMOVE_STOP_WORDS
 
 
+# #115: when a gap of rows outside the index is worth a rebuild — same as src/store/fts.ts.
+COVER_FRACTION = 0.05
+COVER_MIN_ROWS = 1_000
+
+
+def _gap(i) -> int:
+    """Rows an index does not cover yet — appended after it was built. 0 when it does not say."""
+    return int(getattr(i, "num_unindexed_rows", 0) or 0) if i is not None else 0
+
+
+def _behind(i) -> bool:
+    """COVER_FRACTION of the shard and at least COVER_MIN_ROWS outside the index — behind() in fts.ts."""
+    gap = _gap(i)
+    indexed = int(getattr(i, "num_indexed_rows", 0) or 0) if i is not None else 0
+    return gap >= COVER_MIN_ROWS and gap >= COVER_FRACTION * (gap + indexed)
+
+
 def _create_fts(t, tokenizer: str, name: Optional[str]) -> None:
     # EVERY ONE OF THESE MATCHES src/store/fts.ts, and each has a reason.
     #
@@ -423,6 +440,15 @@ class LanceStore:
         safe = file_path.replace("'", "''")
         t.delete(f"file_path = '{safe}'")
 
+    def fts_unindexed(self) -> int:
+        """Rows the full-text index does not cover yet (#115) — 0 with no index."""
+        t = self._existing("events")
+        if t is None:
+            return 0
+        text = [i for i in t.list_indices() if "text" in i.columns]
+        icu = next((i for i in text if i.name != SIMPLE_INDEX), None)
+        return _gap(icu or (text[0] if text else None))
+
     def fts_tokenizer(self) -> Optional[str]:
         """"icu", "simple" (Thai substring search degraded), or None when there is no index."""
         t = self._existing("events")
@@ -445,7 +471,8 @@ class LanceStore:
         # #97: an index built with other stop-word settings is rebuilt as if asked to.
         stale_icu = icu is not None and _drifted(getattr(icu, "index_details", None))
         stale_simple = simple is not None and _drifted(getattr(simple, "index_details", None))
-        if icu is not None and not rebuild and not stale_icu:
+        # #115: and so is one that no longer covers enough of its shard — see _behind().
+        if icu is not None and not rebuild and not stale_icu and not _behind(icu):
             if simple is not None:
                 t.drop_index(SIMPLE_INDEX)  # an upgrade interrupted between create and drop
             return {"tokenizer": "icu", "built": False}
@@ -456,16 +483,20 @@ class LanceStore:
                 raise
             if icu is not None:  # never ICU -> `simple`: two indexes on one column
                 return {"tokenizer": "icu", "built": False, "fell_back": str(err)}
-            if simple is not None and not rebuild and not stale_simple:
+            if simple is not None and not rebuild and not stale_simple and not _behind(simple):
                 return {"tokenizer": "simple", "built": False, "fell_back": str(err)}
             create(t, "simple", SIMPLE_INDEX)
             out = {"tokenizer": "simple", "built": True, "fell_back": str(err)}
             if stale_simple:
                 out["drifted"] = True
+            if _gap(simple):
+                out["covered"] = _gap(simple)
             return out
         if simple is not None:
             t.drop_index(SIMPLE_INDEX)
         out = {"tokenizer": "icu", "built": True, "upgraded": simple is not None}
         if stale_icu:
             out["drifted"] = True
+        if _gap(icu):
+            out["covered"] = _gap(icu)
         return out
