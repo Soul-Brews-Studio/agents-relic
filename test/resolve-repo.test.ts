@@ -1,4 +1,7 @@
 import { expect, test, describe } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { repoKeyOf, resolveRepoKey, repoIndex } from "../src/repo.js";
 
 /**
@@ -22,8 +25,13 @@ describe("resolveRepoKey", () => {
   });
 
   test("a path that is not a repo stays null — most of _unresolved is CORRECT", () => {
-    for (const p of ["/Users/beta/psi-memory", "/Users/beta/sandbox", "/home/ampere", "/tmp/x"])
-      expect(resolveRepoKey(p)).toBeNull();
+    // Verifiably not a repo. /Users/beta/psi-memory used to be listed here, but it IS a git repo
+    // with an origin, and the remote fallback (#64) now resolves it — correctly.
+    const plain = mkdtempSync(join(tmpdir(), "relic-not-a-repo-"));
+    try {
+      for (const p of [plain, join(plain, "sub"), "/home/ampere-absent-xyzzy", "/tmp/x-absent-xyzzy"])
+        expect(resolveRepoKey(p)).toBeNull();
+    } finally { rmSync(plain, { recursive: true, force: true }); }
   });
 
   test("a herdr worktree for a repo that does not exist here stays null", () => {

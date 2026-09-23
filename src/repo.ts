@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
-import { join } from "node:path";
-import { mkdirSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { join, dirname, resolve, isAbsolute } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 
 /**
@@ -18,12 +18,20 @@ import { homedir } from "node:os";
  * `github.com/<org>/<repo>` triple ANYWHERE in the path and stop there. Everything
  * deeper — worktrees under wt/, agents/, psi/lab/... — belongs to the owning repo.
  */
+/** Forge hosts whose path segment starts a `<host>/<org>/<repo>` triple, as ghq lays them out. */
+export const REPO_HOSTS = ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"];
+
+/** Index of the first forge-host segment in a split path, or -1. */
+function hostIndex(parts: string[]): number {
+  return parts.findIndex(p => REPO_HOSTS.includes(p));
+}
+
 export function repoKeyOf(cwd: string | null): string | null {
   if (!cwd) return null;
   const parts = cwd.split("/").filter(Boolean);
 
-  const gh = parts.indexOf("github.com");
-  if (gh >= 0 && parts.length >= gh + 3) return `github.com/${parts[gh + 1]}/${normalizeRepo(parts[gh + 2])}`;
+  const gh = hostIndex(parts);
+  if (gh >= 0 && parts.length >= gh + 3) return `${parts[gh]}/${parts[gh + 1]}/${normalizeRepo(parts[gh + 2])}`;
 
   // incubate worktrees drop the host segment: .../incubate/worktrees/<org>/<repo>/...
   const wt = parts.indexOf("worktrees");
@@ -44,7 +52,9 @@ export function repoKeyOf(cwd: string | null): string | null {
  */
 let repoIndexCache: Map<string, string[]> | null = null;
 /** Both caches are one fact about this machine — reset them together or they drift. */
-export function resetRepoIndex(): void { repoIndexCache = null; canonCache = null; }
+export function resetRepoIndex(): void {
+  repoIndexCache = null; canonCache = null; mappingsCache = null; remoteCache.clear();
+}
 export function repoIndex(): Map<string, string[]> {
   if (repoIndexCache) return repoIndexCache;
   const out = new Map<string, string[]>();
@@ -127,6 +137,8 @@ export function canonicalRepoKey(key: string): string {
 }
 
 export function resolveRepoKey(cwd: string | null): string | null {
+  const mapped = mappedRepoKey(cwd);
+  if (mapped) return mapped;
   const direct = repoKeyOf(cwd);
   // A repo this machine does not have falls through unchanged — peer roots carry paths
   // from another host, and inventing a spelling for them would be worse than echoing.
@@ -155,7 +167,107 @@ export function resolveRepoKey(cwd: string | null): string | null {
         if (enc === asDir || enc.startsWith(asDir + "-")) return key;
       }
   }
+  return remoteRepoKey(cwd);
+}
+
+/** A key relic can shard and list: `<host>/<org>/<repo>`, host a domain. */
+const VALID_KEY = /^[^/\s]+\.[^/\s]+\/[^/\s]+\/[^/\s]+$/;
+
+// `repo_mappings` in ~/.relic/sources.json: path prefix -> key, checked first, so it also covers paths gone from this machine.
+let mappingsCache: [string, string][] | null = null;
+
+/** Pure: the `repo_mappings` object of a parsed sources.json, validated, longest prefix first. */
+export function parseRepoMappings(cfg: unknown, home: string, warn: (m: string) => void = () => {}): [string, string][] {
+  const out: [string, string][] = [];
+  const raw = (cfg as { repo_mappings?: Record<string, unknown> } | null)?.repo_mappings ?? {};
+  for (const [prefix, key] of Object.entries(raw)) {
+    const p = prefix.startsWith("~/") ? join(home, prefix.slice(2)) : prefix;
+    if (typeof key === "string" && VALID_KEY.test(key) && isAbsolute(p)) out.push([p.replace(/\/+$/, ""), key]);
+    else warn(`relic: ignoring repo_mappings entry ${JSON.stringify(prefix)} -> ${JSON.stringify(key)}` +
+              ` (needs an absolute path and a <host>/<org>/<repo> key)`);
+  }
+  return out.sort((a, b) => b[0].length - a[0].length);
+}
+
+function repoMappings(): [string, string][] {
+  if (mappingsCache) return mappingsCache;
+  let cfg: unknown = null;
+  try { cfg = JSON.parse(readFileSync(join(homedir(), ".relic", "sources.json"), "utf8")); }
+  catch { /* no config — nothing to override */ }
+  mappingsCache = parseRepoMappings(cfg, homedir(), m => process.stderr.write(m + "\n"));
+  return mappingsCache;
+}
+
+export function mappedRepoKey(cwd: string | null, mappings: [string, string][] = repoMappings()): string | null {
+  if (!cwd) return null;
+  for (const [prefix, key] of mappings)
+    if (cwd === prefix || cwd.startsWith(prefix + "/")) return key;
   return null;
+}
+
+/** An origin URL to `<host>/<org>/<repo>`: scp-style ssh, ssh://, https — credentials, port and .git dropped. */
+export function remoteToKey(url: string): string | null {
+  const u = url.trim();
+  let host = "", path = "";
+  const scp = /^(?:[^@/\s]+@)?([^:/\s]+):(?!\/)(.+)$/.exec(u);
+  if (/^[a-z+]+:\/\//i.test(u)) {
+    try { const x = new URL(u); host = x.hostname; path = x.pathname; } catch { return null; }
+  } else if (scp) { host = scp[1]; path = scp[2]; }
+  else return null;
+  const segs = path.replace(/\.git\/?$/, "").split("/").filter(Boolean);
+  // Nested groups (gitlab.com/group/sub/repo) have no <org>/<repo> shard to land in.
+  if (!host.includes(".") || segs.length !== 2) return null;
+  return `${host.toLowerCase()}/${segs[0]}/${normalizeRepo(segs[1])}`;
+}
+
+/** The config file of the repo that owns `dir` — a `.git` dir, or a worktree/submodule `.git` file. */
+function gitConfigFor(dir: string): string | null {
+  const dotgit = join(dir, ".git");
+  let st;
+  try { st = statSync(dotgit); } catch { return null; }
+  if (st.isDirectory()) return join(dotgit, "config");
+  let body = "";
+  try { body = readFileSync(dotgit, "utf8"); } catch { return null; }
+  const m = /^gitdir:\s*(.+)$/m.exec(body);
+  if (!m) return null;
+  const gitdir = resolve(dir, m[1].trim());
+  // A worktree's own gitdir holds no config; `commondir` points back to the main .git.
+  const common = join(gitdir, "commondir");
+  try {
+    return join(existsSync(common) ? resolve(gitdir, readFileSync(common, "utf8").trim()) : gitdir, "config");
+  } catch { return null; }
+}
+
+function originOf(configPath: string): string | null {
+  let text: string;
+  try { text = readFileSync(configPath, "utf8"); } catch { return null; }
+  let inOrigin = false;
+  for (const line of text.split("\n")) {
+    const sec = /^\s*\[(.+)\]\s*$/.exec(line);
+    if (sec) { inOrigin = /^remote\s+"origin"$/.test(sec[1].trim()); continue; }
+    const kv = /^\s*url\s*=\s*(.+?)\s*$/.exec(line);
+    if (inOrigin && kv) return kv[1];
+  }
+  return null;
+}
+
+// Nearest repo's origin, cached per cwd; never walks into $HOME, where a dotfiles repo would claim every session under it.
+const remoteCache = new Map<string, string | null>();
+export function remoteRepoKey(cwd: string, home = homedir()): string | null {
+  if (remoteCache.has(cwd)) return remoteCache.get(cwd)!;
+  let key: string | null = null;
+  if (existsSync(cwd)) {
+    for (let d = cwd; d !== home && d !== dirname(d); d = dirname(d)) {
+      const cfg = gitConfigFor(d);
+      if (!cfg) continue;
+      const url = originOf(cfg);   // the nearest repo decides, origin or not
+      key = url ? remoteToKey(url) : null;
+      break;
+    }
+  }
+  if (key) key = canonicalRepoKey(key);
+  remoteCache.set(cwd, key);
+  return key;
 }
 
 /**
@@ -221,7 +333,7 @@ export function locationOf(cwd: string | null): Location {
   const empty: Location = { org: "", repo: "", project: "", worktree: "", dir: "" };
   if (!cwd) return empty;
   const parts = cwd.split("/").filter(Boolean);
-  const gh = parts.indexOf("github.com");
+  const gh = hostIndex(parts);
   if (gh < 0 || parts.length < gh + 3) return empty;
 
   const { worktree, subpath } = contextOf(cwd);
@@ -258,7 +370,7 @@ export function locationOf(cwd: string | null): Location {
 export function contextOf(cwd: string | null): { worktree: string; subpath: string } {
   if (!cwd) return { worktree: "", subpath: "" };
   const parts = cwd.split("/").filter(Boolean);
-  const gh = parts.indexOf("github.com");
+  const gh = hostIndex(parts);
   if (gh < 0 || parts.length < gh + 3) return { worktree: "", subpath: "" };
 
   const repoSeg = parts[gh + 2];
@@ -382,13 +494,17 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
   if (dataRoot) {
     for (const bank of banks(join(dataRoot, BANKS_DIR))) {
       const base = join(dataRoot, BANKS_DIR, bank.name);
-      const gh = join(base, "github.com");
-      for (const org of ls(gh)) {
-        if (!org.isDirectory()) continue;
-        for (const repo of ls(join(gh, org.name))) {
-          if (!repo.isDirectory()) continue;
-          const key = `github.com/${org.name}/${repo.name}`;
-          out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name), bank: bank.name, repo: key });
+      // Every host, as the native binary and the Python port already walk — not only github.com.
+      for (const host of banks(base)) {
+        if (host.name === "_unresolved") continue;
+        const gh = join(base, host.name);
+        for (const org of ls(gh)) {
+          if (!org.isDirectory()) continue;
+          for (const repo of ls(join(gh, org.name))) {
+            if (!repo.isDirectory()) continue;
+            const key = `${host.name}/${org.name}/${repo.name}`;
+            out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name), bank: bank.name, repo: key });
+          }
         }
       }
       const un = join(base, "_unresolved");
@@ -398,16 +514,19 @@ export function listShards(dataRoot: string | null, inRepo = false): Shard[] {
   }
 
   const root = ghqRoot();
-  const gh = join(root, "github.com");
-  for (const org of ls(gh)) {
-    if (!org.isDirectory()) continue;
-    for (const repo of ls(join(gh, org.name))) {
-      if (!repo.isDirectory()) continue;
-      const key = `github.com/${org.name}/${repo.name}`;
-      // in-repo: the bank sits INSIDE the checkout's .relic/, so one repo can hold
-      // several banks without them colliding.
-      for (const bank of banks(join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR)))
-        out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR, bank.name), bank: bank.name, repo: key });
+  // Domain-named dirs only: the ghq root also holds plain checkouts, and walking those two levels deep costs readdirs for nothing.
+  for (const host of ls(root).filter(e => e.isDirectory() && e.name.includes(".") && !e.name.startsWith("."))) {
+    const gh = join(root, host.name);
+    for (const org of ls(gh)) {
+      if (!org.isDirectory()) continue;
+      for (const repo of ls(join(gh, org.name))) {
+        if (!repo.isDirectory()) continue;
+        const key = `${host.name}/${org.name}/${repo.name}`;
+        // in-repo: the bank sits INSIDE the checkout's .relic/, so one repo can hold
+        // several banks without them colliding.
+        for (const bank of banks(join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR)))
+          out.push({ key: `${bank.name}/${key}`, dir: join(gh, org.name, repo.name, SHARD_DIR, BANKS_DIR, bank.name), bank: bank.name, repo: key });
+      }
     }
   }
   for (const bank of banks(join(root, "_relic-unresolved", BANKS_DIR)))
