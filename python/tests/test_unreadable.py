@@ -16,6 +16,8 @@ import pytest
 from relicpy import discover as D
 from relicpy import sources as S
 from relicpy import unreadable as U
+from relicpy.noise import log_skipped, read_skipped, read_skipped_files
+from relicpy.prune import prune_refusal
 from relicpy.shapes import claude as shape_claude
 
 A = "aaaaaaaa-1111-4000-8000-000000000000"
@@ -144,3 +146,30 @@ def test_corpus_hermes_says_it_is_not_supported(tmp_path):
                         "--dry-run"], capture_output=True, text=True, env=env, timeout=120)
     assert p.returncode == 0, p.stderr
     assert "hermes" in p.stderr and "not supported by relic-py yet" in p.stderr
+
+
+def test_prune_is_refused_after_a_walk_that_could_not_read_everything():
+    class T:
+        failed = 0
+    assert "2 paths could not be read" in prune_refusal(T(), None, None, unreadable=2)
+    assert prune_refusal(T(), None, None, unreadable=0) is None
+    assert prune_refusal(T(), None, None) is None
+
+
+def test_the_proof_log_keeps_paths_apart_from_events(tmp_path):
+    root = str(tmp_path)
+    log_skipped([{"uid": "u1", "file_path": "/x/a.jsonl", "seq": 3, "role": "tool_result",
+                  "rule": "binary-blob", "bytes": 500, "head": "AAAA"}], root)
+
+    def row(path, ts, rule="dir-unreadable"):
+        return {"rule": rule, "path": path, "error": "EACCES: Permission denied", "ts": ts}
+    log_skipped([row("/r/-locked", "2026-09-22T01:00:00.000Z"),
+                 row("/r/-x/s.jsonl", "2026-09-22T01:00:00.000Z", "walk-error")], root)
+    log_skipped([row("/r/-locked", "2026-09-23T01:00:00.000Z")], root)
+
+    ev = read_skipped(root)
+    assert ev["total"] == 1 and [b["rule"] for b in ev["by_rule"]] == ["binary-blob"]
+    fs = read_skipped_files(root)
+    assert fs["total"] == 2
+    top = fs["paths"][0]
+    assert top["path"] == "/r/-locked" and top["runs"] == 2 and top["ts"].startswith("2026-09-23")

@@ -1100,10 +1100,20 @@ relic status --json | jq '.rows[] | select(.bank=="codex")'
 ```bash
 relic skipped                # counts by rule, with samples of what each one ate
 relic skipped --json
+relic skipped --files        # paths the walk could NOT READ — nothing in them was indexed
 ```
 
 Every drop is logged to `~/.relic/skipped.jsonl` with the rule that fired and the first
 120 characters, because **a filter you cannot audit is a filter you cannot trust**.
+
+The same log holds the paths discovery could not read (#99): `dir-unreadable` for a
+directory it could not list or reach, `walk-error` for a single file it could not stat.
+Every walker used to answer those with an empty list, so an unreadable directory looked
+exactly like an empty one and `relic pending` reported `0 missing` about files it had
+never seen. Now each is one stderr line per path (ENOENT stays quiet — optional
+`subagents/` directories are the normal case), `index` logs them here, `pending` says
+its counts cover only what the walk could read, and `prune` refuses to run over a scan
+that could not see everything.
 
 ### `embed` — the opt-in second pass
 
@@ -1554,6 +1564,7 @@ SQL.
 
  SIDECARS   ~/.relic/trace.jsonl    one line per query, + `opened` on show
             ~/.relic/skipped.jsonl  one line per dropped event, with the rule
+                                    — and per unreadable path (`relic skipped --files`)
             both JSONL on purpose: relic can index its own logs, no new reader
 
  LEGEND  PK = key in practice   FK→ = join by convention, unenforced   !! = trap

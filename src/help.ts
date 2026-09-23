@@ -110,7 +110,9 @@ export function helpText(): string {
                                not a summary: session gives shape, recap gives content.
   status  [--limit 15] [--bank B]
   sources                      what this machine has, and what is on/off
-  skipped                      what noise filtering dropped, and the proof (--keep-noise disables it)
+  skipped [--files] [--json]   what noise filtering dropped, and the proof (--keep-noise disables it)
+                               --files: paths the walk could NOT READ, so nothing in them was
+                               indexed — one row per path, newest first. Index runs log them.
   serve   [--host 127.0.0.1] [--port 4319] [--token T] [--origin URL,URL]
                                the MCP tools over HTTP at /mcp, for clients that are not
                                a child process — a browser UI, another machine, another

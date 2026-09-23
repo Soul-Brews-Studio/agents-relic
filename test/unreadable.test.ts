@@ -6,6 +6,9 @@ import { walkClaudeHome, type Found } from "../src/discover.js";
 import { homeProjectRoots } from "../src/sources.js";
 import { parseClaude } from "../src/shapes/claude.js";
 import { beginWalk, walkFailures, reachable } from "../src/unreadable.js";
+import { pruneRefusal } from "../src/prune.js";
+import { logSkipped, logSkippedFiles, readSkipped, readSkippedFiles } from "../src/noise.js";
+import type { ImportTally } from "../src/import.js";
 
 /**
  * #99: every walker answered a failed readdir or stat with an empty list, so an
@@ -148,6 +151,47 @@ describe("a missing directory", () => {
   });
 });
 
+describe("prune after a walk that could not read everything", () => {
+  const tally = { failed: 0 } as ImportTally;
+
+  test("is refused — an unreadable directory is not a deleted one", () => {
+    const why = pruneRefusal(tally, { sinceMs: null, repoFilter: null, unreadable: 2 });
+    expect(why).toContain("2 paths could not be read");
+  });
+
+  test("goes ahead when the walk read everything", () => {
+    expect(pruneRefusal(tally, { sinceMs: null, repoFilter: null, unreadable: 0 })).toBeNull();
+    expect(pruneRefusal(tally, { sinceMs: null, repoFilter: null })).toBeNull();
+  });
+});
+
+describe("the proof log carries unreadable paths beside dropped events", () => {
+  const dataRoot = join(tmp, "proof");
+  logSkipped([{ uid: "u1", file_path: "/x/a.jsonl", seq: 3, role: "tool_result",
+                rule: "binary-blob", bytes: 500, head: "AAAA" }], dataRoot);
+  const row = (path: string, ts: string, rule: "dir-unreadable" | "walk-error" = "dir-unreadable") =>
+    ({ rule, path, error: "EACCES: permission denied", ts });
+  // The same directory, logged by two index runs; and one file.
+  logSkippedFiles([row("/r/-locked", "2026-09-22T01:00:00.000Z"), row("/r/-x/s.jsonl", "2026-09-22T01:00:00.000Z", "walk-error")], dataRoot);
+  logSkippedFiles([row("/r/-locked", "2026-09-23T01:00:00.000Z")], dataRoot);
+
+  test("event counts are not inflated by path rows", () => {
+    const st = readSkipped(dataRoot)!;
+    expect(st.total).toBe(1);
+    expect(st.byRule.map(r => r.rule)).toEqual(["binary-blob"]);
+  });
+
+  test("one row per path, newest record, with the number of runs that logged it", () => {
+    const fs = readSkippedFiles(dataRoot)!;
+    expect(fs.total).toBe(2);
+    expect(fs.byRule).toEqual([{ rule: "dir-unreadable", n: 1 }, { rule: "walk-error", n: 1 }]);
+    const lockedRow = fs.paths.find(p => p.path === "/r/-locked")!;
+    expect(lockedRow.runs).toBe(2);
+    expect(lockedRow.ts).toBe("2026-09-23T01:00:00.000Z");
+    expect(fs.paths[0].path).toBe("/r/-locked");            // newest first
+  });
+});
+
 /*
  * End to end through the real config: sources.ts reads ~/.relic/sources.json from HOME at
  * import, so these run in a child whose HOME is a temp dir. No machine config leaks in.
@@ -159,6 +203,14 @@ function child(h: string, script: string): { out: string; err: string; code: num
   for (const k of ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_COMPANION_SESSION_ID"])
     delete env[k];
   const r = Bun.spawnSync(["bun", "-e", script], { env, stdout: "pipe", stderr: "pipe" });
+  return { out: r.stdout.toString(), err: r.stderr.toString(), code: r.exitCode ?? -1 };
+}
+
+function cli(h: string, ...args: string[]): { out: string; err: string; code: number } {
+  const env: Record<string, string | undefined> = { ...process.env, HOME: h };
+  for (const k of ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_COMPANION_SESSION_ID"])
+    delete env[k];
+  const r = Bun.spawnSync(["bun", join(SRC, "cli.ts"), ...args], { env, stdout: "pipe", stderr: "pipe" });
   return { out: r.stdout.toString(), err: r.stderr.toString(), code: r.exitCode ?? -1 };
 }
 
@@ -197,9 +249,10 @@ describe("a broken ~/.relic/sources.json", () => {
   });
 });
 
-describe.skipIf(asRoot)("through the walkers", () => {
+describe.skipIf(asRoot)("through the commands", () => {
   const h = join(tmp, "e2e");
   const projects = join(h, ".claude", "projects");
+  const data = join(h, "data");
   put(join(projects, "-work-ok", `${A}.jsonl`));
   const bad = join(projects, "-work-locked");
   put(join(bad, `${B}.jsonl`), line(B));
@@ -219,5 +272,29 @@ describe.skipIf(asRoot)("through the walkers", () => {
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out.trim().split("\n").pop()!)).toEqual({ found: 1, failures: [bad], seek: 1 });
     expect(cannotRead(r.err)).toHaveLength(1);
+  });
+
+  test("pending says the count covers only what the walk could read", () => {
+    const r = cli(h, "pending", "--data-root", data, "--json");
+    expect(r.code).toBe(0);
+    const rep = JSON.parse(r.out);
+    expect(rep.found).toBe(1);
+    expect(rep.unreadable.map((x: { path: string }) => x.path)).toEqual([bad]);
+  });
+
+  test("index logs it, skipped --files lists it, and prune refuses to run", () => {
+    const idx = cli(h, "index", "--data-root", data, "--prune");
+    expect(idx.code).toBe(0);
+    expect(cannotRead(idx.err)).toHaveLength(1);
+    expect(idx.out).toContain("unreadable: 1 path could not be read");
+    expect(idx.out).toContain("prune REFUSED");
+
+    const files = cli(h, "skipped", "--files", "--data-root", data, "--json");
+    expect(files.code).toBe(0);
+    expect(JSON.parse(files.out).paths.map((x: { path: string }) => x.path)).toEqual([bad]);
+
+    const pretty = cli(h, "skipped", "--files", "--data-root", data);
+    expect(pretty.out).toContain("[dir-unreadable]");
+    expect(pretty.out).toContain(bad);
   });
 });

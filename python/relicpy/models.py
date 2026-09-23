@@ -262,6 +262,9 @@ class PendingReport(BaseModel):
     scan_ms: int = 0
     files: list[PendingFile] = Field(default_factory=list)
     files_omitted: int = 0
+    # Paths discovery could not read (#99). Files under them are in none of the counts
+    # above, so "nothing pending" is only true of what the walk could see.
+    unreadable: list[dict] = Field(default_factory=list)
 
 
 class ParsedFile(BaseModel):

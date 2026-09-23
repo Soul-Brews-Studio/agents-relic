@@ -528,7 +528,17 @@ async function run(name: string, a: any): Promise<string> {
       `found ${fmt(r.found)} · indexed ${fmt(r.indexed)} · missing ${fmt(r.missing)} · ` +
       `changed ${fmt(r.changed)} · ${r.scanMs} ms`,
     ];
-    if (!r.missing && !r.changed) L.push("", "nothing pending — every discovered file is in the index.");
+    // An MCP client never sees stderr, so the walk's failures have to be in the answer —
+    // without them "nothing pending" is exactly the #99 report: true of what was seen.
+    if (r.unreadable.length) {
+      L.push("", `\u26A0 ${fmt(r.unreadable.length)} path${r.unreadable.length === 1 ? "" : "s"} could not be read — ` +
+                 `files under ${r.unreadable.length === 1 ? "it are" : "them are"} in none of these counts:`);
+      for (const x of r.unreadable.slice(0, 10)) L.push(`    ${x.path}  (${x.error})`);
+      if (r.unreadable.length > 10) L.push(`    ... and ${fmt(r.unreadable.length - 10)} more`);
+    }
+    if (!r.missing && !r.changed)
+      L.push("", r.unreadable.length ? "nothing pending among the files the walk could read."
+                                     : "nothing pending — every discovered file is in the index.");
     L.push("");
     for (const g of r.groups)
       L.push(`  ${(g.source + "/" + g.tier).padEnd(30)} found ${String(g.found).padStart(6)}` +

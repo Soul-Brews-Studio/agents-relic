@@ -7,7 +7,8 @@ import { discover, parseSince, type Found, type PathOverride } from "./discover.
 import { detect, KNOWN_NON_JSONL, envHomes } from "./sources.js";
 import { sourceKeys } from "./discover.js";
 import { trace, readTrace, tracePath } from "./trace.js";
-import { classify, logSkipped, readSkipped, skippedPath } from "./noise.js";
+import { classify, logSkipped, readSkipped, skippedPath, logSkippedFiles, readSkippedFiles } from "./noise.js";
+import { walkFailures } from "./unreadable.js";
 import { renderChain } from "./chain.js";
 import { buildTree, renderTree, commonPrefix } from "./tree.js";
 import { buildReport, renderReport, type ReportRow } from "./report.js";
@@ -104,6 +105,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
                 f["dry-run"] ? "DRY RUN — no writes" : null].filter(Boolean).join(" · ");
   console.log(`\u{1F3FA} relic indexing  (${mode})`);
   let found = discover(only, sinceMs, override);
+  const unreadable = walkFailures();
 
   // --repo scopes the index to one repo — "personal memory" rather than fleet-wide.
   // Cheap prefilter first: the encoded project dir name contains the repo name with
@@ -119,6 +121,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     prefiltered = before - found.length;
   }
   if (f["dry-run"]) { process.stderr.write("--dry-run: nothing written\n"); return; }
+  logSkippedFiles(unreadable, dataRoot);
 
   // One importer, shared with `session`'s on-demand path — a second copy of this loop
   // would drift the moment either side changed.
@@ -138,6 +141,9 @@ async function cmdIndex(f: Record<string, string | boolean>) {
   for (const [k, v] of [...byTier].sort((a, b) => b[1] - a[1]))
     console.log(`               ${String(fmt(v)).padStart(7)}  ${k}`);
   if (prefiltered) console.log(`  prefiltered: ${fmt(prefiltered)} (name did not match --repo, never opened)`);
+  if (unreadable.length)
+    console.log(`  \u26A0 unreadable: ${fmt(unreadable.length)} path${unreadable.length === 1 ? "" : "s"} could not be read, ` +
+                `nothing in ${unreadable.length === 1 ? "it" : "them"} indexed -> relic skipped --files`);
   if (filtered)    console.log(`  other-repo:  ${fmt(filtered)} (parsed, cwd belongs elsewhere)`);
   console.log(`  unchanged:   ${fmt(skipped)} (mtime+size match, never re-read)`);
   console.log(`  imported:    ${fmt(imported)} files -> ${fmt(added)} events`);
@@ -165,7 +171,7 @@ async function cmdIndex(f: Record<string, string | boolean>) {
     const maxDropPct = f["max-drop"] !== undefined ? Number(f["max-drop"]) : DEFAULT_MAX_DROP_PCT;
     const plan = await prune(tally, {
       apply: true, maxDropPct, force: Boolean(f.force), dataRoot, inRepo,
-      sinceMs, repoFilter,
+      sinceMs, repoFilter, unreadable: unreadable.length,
     });
     reportPrune(plan, maxDropPct);
   }
@@ -268,15 +274,17 @@ async function cmdPrune(f: Record<string, string | boolean>) {
   process.stderr.write(`\u{1F3FA} relic prune  (${only ? only.join("+") : "all enabled sources"} · ` +
                        `${apply ? "APPLY — rows will be deleted" : "dry run"} · ceiling ${maxDropPct}%)\n`);
   const found = discover(only, null);
+  const unreadable = walkFailures().length;
   const tally = await importFiles(found, { dataRoot, inRepo, noWrite: true, progress: true,
                                           verbose: Boolean(f.verbose) }, t0);
   clearLine();
 
   console.log(`  scanned:     ${fmt(found.length)} files -> ${tally.seen.size} shards reached`);
   if (tally.failed) console.log(`  \u26A0 failed:    ${fmt(tally.failed)} (re-run with --verbose to see why)`);
+  if (unreadable) console.log(`  \u26A0 unreadable: ${fmt(unreadable)} path${unreadable === 1 ? "" : "s"} (named on stderr)`);
 
   const plan = await prune(tally, { apply, maxDropPct, force: Boolean(f.force),
-                                    dataRoot, inRepo, sinceMs: null, repoFilter: null });
+                                    dataRoot, inRepo, sinceMs: null, repoFilter: null, unreadable });
   reportPrune(plan, maxDropPct);
   console.log(`  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (plan.refused) process.exit(1);
@@ -1551,6 +1559,33 @@ const cmd = pos[0];
 if (f["no-native"]) process.env.RELIC_NATIVE = "0";
 else if (typeof f.native === "string") process.env.RELIC_NATIVE = f.native;
 
+// ---- skipped --files ---------------------------------------------------------
+/**
+ * Paths the walk could not read (#99): the file-scoped half of the proof log.
+ *
+ * Same log and same rule buckets as the event view, but one row per PATH — an
+ * unreadable directory is logged again by every index run until someone fixes it, and
+ * listing it forty times would bury the second one.
+ */
+function cmdSkippedFiles(f: Record<string, string | boolean>) {
+  const dataRoot = (f["data-root"] as string) ?? null;
+  const r = readSkippedFiles(dataRoot);
+  if (outFmt(f) === "json") { console.log(JSON.stringify(r ?? { total: 0, byRule: [], paths: [] }, null, 2)); return; }
+  if (!r) { console.log(`no unreadable paths logged — ${skippedPath(dataRoot)}`); return; }
+  console.log(`${fmt(r.total)} path${r.total === 1 ? "" : "s"} the walk could not read — nothing in them was indexed\n`);
+  for (const b of r.byRule) console.log(`  ${b.rule.padEnd(26)} ${String(fmt(b.n)).padStart(7)}`);
+  const limit = Number(f.limit ?? 20);
+  for (const b of r.byRule) {
+    const rows = r.paths.filter(x => x.rule === b.rule);
+    console.log(`\n  [${b.rule}]`);
+    for (const x of rows.slice(0, limit)) {
+      console.log(`    ${x.path}`);
+      console.log(`        ${x.error}  ·  last ${localDateTime(x.ts)}${x.runs > 1 ? `  ·  logged by ${fmt(x.runs)} runs` : ""}`);
+    }
+    if (rows.length > limit) console.log(`    ... and ${fmt(rows.length - limit)} more (--limit N, or --json)`);
+  }
+}
+
 // ---- memory / pending -------------------------------------------------------
 // Both functions already existed in query.ts with no way to call them. A query nobody
 // can run is the same as a query that does not exist.
@@ -1604,6 +1639,9 @@ async function cmdPending(f: Record<string, string | boolean>) {
     return;
   }
   console.log(`found ${fmt(r.found)}  indexed ${fmt(r.indexed)}  missing ${fmt(r.missing)}  changed ${fmt(r.changed)}   ${r.scanMs} ms`);
+  if (r.unreadable.length)
+    console.log(`\u26A0 ${fmt(r.unreadable.length)} path${r.unreadable.length === 1 ? "" : "s"} could not be read (named on stderr) — ` +
+                `files under ${r.unreadable.length === 1 ? "it are" : "them are"} in none of these counts`);
   if (r.newestPendingMs !== null)
     console.log(`newest pending file: ${localDateTime(new Date(r.newestPendingMs).toISOString())}`);
   for (const g of r.groups)
@@ -1673,7 +1711,8 @@ async function cmdPending(f: Record<string, string | boolean>) {
     }
     if (r.filesOmitted) console.log(`\n  ... and ${fmt(r.filesOmitted)} more pending (--list N)`);
   } else if (r.missing + r.changed === 0) {
-    console.log(`\nnothing pending — every discovered file is in the index.`);
+    console.log(r.unreadable.length ? `\nnothing pending among the files the walk could read.`
+                                    : `\nnothing pending — every discovered file is in the index.`);
   }
 }
 
@@ -1799,6 +1838,7 @@ else if (cmd === "chain") {
 }
 else if (cmd === "session") { if (!pos[1]) { console.error("session needs an id or prefix"); process.exit(1); } await cmdSession(pos[1], f); }
 else if (cmd === "sessions") await cmdSessions(f);
+else if (cmd === "skipped" && f.files) cmdSkippedFiles(f);
 else if (cmd === "skipped") {
   const dataRoot = (f["data-root"] as string) ?? null;
   const st = readSkipped(dataRoot);
@@ -1816,6 +1856,9 @@ else if (cmd === "skipped") {
       console.log(`            ${x.file_path.split("/").pop()} --seq ${x.seq}`);
     }
   }
+  // Same log, other kind of row: point at it rather than fold paths into event counts.
+  const lost = outFmt(f) === "json" ? null : readSkippedFiles(dataRoot);
+  if (lost) console.log(`\n${fmt(lost.total)} path${lost.total === 1 ? "" : "s"} the walk could not read -> relic skipped --files`);
 }
 else if (cmd === "dig") {
   // PROJECT_DIRS is the contract the /dig skill already exports — honour it so this is
