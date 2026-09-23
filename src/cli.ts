@@ -37,7 +37,7 @@ function wantSkipNoise(f: Record<string, string | boolean>): boolean {
 import { prune, pruneTotals, DEFAULT_MAX_DROP_PCT, type PrunePlan } from "./prune.js";
 import { type Scope, semanticSearch, searchEvents, listSessions, resolveSession, chainOf, readAround, pickShards, toISO,
          statsOf, neighbours, nameOf, staleness, answerFreshness, memoryReport, pendingReport,
-         groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead } from "./query.js";
+         groupByBank, maxISO, unindexedHint, degradedNote, roomTag, channelHead, facetArg } from "./query.js";
 import { sessionRecap } from "./recap.js";
 import { embedShards, DEFAULT_OLLAMA } from "./embed.js";
 import { scanLangs, recommend, renderLangs } from "./langs.js";
@@ -175,63 +175,69 @@ async function cmdIndex(f: Record<string, string | boolean>) {
 }
 
 /**
- * `index --backfill-channel`: re-import the files whose rows predate channel facets, or
- * whose stored name is still an envelope. DRY BY DEFAULT, like prune — the count comes
- * first, and `--apply` re-imports exactly the files that count named.
+ * `index --backfill-channel`: fill the channel facets of rows indexed before they existed,
+ * in place, from the stored text. DRY BY DEFAULT, like prune — the counts come first, and
+ * `--apply` writes exactly the plan it printed. `--names` adds the one part that needs the
+ * transcripts: session descriptions still cut inside an envelope tag.
  */
 async function cmdBackfillChannel(f: Record<string, string | boolean>) {
   const dataRoot = (f["data-root"] as string) ?? null;
   const inRepo = Boolean(f["in-repo"]);
-  const apply = Boolean(f.apply);
+  const apply = Boolean(f.apply), names = Boolean(f.names);
   const scope = { dataRoot, inRepo, repo: f.repo ? String(f.repo) : undefined, bank: f.bank ? String(f.bank) : undefined };
   const t0 = Date.now();
   console.log(`\u{1F3FA} relic channel backfill  (${[scope.bank ? `bank ${scope.bank}` : "", scope.repo ? `repo~${scope.repo}` : "",
-              apply ? "APPLY — these files will be re-imported" : "dry run — nothing written"].filter(Boolean).join(" · ")})`);
-  const plan = await planChannelBackfill(scope);
-  const facets = plan.files.filter(x => x.why.includes("facets"));
-  const names = plan.files.filter(x => x.why.includes("names"));
-  const gb = (plan.bytes / 1e9).toFixed(2);
+              names ? "with --names" : "", apply ? "APPLY — rows are updated in place" : "dry run — nothing written"]
+              .filter(Boolean).join(" · ")})`);
+  const bar = progress();
+  const plan = await planChannelBackfill(scope, {
+    names, onShard: (done, total, key) => bar.tick(`  reading ${done}/${total} shards  ${key}   `, (done / total) * 100, done === total),
+  });
+  bar.clear();
+  const nm = plan.names;
   console.log(`  scanned:     ${fmt(plan.scanned)} shards in ${(plan.ms / 1000).toFixed(1)}s`);
-  console.log(`  facets:      ${fmt(facets.length)} files · ${fmt(facets.reduce((n, x) => n + x.turns, 0))} channel turns with no via`);
-  console.log(`  names:       ${fmt(names.length)} files · description still opens with an envelope tag,` +
-              ` ${fmt(names.filter(x => x.untitled).length)} of them named (untitled)`);
-  console.log(`  to re-read:  ${fmt(plan.files.length)} files · ${gb} GB`);
-  const byBank = new Map<string, number>();
-  for (const x of plan.files) byBank.set(x.found.bank, (byBank.get(x.found.bank) ?? 0) + 1);
-  for (const [b, n] of [...byBank].sort((a, z) => z[1] - a[1])) console.log(`               ${fmt(n).padStart(7)}  ${b}`);
-  const sk = plan.skipped;
-  if (sk.gone + sk.moved + sk.otherShape)
-    console.log(`  skipped:     ${[sk.gone && `${fmt(sk.gone)} gone from disk`,
-                                   sk.moved && `${fmt(sk.moved)} now resolve to another repo (re-importing would split them across shards)`,
-                                   sk.otherShape && `${fmt(sk.otherShape)} not Claude transcripts (only that shape parses envelopes)`]
+  console.log(`  facets:      ${fmt(plan.turns)} channel turns to fill, written back by uid from their own stored text`);
+  console.log(`  rooms:       ${fmt(plan.rooms)} session rows to list their rooms and senders`);
+  console.log(`  names:       ${fmt(nm.pending)} session rows still named by an envelope tag, ${fmt(nm.untitled)} of them (untitled)` +
+              (names ? ` · ${fmt(nm.planned)} re-read (${(nm.bytes / 1e9).toFixed(2)} GB)`
+                     : ` · --names re-reads their transcripts (${(nm.bytes / 1e9).toFixed(2)} GB) and rewrites only those rows`));
+  if (nm.gone + nm.otherShape)
+    console.log(`  skipped:     ${[nm.gone && `${fmt(nm.gone)} names whose transcript is gone or unreadable`,
+                                   nm.otherShape && `${fmt(nm.otherShape)} names on a non-Claude transcript (only that shape strips the tag)`]
                                   .filter(Boolean).join(" · ")}`);
-  if (!plan.files.length) { console.log(`  nothing to backfill.`); return; }
+  if (!plan.shards.length) { console.log(`  nothing to write.`); return; }
   if (!apply) {
-    console.log(`\n  to re-import them:  relic index --backfill-channel --apply` +
-                `   (narrow with --bank B or --repo S)`);
-    // Said up front: this IS the changed-file import, so today's rules come with it.
-    console.log(`  each file is re-imported the way index re-imports a changed one, today's noise` +
-                ` filter included (--keep-noise keeps blob-shaped rows an older import kept)`);
+    // The flags given, echoed exactly: dropping --data-root or --bank here turned a
+    // rehearsal on a scratch copy into a live run over every bank for whoever pasted it.
+    const again = ["relic index --backfill-channel --apply", names && "--names",
+                   dataRoot && `--data-root ${shq(dataRoot)}`, inRepo && "--in-repo",
+                   scope.bank && `--bank ${shq(scope.bank)}`, scope.repo && `--repo ${shq(scope.repo)}`].filter(Boolean).join(" ");
+    console.log(`\n  to write them:  ${again}`);
+    console.log(`  nothing is deleted or re-imported: each row is read, its facets set, and put back`);
     return;
   }
 
-  // Shard totals either side of the write. A re-import replaces rows, so a change in the
-  // count is a rule that changed since the first import — and it should be visible.
-  const dirs = [...new Set(plan.files.map(x => x.shard))];
+  // The invariant, checked rather than promised: an in-place update adds and removes no row.
+  const dirs = plan.shards.map(x => x.dir);
   const total = async () => { let n = 0; for (const d of dirs) n += (await (await LanceStore.open(d)).counts()).events; return n; };
   const before = await total();
-  const tally = await applyChannelBackfill(plan, { dataRoot, inRepo, skipNoise: wantSkipNoise(f),
-                                                    verbose: Boolean(f.verbose), progress: true });
-  console.log(`  re-imported: ${fmt(tally.imported)} files -> ${fmt(tally.added)} events` +
-              (tally.failed ? `  ⚠ ${fmt(tally.failed)} failed (re-run with --verbose to see why)` : ""));
-  if (tally.repaired) console.log(`  repaired:    ${fmt(tally.repaired)} files re-keyed — same-named transcripts had overwritten each other's events (#58)`);
-  console.log(`  events:      ${fmt(before)} -> ${fmt(await total())} across the ${fmt(dirs.length)}` +
-              ` shard${dirs.length === 1 ? "" : "s"} rewritten` +
-              (tally.skippedNoise ? `  ·  ${fmt(tally.skippedNoise)} held back as noise -> relic skipped` : ""));
-  // Proven by asking again, not by trusting the tally: what is left is what the next
+  const wrote = await applyChannelBackfill(plan,
+    (done, all, key) => bar.tick(`  writing ${done}/${all} shards  ${key}   `, (done / all) * 100, done === all));
+  bar.clear();
+  const after = await total();
+  console.log(`  wrote:       ${fmt(wrote.events)} event rows · ${fmt(wrote.sessions)} session rows · ${fmt(dirs.length)} shards`);
+  console.log(`  events:      ${fmt(before)} -> ${fmt(after)}` +
+              (before === after ? `  (unchanged — nothing added, nothing removed)` : `  ⚠ CHANGED — this must not happen; stop and look`));
+  // Proven by asking again, not by trusting the counts: what is left is what the next
   // dry run would print.
-  const after = await planChannelBackfill(scope);
-  console.log(`  left:        ${fmt(after.files.length)} files still need it  ·  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  const left = await planChannelBackfill(scope, { names });
+  console.log(`  left:        ${fmt(left.turns)} turns · ${fmt(left.rooms)} rooms` +
+              (names ? ` · ${fmt(left.names.planned)} names` : "") + `  ·  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+}
+
+/** A flag value as the shell will read it back: bare when safe, single-quoted otherwise. */
+function shq(v: string): string {
+  return /^[\w@%+=:,./-]+$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
@@ -586,15 +592,27 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
    * the caller picks the regime, because the caller knows whether they are recalling a
    * phrase or describing an idea, and a classifier would be guessing at that.
    */
+  // Facet values are checked here, where a mistake can still be said out loud: inside the
+  // fan-out, a bare `--via` (true) threw in every shard and read as "no matches".
+  let facets: { via?: string; chat?: string; fromUser?: string };
+  try {
+    facets = { via: facetArg("--via", f.via), chat: facetArg("--chat", f.chat), fromUser: facetArg("--from-user", f["from-user"]) };
+  } catch (e) { console.error(String((e as Error).message)); process.exit(1); }
+  if (f.semantic && (facets.via || facets.chat || facets.fromUser)) {
+    console.error("--via/--chat/--from-user filter the lexical search only; --semantic would ignore them.");
+    console.error("  drop --semantic, or drop the facet flag.");
+    process.exit(1);
+  }
+
   if (f.semantic) { await cmdSemantic(q, f, scope, limit); return; }
 
-  const { hits, shards: searched, ms, generic, degraded, unfaceted } = await searchEvents(q, {
+  const { hits, shards: searched, ms, generic, degraded, unfaceted, unfacetedTurns } = await searchEvents(q, {
     ...scope, limit,
     tier: f.tier as string, source: f.source as string, worktree: f.worktree as string,
     path: f.path as string, role: f.role as string, prose: Boolean(f.prose),
     org: f.org as string, project: f.project as string, dir: f.dir as string,
     since: f.since as string, until: f.until as string,
-    via: f.via as string, chat: f.chat as string, fromUser: f["from-user"] as string,
+    ...facets,
     allTiers: Boolean(f["all-tiers"] || f.tier),
     warnGeneric: !f["no-warn"],
   });
@@ -622,9 +640,9 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
     console.error(`    Suppress this warning: --no-warn`);
   }
   if (unfaceted)
-    console.error(`\n  ⚠ ${fmt(unfaceted)} of ${fmt(searched)} shards were indexed before channel facets existed —` +
-                  ` --via/--chat/--from-user cannot match anything in them.` +
-                  `\n    relic index --backfill-channel   counts what re-reading their channel turns would take`);
+    console.error(`\n  ⚠ ${fmt(unfacetedTurns ?? 0)} channel turns in ${fmt(unfaceted)} of ${fmt(searched)} shards were indexed` +
+                  ` before channel facets — --via/--chat/--from-user cannot match them.` +
+                  `\n    relic index --backfill-channel   fills them in place, from the text already stored`);
 
   // `--limit 0` (and negative) means "all", the same idiom recap teaches — so show every
   // hit the store returned rather than slicing to nothing. The store already unbounded the
@@ -634,7 +652,8 @@ async function cmdSearch(q: string, f: Record<string, string | boolean>) {
 
   if (mode === "json") {
     console.log(JSON.stringify({ query: q, shards: searched, ms: Math.round(ms), total: hits.length,
-                                 degraded: degraded ?? [], ...(unfaceted !== undefined && { unfaceted }), hits: top }, null, 2));
+                                 degraded: degraded ?? [], ...(unfaceted !== undefined && { unfaceted, unfacetedTurns }),
+                                 hits: top }, null, 2));
     return;
   }
   if (mode === "jsonl") {

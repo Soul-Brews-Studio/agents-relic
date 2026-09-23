@@ -6,8 +6,9 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import {
   searchEvents, listSessions, resolveSession, chainOf, readAround, indexStatus, pickShards,
   statsOf, neighbours, nameOf, groupByBank, pendingReport, maxISO, unindexedHint, degradedNote, roomTag, channelHead,
+  facetArg,
 } from "./query.js";
-import { parseChannelEnvelope, saidText } from "./types.js";
+import { parseChannelEnvelope } from "./types.js";
 import { renderChain } from "./chain.js";
 import { localDateTime, localTime, zoneOffset, zoneName } from "./time.js";
 import { currentSession, liveSessions, treeFiles, activityBuckets, sparkline, humanAge, clockLabel } from "./live.js";
@@ -378,10 +379,16 @@ async function run(name: string, a: any): Promise<string> {
       return `no shards match${a?.repo ? ` repo~${a.repo}` : ""} — call relic_status to see what is indexed`;
 
     const limit = Number(a.limit ?? 20);
-    const { hits, shards, ms, total, degraded, unfaceted } = await searchEvents(q, {
+    // A client may send `chat: 214730` as a number, or `via: true`. Converted or refused
+    // here: inside the fan-out either one threw per shard and read as "no matches".
+    let facets: { via?: string; chat?: string; fromUser?: string };
+    try {
+      facets = { via: facetArg("via", a.via), chat: facetArg("chat", a.chat), fromUser: facetArg("from_user", a.from_user) };
+    } catch (e) { return `relic_search: ${(e as Error).message}`; }
+    const { hits, shards, ms, total, degraded, unfaceted, unfacetedTurns } = await searchEvents(q, {
       ...scope, limit, role: a.role, prose: a.prose, tier: a.tier, source: a.source,
       worktree: a.worktree, path: a.path, since: a.since, until: a.until,
-      via: a.via, chat: a.chat, fromUser: a.from_user,
+      ...facets,
       allTiers: Boolean(a.all_tiers || a.tier),
     });
     // Same trace log the CLI writes, so MCP traffic shows up in `relic trace` too —
@@ -393,10 +400,10 @@ async function run(name: string, a: any): Promise<string> {
             top_repo: (hits[0]?.repo ?? "").replace(/^[^/]+\//, ""), fts: true }, DATA_ROOT);
 
     const lossy = degradedNote(degraded, shards);
-    // Said on the answer itself: a shard that predates the facets cannot match one, and
+    // Said on the answer itself: a turn indexed before the facets cannot match one, and
     // its silence reads exactly like "no such turn".
-    const unfacetedNote = unfaceted ? `${unfaceted} of ${shards} shards predate channel facets and cannot match ` +
-      `via/chat/from_user until \`relic index --backfill-channel --apply\` re-reads them` : "";
+    const unfacetedNote = unfaceted ? `${unfacetedTurns} channel turns in ${unfaceted} of ${shards} shards predate ` +
+      `channel facets and cannot match via/chat/from_user until \`relic index --backfill-channel --apply\` fills them` : "";
     const notes = [lossy, unfacetedNote].filter(Boolean);
     if (!hits.length) return `no matches for "${q}" across ${shards} shards (${ms} ms)` + notes.map(n => `\n${n}`).join("");
     const narrowed = !a.all_tiers && !a.tier;
@@ -409,7 +416,7 @@ async function run(name: string, a: any): Promise<string> {
       const i = text.toLowerCase().indexOf(q.toLowerCase());
       const snip = i < 0 ? text.slice(0, 200) : text.slice(Math.max(0, i - 70), i + q.length + 130);
       L.push(`${h.repo}${h.worktree ? ` [${h.worktree}]` : ""} · ${h.source}/${h.tier} · ${h.role} · ${h.ts}`);
-      if (c) L.push(`  ${channelHead(c)}`);
+      if (c) L.push(`  ${channelHead(c, { full: true })}`);
       L.push(`  ...${oneLine(snip, 260)}...`);
       L.push(`  relic_show  file=${h.file_path}  seq=${h.seq}`);
       L.push("");
@@ -427,7 +434,7 @@ async function run(name: string, a: any): Promise<string> {
     for (const r of rows) {
       L.push(`${localDateTime(r.started_at)}  ${r.session_uuid.slice(0, 8)}  ` +
              `${String(r.event_count).padStart(6)} ev  ${r.repo}${r.worktree ? ` [${r.worktree}]` : ""}`);
-      L.push(`    ${oneLine(nameOf(r), 110)}${roomTag(r) ? `  ${roomTag(r)}` : ""}`);
+      L.push(`    ${oneLine(nameOf(r), 110)}${roomTag(r) ? `  ${roomTag(r, { full: true })}` : ""}`);
     }
     if (total > rows.length) L.push("", `... and ${total - rows.length} more (raise limit)`);
     return L.join("\n");
@@ -447,14 +454,14 @@ async function run(name: string, a: any): Promise<string> {
       const L = [`${uuids.size} sessions named like "${a.id}" — call again with one id:`, ""];
       for (const r of rows)
         L.push(`${localDateTime(r.started_at)}  ${r.session_uuid}  ` +
-               `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}${roomTag(r) ? `  ${roomTag(r)}` : ""}`);
+               `${String(r.event_count).padStart(6)} ev  ${r.repo}  ${nameOf(r)}${roomTag(r) ? `  ${roomTag(r, { full: true })}` : ""}`);
       return L.join("\n");
     }
 
     const st = statsOf(rows)!;
     const parent = rows.find(r => r.tier === "session") ?? rows[0];
     const L = [
-      `${nameOf(parent)}${roomTag(parent) ? `  ${roomTag(parent)}` : ""}`,
+      `${nameOf(parent)}${roomTag(parent) ? `  ${roomTag(parent, { full: true })}` : ""}`,
       `${parent.session_uuid} · matched by ${matchedBy}${imported ? ` · ${imported} imported on demand` : ""}`,
       `${st.repo}${st.worktree ? ` [${st.worktree}]` : ""}${st.model ? ` · ${st.model}` : ""}`,
       `${localDateTime(st.startedAt)} → ${localDateTime(st.endedAt)} · ` +
@@ -568,8 +575,11 @@ async function run(name: string, a: any): Promise<string> {
   if (name === "relic_show") {
     const lines = await readAround(String(a.file), Number(a.seq), Number(a?.before ?? 2), Number(a?.after ?? 2));
     if (!lines.length) return `no events around seq ${a.seq} in ${a.file}`;
+    // A channel turn keeps its ids whole here: a model answering through the plugin
+    // replies to the exact chat_id and message_id, which the CLI's short label drops.
+    const said = (t: string) => { const c = parseChannelEnvelope(t); return c ? `[${channelHead(c, { full: true })}] ${c.body}` : t; };
     return lines.map(l => `${l.target ? ">>" : "  "} #${l.seq} ${l.role}: ` +
-                          `${oneLine(l.role === "user" ? saidText(l.text) : l.text, 1200)}`).join("\n");
+                          `${oneLine(l.role === "user" ? said(l.text) : l.text, 1200)}`).join("\n");
   }
 
   return `unknown tool ${name}`;

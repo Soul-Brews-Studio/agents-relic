@@ -396,12 +396,15 @@ export class LanceStore {
      * no facets, so a facet filter matches nothing in it — an empty answer, not an error
      * the fan-out would swallow. Substring and case-blind: `--via discord` is both
      * plugin:discord:discord and arra-oracle-discord.
+     *
+     * strpos, not LIKE: a username is `nazt_`, and in a LIKE pattern `_` matches any
+     * character and `%` matches everything, so `--from-user nazt_` also found `naztX`.
      */
     const facets = ([["via", opts.via], ["chat_id", opts.chat], ["from_user", opts.fromUser]] as const)
       .filter(([, v]) => v);
     if (facets.length) {
       if ((await this.missingColumns("events", facets.map(([c]) => c)))?.length) return [];
-      for (const [c, v] of facets) filters.push(`lower(${c}) LIKE '%${v!.toLowerCase().replace(/'/g, "''")}%'`);
+      for (const [c, v] of facets) filters.push(`strpos(lower(${c}), ${sqlStr(String(v).toLowerCase())}) > 0`);
     }
     if (opts.tier)   filters.push(`tier = ${sqlStr(opts.tier)}`);
     /*
@@ -839,45 +842,71 @@ export class LanceStore {
   }
 
   /**
-   * What `index --backfill-channel` would re-read here. Read-only.
+   * Every user row holding `<channel`, WHOLE — what `index --backfill-channel` reads.
    *
-   * `facets`: files with a user turn that opens with a channel envelope and carries no
-   * `via` — every such turn on a shard written before the columns existed. The texts
-   * come back so the caller can confirm each with parseChannelEnvelope: a `<channel`
-   * the parser rejects would otherwise be re-read on every run and never leave the list.
-   *
-   * `names`: session rows whose stored description still opens with an envelope tag,
-   * written before import stripped it (#92). Where the tag ran past the 200-char cut,
-   * the words the human typed are gone from the row and only a re-parse brings them back.
+   * `%<channel%`, not a prefix: the parser accepts leading whitespace, so SQL only narrows
+   * and parseChannelEnvelope decides; quoted envelopes come back too and are rejected
+   * there. Whole rows, and plain objects, because the backfill writes each one back
+   * exactly as it was read with only its facets set.
    */
-  async channelBackfill(): Promise<{ facets: { file_path: string; text: string }[];
-                                     names: SessionRow[] }> {
-    const out = { facets: [] as { file_path: string; text: string }[], names: [] as SessionRow[] };
-    const ev = await this.existing("events");
-    if (ev) {
-      const faceted = (await this.missingColumns("events", ["via"]))?.length === 0;
-      out.facets = await ev.query()
-        .where(`role = 'user' AND text LIKE '<channel%'` + (faceted ? ` AND via = ''` : ""))
-        .select(["file_path", "text"]).toArray() as any;
-    }
-    const se = await this.existing("sessions");
-    if (se) {
-      out.names = await se.query()
-        .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `description LIKE '${p}%'`).join(" OR "))
-        .toArray() as unknown as SessionRow[];
-    }
-    return out;
+  async channelRows(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'`).toArray()).map(r => ({ ...r }));
   }
 
-  /** Session rows for these files — chunked, like every IN (...) in this file. */
+  /**
+   * Texts of user rows holding `<channel` that carry no facets — the caller counts the
+   * deliveries among them. Read from the DATA, not the schema: one ordinary index run
+   * widens an old shard, and from then on its schema says "faceted" while every older
+   * channel row in it still says via = "".
+   */
+  async unfacetedChannelTexts(): Promise<string[]> {
+    const t = await this.existing("events");
+    if (!t) return [];
+    const faceted = (await this.missingColumns("events", ["via"]))?.length === 0;
+    return (await t.query().where(`role = 'user' AND text LIKE '%<channel%'` + (faceted ? ` AND via = ''` : ""))
+      .select(["text"]).toArray()).map(r => String(r.text));
+  }
+
+  /** Session rows whose stored name still opens with an envelope tag — written before #92. */
+  async namedByEnvelope(): Promise<Record<string, unknown>[]> {
+    const t = await this.existing("sessions");
+    if (!t) return [];
+    return (await t.query()
+      .where(["<channel", "<teammate-message", "<hook_prompt"].map(p => `description LIKE '${p}%'`).join(" OR "))
+      .toArray()).map(r => ({ ...r }));
+  }
+
+  /** Session rows for these files, as plain objects — chunked, like every IN (...) here. */
   async sessionsOf(paths: string[]): Promise<SessionRow[]> {
     const t = await this.existing("sessions");
     if (!t) return [];
     const out: SessionRow[] = [];
     for (let i = 0; i < paths.length; i += 200)
-      out.push(...await t.query().where(`file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`)
-        .toArray() as unknown as SessionRow[]);
+      for (const r of await t.query().where(`file_path IN (${paths.slice(i, i + 200).map(sqlStr).join(", ")})`).toArray())
+        out.push({ ...r } as unknown as SessionRow);
     return out;
+  }
+
+  /**
+   * Rewrite rows that already exist, matched on `key`: never an insert, never a delete.
+   *
+   * The backfill's only write. Each row is one that was just read, put back with a field
+   * or two set, in ONE commit — so a run killed at any point leaves every row either as
+   * it was or as it should be, and nothing gone. The re-import it replaces deleted a
+   * file's rows in one commit and wrote them back in the next; killed in between, they
+   * were lost, and the unchanged manifest kept `index` from ever re-reading the file.
+   *
+   * No insert branch on purpose: a row that vanished since the read (an index run replaced
+   * its file) is simply not matched, where an upsert would bring it back.
+   */
+  async updateRows(name: "events" | "sessions", key: string, rows: Record<string, unknown>[]): Promise<void> {
+    if (!rows.length) return;
+    const t = await this.existing(name);
+    if (!t) return;
+    await this.widen(name, t, rows[0]);
+    await (await this.existing(name))!.mergeInsert(key).whenMatchedUpdateAll().execute(rows);
   }
 
   /** The session ids this shard holds — the right-hand side of the memory join. */

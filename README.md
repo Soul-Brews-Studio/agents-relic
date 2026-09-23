@@ -660,9 +660,15 @@ nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07      a search hit
 neo-genesis-packaged  [discord #…345195 +5 · nazt_, emraccoon]   sessions
 ```
 
-Shards indexed before the columns existed cannot match a facet filter, and `search`
-says how many. `relic index --backfill-channel` counts the transcripts that need a
-re-read — dry by default, `--apply` re-imports exactly those, `--bank`/`--repo` narrow it.
+Turns indexed before the columns existed cannot match a facet filter, and `search` says
+how many — counted from the rows, since one ordinary index run widens an old shard's
+schema while its older rows still hold `via = ""`. `relic index --backfill-channel`
+fills them IN PLACE: the stored text still has the envelope, so each row is read, its
+facets set, and written back by uid. Nothing is deleted, re-imported or re-read, and a
+run killed halfway leaves every row as it was or as it should be. Dry by default;
+`--apply` writes the plan it printed; `--bank`/`--repo` narrow it. `--names` also
+re-reads the transcripts whose session name is still an envelope tag and rewrites only
+that session row.
 
 ### Staleness, because a stale hit looks exactly like a fresh one
 

@@ -6,7 +6,7 @@ import { parseChannelEnvelope, viaLabel, saidText } from "../src/types.js";
 import { parseClaude } from "../src/shapes/claude.js";
 import { importFiles, roomsOf } from "../src/import.js";
 import { LanceStore } from "../src/store/lance.js";
-import { searchEvents, roomTag, chatLabel, channelHead, listSessions } from "../src/query.js";
+import { searchEvents, roomTag, chatLabel, channelHead, listSessions, facetArg } from "../src/query.js";
 import { sessionRecap } from "../src/recap.js";
 import { planChannelBackfill, applyChannelBackfill } from "../src/backfill.js";
 import { shardDirFor } from "../src/repo.js";
@@ -199,23 +199,32 @@ async function oldShard(root: string, file: string) {
   return store;
 }
 
-const OLD = { root: join(tmp, "old"), file: join(tmp, "src-old", "c0ffee00-0000-4000-8000-000000000001.jsonl") };
-writeTranscript(OLD.file);
-const oldStore = await oldShard(OLD.root, OLD.file);
+/** A fresh old shard of its own, so no test depends on another's writes. */
+let shardN = 0;
+async function freshOld() {
+  const root = join(tmp, `old-${++shardN}`), file = join(tmp, `src-old-${shardN}`, "c0ffee00-0000-4000-8000-000000000001.jsonl");
+  writeTranscript(file);
+  return { root, file, store: await oldShard(root, file) };
+}
+const reopen = (root: string) => LanceStore.open(shardDirFor(REPO, root, false, BANK));
+/** uid -> the row's text: what "nothing lost, nothing rewritten" is measured against. */
+const texts = async (root: string) =>
+  new Map((await (await reopen(root)).eventsWhere("seq > 0")).map(e => [String(e.uid), String(e.text)]));
+
+const OLD = await freshOld();
 
 describe("a shard indexed before the facets existed", () => {
-  const { root } = OLD;
-  const store = oldStore;
+  const { root, store } = OLD;
 
   test("a facet filter on it is an empty answer, not an error", async () => {
     expect(await store.missingColumns("events", ["via"])).toEqual(["via"]);
     expect(await store.search("relay", { via: "discord" })).toEqual([]);
     expect(await store.search("relay", { fromUser: "nazt", chat: "214730" })).toEqual([]);
   });
-  test("searchEvents counts it as unfaceted, and unfiltered search still answers from it", async () => {
+  test("searchEvents counts its channel turns as unfaceted, and unfiltered search still answers", async () => {
     const r = await searchEvents("relay", { dataRoot: root, via: "discord", warnGeneric: false });
     expect(r.hits).toEqual([]);
-    expect(r.unfaceted).toBe(1);
+    expect([r.unfaceted, r.unfacetedTurns]).toEqual([1, 3]);
     expect((await searchEvents("relay", { dataRoot: root, warnGeneric: false })).hits.length).toBe(3);
   });
   test("its sessions list without a tag, and without failing", async () => {
@@ -225,44 +234,178 @@ describe("a shard indexed before the facets existed", () => {
   });
 });
 
-const BF = { root: join(tmp, "backfill"), file: join(tmp, "src-bf", "c0ffee00-0000-4000-8000-000000000001.jsonl") };
-writeTranscript(BF.file);
-const bfStore = await oldShard(BF.root, BF.file);
-const bfBefore = (await bfStore.eventsWhere("seq > 0")).length;
+describe("an old shard that an ordinary index run has since widened", () => {
+  test("still reports its unfilled turns — the schema says faceted, the rows do not", async () => {
+    const { root, file } = await freshOld();
+    // One NEW channel session lands in the same shard through a normal import: widen() adds
+    // the columns, and every old row now holds via = "".
+    const other = join(tmp, "src-new", "dddddddd-0000-4000-8000-000000000004.jsonl");
+    mkdirSync(join(other, ".."), { recursive: true });
+    writeFileSync(other, JSON.stringify({ type: "user", sessionId: "dddddddd-0000-4000-8000-000000000004", cwd: CWD,
+      timestamp: "2026-09-23T05:00:00.000Z",
+      message: { role: "user", content: env(A, "n1", "nazt_", "1", "2026-09-23T05:00:00.000Z", "is the relay fixed") } }) + "\n");
+    const t = await importFiles([foundOf(file), foundOf(other)], { dataRoot: root, inRepo: false });
+    expect([t.imported, t.skipped]).toEqual([1, 1]);
+    expect(await (await reopen(root)).missingColumns("events", ["via"])).toEqual([]);
 
-describe("index --backfill-channel", () => {
-  const { root, file } = BF;
-  const store = bfStore, before = bfBefore;
+    const r = await searchEvents("relay", { dataRoot: root, via: "discord", warnGeneric: false });
+    expect(r.hits.map(h => String(h.file_path))).toEqual([other]);
+    expect([r.unfaceted, r.unfacetedTurns]).toEqual([1, 3]);
 
-  test("a plain index run skips the file as unchanged — the gap a backfill closes", async () => {
-    const t = await importFiles([foundOf(file)], { dataRoot: root, inRepo: false });
-    expect(t.skipped).toBe(1);
-    expect(t.imported).toBe(0);
+    await applyChannelBackfill(await planChannelBackfill({ dataRoot: root }));
+    const after = await searchEvents("relay", { dataRoot: root, via: "discord", warnGeneric: false });
+    expect(after.hits.length).toBe(3);
+    expect([after.unfaceted, after.unfacetedTurns]).toEqual([0, 0]);
+  });
+});
+
+describe("facet filters match what was typed, literally", () => {
+  test("`_` and `%` are characters, not wildcards", async () => {
+    const dir = join(tmp, "literal", "banks", BANK, "github.com", "acme", "literal");
+    const store = await LanceStore.open(dir);
+    const row = (uid: string, from_user: string) => ({
+      uid, session_uuid: "s", file_path: "/f.jsonl", repo_key: REPO, seq: 1, role: "user", ts: "2026-09-23T00:00:00Z",
+      text: "relay down again", source: "claude", tier: "session", kind: "transcript", worktree: "", cwd: "", org: "",
+      project: "", dir: "", mem_type: "", origin_session: "", via: "plugin:discord:discord", chat_id: "1", msg_id: uid,
+      from_user, from_user_id: "", sent_ts: "" });
+    await store.putEvents([row("u1", "nazt_"), row("u2", "naztX"), row("u3", "100%")] as any);
+    const who = async (fromUser: string) =>
+      (await store.search("relay", { fromUser, mainTiers: true })).map(h => String(h.from_user)).sort();
+    expect(await who("nazt_")).toEqual(["nazt_"]);
+    expect(await who("%")).toEqual(["100%"]);
+    expect(await who("_")).toEqual(["nazt_"]);
+    expect(await who("NAZT")).toEqual(["naztX", "nazt_"]);   // code-unit order: X before _
   });
 
-  test("the plan names the file once, for both reasons, and writes nothing", async () => {
+  test("a value that is not a string is converted or refused at the edge", () => {
+    expect(facetArg("chat", 214730)).toBe("214730");            // an MCP client sending a number
+    expect(facetArg("--via", undefined)).toBeUndefined();
+    expect(() => facetArg("--via", true)).toThrow("--via needs a value");   // a bare flag
+    expect(() => facetArg("from_user", "   ")).toThrow("non-empty");
+  });
+
+  test("the CLI refuses a bare facet flag, and facets with --semantic", async () => {
+    const bare = await cliFull(["search", "relay", "--data-root", OLD.root, "--via"]);
+    expect([bare.code, bare.err]).toEqual([1, "--via needs a value, e.g. --via discord\n"]);
+    const sem = await cliFull(["search", "relay", "--data-root", OLD.root, "--semantic", "--via", "discord"]);
+    expect(sem.code).toBe(1);
+    expect(sem.err).toContain("--semantic would ignore them");
+  });
+});
+
+describe("the model's renders keep every id whole", () => {
+  test("a search hit head names the full chat_id and message_id", () => {
+    const c = parseChannelEnvelope(FIX.parse[0].text)!;
+    expect(channelHead(c, { full: true })).toBe(
+      "nazt_ (user_id 691531480689541170) · via plugin:discord:discord · chat_id 1512079809021214730 · " +
+      "message_id 1540006806481535127 · sent 2026-08-20T14:37:14.608Z");
+  });
+  test("a session tag lists the rooms whole", () => {
+    expect(roomTag({ via: "plugin:discord:discord", chat_id: `${A},${B}`, from_users: "nazt_" }, { full: true }))
+      .toBe(`[plugin:discord:discord chat_id ${A}, ${B} · nazt_]`);
+  });
+});
+
+async function cliFull(args: string[]): Promise<{ code: number; out: string; err: string }> {
+  const proc = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "cli.ts"), ...args], { stdout: "pipe", stderr: "pipe" });
+  const [out, err] = [await new Response(proc.stdout).text(), await new Response(proc.stderr).text()];
+  return { code: await proc.exited, out, err };
+}
+
+describe("index --backfill-channel: in place, from the stored text", () => {
+  test("a plain index run skips the old file as unchanged — the gap a backfill closes", async () => {
+    const { root, file } = await freshOld();
+    const t = await importFiles([foundOf(file)], { dataRoot: root, inRepo: false });
+    expect([t.skipped, t.imported]).toEqual([1, 0]);
+  });
+
+  test("the plan counts turns, rooms and names, and writes nothing", async () => {
+    const { root, store } = await freshOld();
     const plan = await planChannelBackfill({ dataRoot: root });
-    expect(plan.files.map(f => [f.found.path, f.why, f.turns])).toEqual([[file, ["facets", "names"], 3]]);
-    expect(plan.files[0].found).toMatchObject({ bank: BANK, tier: "session", source: "claude" });
-    expect(plan.bytes).toBe(statSync(file).size);
+    expect([plan.turns, plan.rooms, plan.names.pending, plan.names.planned]).toEqual([3, 1, 1, 0]);
+    expect(plan.shards.map(x => x.files)).toEqual([1]);
     expect(await store.missingColumns("events", ["via"])).toEqual(["via"]);
   });
 
-  test("--apply re-imports it in place: facets filled, name rewritten, nothing doubled", async () => {
-    const t = await applyChannelBackfill(await planChannelBackfill({ dataRoot: root }), { dataRoot: root, inRepo: false });
-    expect(t.failed).toBe(0);
-    expect(t.imported).toBe(1);
-    const fresh = await LanceStore.open(shardDirFor(REPO, root, false, BANK));
-    const events = await fresh.eventsWhere("seq > 0");
-    expect(events.length).toBe(before);
-    expect(events.filter(e => e.via).length).toBe(3);
-    const [s] = await fresh.sessionsOf([file]);
-    expect(s.description).toBe("please fix the relay");
-    expect(s.from_users).toBe("nazt_,ting_41427");
+  test("--apply fills the facets and rooms, and adds, removes or rewrites no row", async () => {
+    const { root, file } = await freshOld();
+    const before = await texts(root);
+    const wrote = await applyChannelBackfill(await planChannelBackfill({ dataRoot: root }));
+    expect(wrote).toEqual({ events: 3, sessions: 1 });
+    expect(await texts(root)).toEqual(before);             // same uids, same text, byte for byte
+    const store = await reopen(root);
+    const rows = (await store.eventsWhere("seq > 0")).sort((a, b) => Number(a.seq) - Number(b.seq));
+    expect(rows.map(e => String(e.from_user))).toEqual(["nazt_", "", "ting_41427", "", "nazt_", ""]);
+    expect(String(rows[2].sent_ts)).toBe("2026-09-23T01:03:00.000Z");
+    const [s] = await store.sessionsOf([file]);
+    expect([s.via, s.chat_id, s.from_users]).toEqual(["plugin:discord:discord", `${A},${B}`, "nazt_,ting_41427"]);
+    expect(String(s.description).startsWith("<channel")).toBe(true);   // names only with --names
     expect((await searchEvents("relay", { dataRoot: root, via: "discord", warnGeneric: false })).hits.length).toBe(2);
+    const next = await planChannelBackfill({ dataRoot: root });
+    expect([next.turns, next.rooms, next.shards.length]).toEqual([0, 0, 0]);
   });
 
-  test("and the next plan is empty", async () => {
-    expect((await planChannelBackfill({ dataRoot: root })).files).toEqual([]);
+  test("--names rewrites the session row from the transcript, and touches no event", async () => {
+    const { root, file } = await freshOld();
+    await applyChannelBackfill(await planChannelBackfill({ dataRoot: root }));
+    const events = await (await reopen(root)).eventsWhere("seq > 0");
+    const plan = await planChannelBackfill({ dataRoot: root }, { names: true });
+    expect([plan.turns, plan.names.planned, plan.shards[0].events.length]).toEqual([0, 1, 0]);
+    await applyChannelBackfill(plan);
+    const store = await reopen(root);
+    expect(await store.eventsWhere("seq > 0")).toEqual(events);
+    const [s] = await store.sessionsOf([file]);
+    expect([s.description, s.from_users]).toEqual(["please fix the relay", "nazt_,ting_41427"]);
+    expect((await planChannelBackfill({ dataRoot: root }, { names: true })).names.pending).toBe(0);
+  });
+
+  test("the dry run's next command carries every flag it was given", async () => {
+    const { root } = await freshOld();
+    const r = await cliFull(["index", "--backfill-channel", "--data-root", root, "--bank", BANK, "--repo", "widget"]);
+    expect(r.out).toContain(`to write them:  relic index --backfill-channel --apply --data-root ${root} --bank ${BANK} --repo widget\n`);
+    expect(r.out).toContain("facets:      3 channel turns");
+  });
+});
+
+/**
+ * THE KILL TEST. The first backfill deleted a file's rows in one commit and wrote them back
+ * in the next; a process killed in between lost them for good. Here every write is an
+ * update of rows that exist, so a kill at either commit boundary must lose nothing.
+ */
+describe("a backfill killed mid-apply loses nothing", () => {
+  const proto = LanceStore.prototype as any;
+  const killAt = async (table: string, run: () => Promise<unknown>) => {
+    const real = proto.updateRows;
+    proto.updateRows = async function (name: string, ...rest: unknown[]) {
+      if (name === table) throw new Error(`simulated kill before the ${table} commit`);
+      return real.call(this, name, ...rest);
+    };
+    try { await run(); } catch { /* the kill */ } finally { proto.updateRows = real; }
+  };
+
+  test("killed after the event commit: rows intact, rooms finished by the next run", async () => {
+    const { root, file } = await freshOld();
+    const before = await texts(root);
+    await killAt("sessions", async () => applyChannelBackfill(await planChannelBackfill({ dataRoot: root })));
+    expect(await texts(root)).toEqual(before);
+    const mid = await reopen(root);
+    expect((await mid.eventsWhere("seq > 0")).filter(e => e.via).length).toBe(3);
+    expect(String((await mid.sessionsOf([file]))[0].from_users ?? "")).toBe("");
+    // A plain index run neither repairs nor harms it; the next backfill plan is exactly what is left.
+    expect((await importFiles([foundOf(file)], { dataRoot: root, inRepo: false })).skipped).toBe(1);
+    const next = await planChannelBackfill({ dataRoot: root });
+    expect([next.turns, next.rooms]).toEqual([0, 1]);
+    await applyChannelBackfill(next);
+    expect(String((await (await reopen(root)).sessionsOf([file]))[0].from_users)).toBe("nazt_,ting_41427");
+    expect(await texts(root)).toEqual(before);
+  });
+
+  test("killed before any commit: nothing changed, and the plan is the same", async () => {
+    const { root } = await freshOld();
+    const before = await texts(root);
+    await killAt("events", async () => applyChannelBackfill(await planChannelBackfill({ dataRoot: root })));
+    expect(await texts(root)).toEqual(before);
+    const next = await planChannelBackfill({ dataRoot: root });
+    expect([next.turns, next.rooms]).toEqual([3, 1]);
   });
 });

@@ -85,12 +85,6 @@ export interface ImportOpts {
    * so any divergence between the two mappings is a deletion in the wrong shard.
    */
   noWrite?: boolean;
-  /**
-   * Re-import these paths even when the manifest says unchanged — through the same
-   * delete-by-file_path path a changed file takes. `index --backfill-channel` is the
-   * only caller: rows written before a column existed stay empty until their file moves.
-   */
-  reimport?: Set<string>;
 }
 export interface ImportTally {
   added: number; skipped: number; failed: number; filtered: number;
@@ -305,7 +299,7 @@ export async function importFiles(found: Found[], o: ImportOpts, t0 = Date.now()
       // reported them as parse failures.
       const known = man.get(file.path);
       const legacy = fix.paths.has(file.path);
-      if (known && known.mtime === file.mtime && known.size === file.size && !legacy && !o.reimport?.has(file.path)) { skipped++; continue; }
+      if (known && known.mtime === file.mtime && known.size === file.size && !legacy) { skipped++; continue; }
 
       const dropped: any[] = [];
       const kept = o.skipNoise

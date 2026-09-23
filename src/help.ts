@@ -21,11 +21,13 @@ export function helpText(): string {
           [--source-path PATH]   run ONE --corpus against a root it does not normally
                                walk — same walker, parser and bank. For a vault
                                outside the ghq tree the vaults walker enumerates.
-          [--backfill-channel [--apply] [--bank B] [--repo S]]
-                               re-import the transcripts indexed before channel facets
-                               (or whose name is still an envelope tag), so their turns
-                               answer --via/--chat/--from-user. DRY BY DEFAULT: counts
-                               the files and GB first; --apply re-imports exactly those.
+          [--backfill-channel [--apply] [--names] [--bank B] [--repo S]]
+                               fill the channel facets of turns indexed before they
+                               existed, IN PLACE: read from the stored text, written
+                               back by uid — nothing deleted, re-imported or re-read.
+                               DRY BY DEFAULT: counts first; --apply writes that plan.
+                               --names also re-reads transcripts whose session name is
+                               still an envelope tag, and rewrites only that row.
   prune   [--apply] [--corpus ...] [--max-drop 10] [--force]
                                remove index rows for files discovery no longer yields.
                                DRY BY DEFAULT — --apply is the only thing that deletes.

@@ -1,5 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
-import { isHostPreamble, stripEnvelope, viaLabel, type ChannelFacets } from "./types.js";
+import { isHostPreamble, stripEnvelope, viaLabel, parseChannelEnvelope, type ChannelFacets } from "./types.js";
 import { localDateTime, zoneOffset } from "./time.js";
 export { isHostPreamble };
 import os from "node:os";
@@ -127,10 +127,12 @@ export interface SearchResult {
   total: number;           // hits before the limit slice
   generic?: GenericCheck;  // set when warnGeneric ran; undefined if skipped or < 2 shards
   /**
-   * Shards read under a facet filter that predate the facet columns: they cannot match
-   * one, so "no matches" there means "not faceted yet" — see `index --backfill-channel`.
+   * Under a facet filter: shards still holding channel turns with no facets, and how many
+   * turns. Those turns cannot match, so "no matches" there means "not filled yet" — see
+   * `index --backfill-channel`. Counted from the rows, never the schema.
    */
   unfaceted?: number;
+  unfacetedTurns?: number;
   degraded?: string[];     // keys of searched shards on the `simple` tokenizer — Thai substrings missed there
 }
 
@@ -374,8 +376,8 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
                  org: o.org, project: o.project, dir: o.dir, memType: o.memType,
                  since: toISO(o.since), until: toISO(o.until, true), role: o.role, prose: o.prose,
                  via: o.via, chat: o.chat, fromUser: o.fromUser };
-  const facetCols = [o.via && "via", o.chat && "chat_id", o.fromUser && "from_user"].filter(Boolean) as string[];
-  let unfaceted = 0;
+  const faceting = Boolean(o.via || o.chat || o.fromUser);
+  let unfaceted = 0, unfacetedTurns = 0;
 
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(CAP, shards.length) }, async () => {
@@ -385,9 +387,16 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
       const s = shards[i];
       try {
         const store = await LanceStore.open(s.dir);
-        // Counted, not just skipped: an empty answer from a shard that CANNOT match
-        // reads exactly like one that did not, and only one of those is true.
-        if (facetCols.length && (await store.missingColumns("events", facetCols))?.length) unfaceted++;
+        /*
+         * Counted, not just skipped: an empty answer from turns that CANNOT match reads
+         * exactly like one that did not. From the rows, not the schema — the schema says
+         * "faceted" from the first ordinary index write onward, while every older channel
+         * row in the shard still has via = "". Measured: 1.1 s over the whole index.
+         */
+        if (faceting) {
+          const stale = (await store.unfacetedChannelTexts()).filter(t => parseChannelEnvelope(t)).length;
+          if (stale) { unfaceted++; unfacetedTurns += stale; }
+        }
         for (const h of await store.search(q, opts)) hits.push({ ...h, repo: s.key });
         searched++;
         if ((await store.ftsTokenizer()) === "simple") degraded.push(s.key);
@@ -421,7 +430,7 @@ export async function searchEvents(q: string, o: SearchOpts = {}): Promise<Searc
 
   return { hits, shards: searched, available: shards.length,
            ms: Math.round(performance.now() - t0), total: hits.length, generic, degraded: degraded.sort(),
-           ...(facetCols.length && { unfaceted }) };
+           ...(faceting && { unfaceted, unfacetedTurns }) };
 }
 
 export interface SemanticOpts extends Scope {
@@ -1058,23 +1067,50 @@ export function chatLabel(id: string): string {
  * typed: `session <name>` matches on them, pending and report print them, and a prefix
  * would push the words past the 70-char cut on exactly the sessions that have one.
  */
-export function roomTag(r: { via?: unknown; chat_id?: unknown; from_users?: unknown }): string {
+export function roomTag(r: { via?: unknown; chat_id?: unknown; from_users?: unknown }, o: { full?: boolean } = {}): string {
   const list = (v: unknown) => String(v ?? "").split(",").filter(Boolean);
-  const via = [...new Set(list(r.via).map(viaLabel))], chats = list(r.chat_id), users = list(r.from_users);
+  const chats = list(r.chat_id), users = list(r.from_users);
+  const via = o.full ? list(r.via) : [...new Set(list(r.via).map(viaLabel))];
   if (!via.length) return "";
-  const room = chats.length ? ` ${chatLabel(chats[0])}${chats.length > 1 ? ` +${chats.length - 1}` : ""}` : "";
+  // Full ids for a model: a reply through a channel plugin needs the whole chat_id.
+  const room = !chats.length ? ""
+    : o.full ? ` chat_id ${chats.slice(0, 5).join(", ")}${chats.length > 5 ? ` +${chats.length - 5}` : ""}`
+    : ` ${chatLabel(chats[0])}${chats.length > 1 ? ` +${chats.length - 1}` : ""}`;
   const who = users.slice(0, 3).join(", ") + (users.length > 3 ? ` +${users.length - 3}` : "");
   return `[${via.join("+")}${room}${who ? ` · ${who}` : ""}]`;
 }
 
-/** `nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07` — who, where and when, for one hit. */
-export function channelHead(c: ChannelFacets): string {
+/**
+ * `nazt_ @ discord #…214730 · sent 2026-08-20 21:37 UTC+07` — who, where and when, for one
+ * hit. `full` is the model's form: every id whole and the sender's clock as stored, because
+ * a reply through the channel plugin is addressed by the exact chat_id and message_id.
+ */
+export function channelHead(c: ChannelFacets, o: { full?: boolean } = {}): string {
+  if (o.full)
+    return [c.from_user && `${c.from_user}${c.from_user_id ? ` (user_id ${c.from_user_id})` : ""}`, `via ${c.via}`,
+            c.chat_id && `chat_id ${c.chat_id}`, c.msg_id && `message_id ${c.msg_id}`, c.sent_ts && `sent ${c.sent_ts}`]
+      .filter(Boolean).join(" · ");
   const where = `${viaLabel(c.via)}${c.chat_id ? ` ${chatLabel(c.chat_id)}` : ""}`;
   // The zone is named: a hit's own `ts` prints as UTC ISO on the line above this one.
   const t = Date.parse(c.sent_ts);
   const when = !c.sent_ts ? "" : Number.isNaN(t) ? ` · sent ${c.sent_ts}`
              : ` · sent ${localDateTime(t)} UTC${zoneOffset(new Date(t))}`;
   return `${c.from_user ? `${c.from_user} @ ${where}` : where}${when}`;
+}
+
+/**
+ * A facet filter's value, as the store needs it: a string, or undefined when not given.
+ *
+ * Checked at the edge because the fan-out swallows per-shard errors: a bare `--via`
+ * arrives as `true` and an MCP client can send `chat: 214730` as a number, and either one
+ * used to throw inside every shard and come back as "no matches across 0 shards".
+ */
+export function facetArg(name: string, v: unknown): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "boolean") throw new Error(`${name} needs a value, e.g. ${name} discord`);
+  const s = String(v).trim();
+  if (!s) throw new Error(`${name} needs a non-empty value`);
+  return s;
 }
 
 
