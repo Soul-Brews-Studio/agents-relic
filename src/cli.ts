@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { homedir } from "node:os";
+import { parseRoles } from "./roles.js";
 import { existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { LanceStore, type EventRow, type SessionRow } from "./store/lance.js";
@@ -1363,7 +1364,7 @@ async function cmdReport(f: Record<string, string | boolean>) {
  */
 function embedScopeArgs(f: Record<string, string | boolean>): string[] {
   const out: string[] = [];
-  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars"] as const)
+  for (const k of ["data-root", "repo", "bank", "min-chars", "max-chars", "roles"] as const)
     if (typeof f[k] === "string") out.push(`--${k}`, f[k] as string);
   for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) out.push(`--${k}`);
   return out;
@@ -1414,6 +1415,12 @@ async function cmdLangs(f: Record<string, string | boolean>) {
  * Either way the scope's languages are measured first, and an English-only model on a
  * scope that carries Thai is refused unless --force: see checkEmbedModel in langs.ts.
  */
+/** --roles for embed: groups expanded (chat, tool, other), a bad spec is a usage error. */
+function parseRolesOrExit(spec: string | boolean | undefined): string[] | undefined {
+  try { return parseRoles(spec); }
+  catch (err) { console.error(String((err as Error).message)); process.exit(1); }
+}
+
 async function cmdEmbed(f: Record<string, string | boolean>) {
   const o = {
     dataRoot: (f["data-root"] as string) ?? null,
@@ -1433,6 +1440,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
     maxChars: f["max-chars"] ? Number(f["max-chars"]) : 2000,
     dryRun: Boolean(f["dry-run"]),
     session: f.session ? String(f.session) : undefined,
+    roles: parseRolesOrExit(f.roles),
     reset: Boolean(f.reset),
     force: Boolean(f.force),
     scopeArgs: [...embedScopeArgs(f), ...(f.session ? ["--session", String(f.session)] : [])],
@@ -1442,7 +1450,7 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   // never repairs; --reset throws away what a repair keeps). A damaged shard's repair
   // command is this run, narrowed to that shard — see damageNote().
   const carry: string[] = [];
-  for (const k of ["data-root", "provider", "model", "host", "device", "batch", "limit", "min-chars", "max-chars", "session"] as const)
+  for (const k of ["data-root", "provider", "model", "host", "device", "batch", "limit", "min-chars", "max-chars", "session", "roles"] as const)
     if (typeof f[k] === "string") carry.push(`--${k}`, f[k] as string);
   for (const k of ["in-repo", "all-tiers"] as const) if (f[k]) carry.push(`--${k}`);
 
@@ -1488,7 +1496,8 @@ async function cmdEmbed(f: Record<string, string | boolean>) {
   }
 
   console.log(`provider  ${r.providerId}${r.dryRun ? "   (dry run — nothing written)" : ""}`);
-  console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}\n`);
+  console.log(`scope     ${o.mainTiers ? "main tiers" : "all tiers"}, text >= ${o.minChars} chars, truncated at ${o.maxChars}` +
+              `${o.roles ? `, roles ${o.roles.join(",")}` : ""}\n`);
   const w = Math.max(6, ...touched.map(sh => sh.key.length));
   // A damaged shard is listed even past the --limit display cap, because its line carries
   // the only command that repairs it.

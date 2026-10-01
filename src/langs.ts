@@ -124,6 +124,7 @@ export interface LangsOpts extends Scope {
   minChars?: number;
   maxChars?: number;
   session?: string;         // one session's events only, as `embed --session` feeds them
+  roles?: string[];         // as `embed --roles` narrows them (#129)
   /** The CLI flags that set this scope, echoed into every printed embed command. */
   scopeArgs?: string[];
   onProgress?: (done: number, total: number, key: string) => void;
@@ -184,7 +185,7 @@ export async function scanLangs(o: LangsOpts = {}): Promise<LangsResult> {
     try {
       const store = await LanceStore.open(sh.dir);
       const rows = await store.langRows({ where, mainTiers: r.mainTiers, minChars: r.minChars, maxChars: r.maxChars,
-                                          session: o.session });
+                                          session: o.session, roles: o.roles });
       for (const row of rows) tallyLang(r, row.role, row.text);
       const v = await store.vectorStats();
       if (v && v.rows > 0) {

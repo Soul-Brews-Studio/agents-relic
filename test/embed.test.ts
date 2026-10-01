@@ -10,6 +10,7 @@ import { semanticSearch } from "../src/query.js";
 import { checkEmbedModel, renderEmbedCheck, CHECK_MIN_EVENTS, type EmbedCheck } from "../src/langs.js";
 import { shardDirFor } from "../src/repo.js";
 import { uidOf } from "../src/types.js";
+import { parseRoles, roleFilter } from "../src/roles.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "relic-embed-"));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -796,4 +797,42 @@ describe("an interrupted embed, and a vectors table that no longer reads (#105)"
     expect(after).toContain("repaired: restored v1 of `vectors`, keeping 4 of 12 rows; v3 did not read");
     expect(await (await LanceStore.open(shardDirFor(null, root, false, "hermes"))).vectorDamage()).toBeNull();
   }, 30_000);
+});
+
+describe("embed --roles (#129)", () => {
+  const mkMixed = async (name: string) => {
+    const s = await LanceStore.open(join(tmp, name));
+    const roles = ["user", "assistant", "tool_use", "tool_result", "note", "reasoning"];
+    await s.putEvents(roles.map((role, i) => ({
+      uid: `r${i}`, session_uuid: "s", file_path: "/f", repo_key: "r", seq: i,
+      role, ts: "", text: `a ${role} event with enough text to pass min-chars`,
+      source: "claude", tier: "session", kind: "transcript", worktree: "", cwd: "",
+      org: "", project: "", dir: "", mem_type: "", origin_session: "",
+    })));
+    return s;
+  };
+
+  test("parseRoles expands groups, keeps plain names, rejects an empty spec", () => {
+    expect(parseRoles(undefined)).toBeUndefined();
+    expect(parseRoles("chat")).toEqual(["assistant", "reasoning", "thinking", "user"]);
+    expect(parseRoles("chat,other,note")).toEqual(
+      ["assistant", "developer", "note", "reasoning", "system", "thinking", "user"]);
+    expect(parseRoles("tool_use")).toEqual(["tool_use"]);
+    expect(() => parseRoles(true)).toThrow();
+    expect(() => parseRoles(" , ")).toThrow();
+    expect(roleFilter(undefined)).toBe("");
+    expect(roleFilter(["o'brien"])).toBe("role IN ('o''brien')");
+  });
+
+  test("chat first embeds only chat, then a run without --roles fills in the rest", async () => {
+    const s = await mkMixed("roles");
+    const chat = await embedShard(s, fake(8), { roles: parseRoles("chat") });
+    expect(chat.eligible).toBe(3);
+    expect(chat.embedded).toBe(3);
+    const rest = await embedShard(s, fake(8), {});
+    expect(rest.eligible).toBe(6);
+    expect(rest.already).toBe(3);
+    expect(rest.embedded).toBe(3);
+    expect((await s.vectorStats())!.rows).toBe(6);
+  });
 });

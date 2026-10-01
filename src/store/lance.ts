@@ -1,4 +1,5 @@
 import * as lancedb from "@lancedb/lancedb";
+import { roleFilter } from "../roles.js";
 import { Index } from "@lancedb/lancedb";
 import { mkdirSync } from "node:fs";
 import { ensureFtsIndex as ensureFts, tokenizerOf, ftsStateOf, type FtsOutcome, type Tokenizer } from "./fts.js";
@@ -808,7 +809,7 @@ export class LanceStore {
    * to everything, so it pollutes every result list while carrying no meaning — and it
    * costs the same to compute as a real one.
    */
-  async unembedded(opts: { limit?: number; mainTiers?: boolean; minChars?: number; session?: string } = {}): Promise<{ uid: string; text: string }[]> {
+  async unembedded(opts: { limit?: number; mainTiers?: boolean; minChars?: number; session?: string; roles?: string[] } = {}): Promise<{ uid: string; text: string }[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const done = await this.embeddedUids();
@@ -820,6 +821,7 @@ export class LanceStore {
     const filters = [
       opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
       opts.mainTiers ? await this.mainTiersFilter(t) : "",
+      roleFilter(opts.roles),   // embed --roles (#129)
     ].filter(Boolean);
     if (filters.length) q = q.where(filters.join(" AND "));
     const out: { uid: string; text: string }[] = [];
@@ -836,7 +838,7 @@ export class LanceStore {
   }
 
   /** How many events are eligible, ignoring what is already done — the denominator. */
-  async embeddableCount(opts: { mainTiers?: boolean; minChars?: number; session?: string } = {}): Promise<number> {
+  async embeddableCount(opts: { mainTiers?: boolean; minChars?: number; session?: string; roles?: string[] } = {}): Promise<number> {
     const t = await this.existing("events");
     if (!t) return 0;
     const minChars = opts.minChars ?? 24;
@@ -844,6 +846,7 @@ export class LanceStore {
     const filters = [
       opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
       opts.mainTiers ? await this.mainTiersFilter(t) : "",
+      roleFilter(opts.roles),   // embed --roles (#129)
     ].filter(Boolean);
     if (filters.length) q = q.where(filters.join(" AND "));
     let n = 0;
@@ -859,7 +862,7 @@ export class LanceStore {
    * the text a model would be fed. `where` narrows it further — `relic langs` passes a uid
    * range, which is a uniform sample because a uid is a sha1.
    */
-  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number; session?: string } = {}): Promise<{ role: string; text: string }[]> {
+  async langRows(opts: { where?: string; mainTiers?: boolean; minChars?: number; maxChars?: number; session?: string; roles?: string[] } = {}): Promise<{ role: string; text: string }[]> {
     const t = await this.existing("events");
     if (!t) return [];
     const minChars = opts.minChars ?? 24;
@@ -868,6 +871,7 @@ export class LanceStore {
       opts.where ?? "",
       opts.session ? `session_uuid = ${sqlStr(opts.session)}` : "",
       opts.mainTiers ? await this.mainTiersFilter(t) : "",
+      roleFilter(opts.roles),   // embed --roles (#129)
     ].filter(Boolean);
     if (filters.length) q = q.where(filters.join(" AND "));
     const out: { role: string; text: string }[] = [];

@@ -115,6 +115,11 @@ export function helpText(): string {
   embed   [--model embeddinggemma] [--provider ollama|st] [--host URL] [--device mps] [--repo S] [--bank B]
                                [--limit N] [--batch 64] [--all-tiers] [--min-chars 24] [--max-chars 2000]
                                [--dry-run] [--reset] [--force] [--repair]
+                               [--roles chat,other]  embed only these roles; groups: chat
+                               (user assistant thinking reasoning), tool (tool_use
+                               tool_result), other (note developer system), or role names.
+                               Tool rows are ~70% of the tokens (#129): chat first, then
+                               a run without --roles fills in the rest, nothing re-embedded.
                                [--session ID]  embed ONE session — the /forward + /new unit
                                --model embeddinggemma, the default, is multilingual and sent
                                with its model-card prompts, recorded in the stored id (#101).
