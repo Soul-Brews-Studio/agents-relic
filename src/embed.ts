@@ -282,6 +282,7 @@ export interface EmbedOpts extends Scope {
   maxChars?: number;
   dryRun?: boolean;
   session?: string;       // embed ONE session — the /forward + /new unit
+  roles?: string[];       // embed only these roles, e.g. chat first (#129); undefined = every role
   reset?: boolean;        // drop `vectors` first — the only way to change model/dim
   force?: boolean;        // embed with an English-only model on a scope that is not — see checkEmbedModel
   scopeArgs?: string[];   // the flags that set this scope, echoed into the commands the check prints
@@ -364,7 +365,7 @@ export async function embedShard(store: LanceStore, p: EmbedProvider, o: EmbedOp
   const batch = Math.max(1, o.batch ?? 64);
   const mainTiers = o.mainTiers !== false;
 
-  const eligible = await store.embeddableCount({ mainTiers, minChars, session: o.session });
+  const eligible = await store.embeddableCount({ mainTiers, minChars, session: o.session, roles: o.roles });
   // --reset before the stats read, so the mismatch guard below sees the post-drop state
   // rather than refusing on vectors this run is about to discard anyway.
   if (o.reset && !o.dryRun) await store.dropVectors();
@@ -385,7 +386,7 @@ export async function embedShard(store: LanceStore, p: EmbedProvider, o: EmbedOp
                skipped: `holds ${prior.rows} vectors from ${prior.model} (dim ${prior.dim}); ` +
                         `re-embed with ${p.id} by adding --reset (drops this shard's vectors table only)` };
     }
-    todo = await store.unembedded({ limit: o.limit, mainTiers, minChars, session: o.session });
+    todo = await store.unembedded({ limit: o.limit, mainTiers, minChars, session: o.session, roles: o.roles });
   } catch (err) {
     /*
      * A VECTORS TABLE THAT NO LONGER READS (#105).
@@ -455,7 +456,7 @@ export async function embedShards(
   // the one embedShard reads below, sampled 1 in 64 by uid.
   const check = await checkEmbedModel(p.id, {
     dataRoot: o.dataRoot, inRepo: o.inRepo, repo: o.repo, bank: o.bank, session: o.session,
-    mainTiers: o.mainTiers !== false, minChars: o.minChars ?? 24, maxChars: o.maxChars ?? 2000,
+    mainTiers: o.mainTiers !== false, minChars: o.minChars ?? 24, maxChars: o.maxChars ?? 2000, roles: o.roles,
     scopeArgs: o.scopeArgs, force: o.force, onProgress: o.onCheckProgress,
   });
   o.onCheck?.(check);
